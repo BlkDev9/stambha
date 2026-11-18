@@ -380,3 +380,72 @@ fn running_display_says_on_for_secure_boot() {
          secure boot on"
     );
 }
+
+/// Power hooks only: RDY_SYSPWR reads set, APFN_ONMAC and APFM_OFFMAC
+/// self-clear, XTAL SI commands complete, and 0x03F0 reads `state`.
+fn quiet(state: u32) -> RegisterModel {
+    let mut io = RegisterModel::new();
+    io.on_read(
+        0x0004,
+        Box::new(|m: &mut RegisterModel| (m.get32(0x0004) | 1 << 17) & !(1 << 8 | 1 << 9)),
+    );
+    io.on_read(
+        0x0270,
+        Box::new(|m: &mut RegisterModel| m.get32(0x0270) & 0x7FFF_FFFF),
+    );
+    io.set32(0x03F0, state);
+    io
+}
+
+#[test]
+fn quiesce_leaves_a_mac_that_reads_off_alone() {
+    for state in [0x000, 0x200, 0x300] {
+        let mut io = quiet(state);
+        assert_eq!(quiesce(&mut io), Ok(false));
+        assert!(io.writes().is_empty(), "{state:#x}");
+    }
+}
+
+#[test]
+fn quiesce_powers_off_a_mac_left_on_and_tells_coex() {
+    let mut io = quiet(0x100);
+    assert_eq!(quiesce(&mut io), Ok(true));
+    let mut off = quiet(0x100);
+    power::power_off(&mut off).unwrap();
+    let mut expected = off.writes();
+    expected.push(Op::W8(0x00AF, 0x80));
+    assert_eq!(io.writes(), expected);
+}
+
+#[test]
+fn quiesce_refuses_a_device_that_reads_all_ones() {
+    let mut io = quiet(u32::MAX);
+    assert_eq!(quiesce(&mut io), Err(AxError::AllOnes { register: 0x03F0 }));
+    assert!(io.writes().is_empty());
+}
+
+#[test]
+fn quiesce_reports_a_power_off_that_never_completes_without_the_scoreboard() {
+    let mut io = RegisterModel::new();
+    io.on_read(
+        0x0270,
+        Box::new(|m: &mut RegisterModel| m.get32(0x0270) & 0x7FFF_FFFF),
+    );
+    io.set32(0x03F0, 0x100);
+    assert_eq!(
+        quiesce(&mut io),
+        Err(AxError::Timeout {
+            register: 0x0004,
+            mask: 1 << 9
+        })
+    );
+    assert!(!io.writes().contains(&Op::W8(0x00AF, 0x80)));
+}
+
+#[test]
+fn a_firmware_file_error_is_its_message_alone() {
+    assert_eq!(
+        AxError::FirmwareFile("rtw89/rtw8852c_fw-2.bin is not on the USB stick").to_string(),
+        "rtw89/rtw8852c_fw-2.bin is not on the USB stick"
+    );
+}

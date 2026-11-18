@@ -28,9 +28,9 @@ use core::fmt;
 /// `R_AX_SCOREBOARD` (`reg.h:156`), the 8852C `btc_sb` register
 /// (`rtw8852c.c:3287`); `rtw89_mac_update_scoreboard` writes byte 3.
 const R_AX_SCOREBOARD: u32 = 0x00AC;
-/// `MAC_AX_NOTIFY_TP_MAJOR` / `MAC_AX_NOTIFY_PWR_MAJOR` (`reg.h:161-162`).
+/// `MAC_AX_NOTIFY_TP_MAJOR` (`reg.h:161`); `power::power_switch_off` writes
+/// `MAC_AX_NOTIFY_PWR_MAJOR`.
 const MAC_AX_NOTIFY_TP_MAJOR: u8 = 0x81;
-const MAC_AX_NOTIFY_PWR_MAJOR: u8 = 0x80;
 /// `rtw89_fw_download`: `for (retry = 0; retry < 5; retry++)` (`fw.c:2048`).
 const FWDL_TRIES: usize = 5;
 
@@ -72,9 +72,9 @@ impl fmt::Display for Running {
 pub struct BringUpError {
     /// One of `"power on"`, `"secure boot"`, `"dma rings"`,
     /// `"mac pre-init"`, `"pci pre-init"`, `"firmware download"`, `"efuse"`;
-    /// the probe that stages the firmware and opens the register window
-    /// before [`bring_up`] adds `"identity"`, `"firmware"` and
-    /// `"register window"`.
+    /// the probe that opens the register window, stages the firmware and
+    /// runs [`quiesce`] before [`bring_up`] adds `"register window"`,
+    /// `"identity"`, `"firmware"` and `"quiesce"`.
     pub step: &'static str,
     pub error: AxError,
 }
@@ -153,10 +153,27 @@ pub unsafe fn bring_up<I: AxIo + ?Sized>(
 /// whose result Linux ignores. `rtw89_mac_set_vcore_reset` does nothing
 /// until thermal protection set a voltage level, which nothing here does.
 fn power_down<I: AxIo + ?Sized>(io: &mut I) {
-    if power::power_off(io).is_ok() {
-        // mac.c:1580, only after pwr_off_func succeeded.
-        let _ = io.write8(R_AX_SCOREBOARD + 3, MAC_AX_NOTIFY_PWR_MAJOR);
+    // The scoreboard write (mac.c:1580) follows only a successful
+    // pwr_off_func.
+    let _ = power::power_switch_off(io);
+}
+
+/// Stop an RTL8852CE that firmware or an earlier driver left powered on,
+/// before its requester is taken over: when `R_AX_IC_PWR_STATE` reads the
+/// MAC on (`rtw89_mac_reset_pwr_state_ax`'s test), `rtw89_mac_power_switch
+/// (false)` runs (`rtw8852c_pwr_off_func`, then the `MAC_AX_NOTIFY_PWR_MAJOR`
+/// scoreboard). A MAC that reads off has nothing to stop. Returns whether
+/// the MAC was on.
+///
+/// With the MAC off its WCPU and DMA engines are unpowered; this proves
+/// nothing about DMA the device issued before, which the caller excludes
+/// (Bus Master clear).
+pub fn quiesce<I: AxIo + ?Sized>(io: &mut I) -> Result<bool, AxError> {
+    if !power::mac_on(io)? {
+        return Ok(false);
     }
+    power::power_switch_off(io)?;
+    Ok(true)
 }
 
 /// The tail of `rtw89_mac_power_switch(true)` (`mac.c:1557-1570`), then the

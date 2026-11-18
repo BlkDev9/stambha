@@ -927,6 +927,30 @@ const XHCI_DIED_AGAIN: &str = "xHCI: the controller stopped answering again afte
 /// Why a Wi-Fi adapter is left alone.
 const NO_WIFI_NETWORK: &str = "Wi-Fi adapter stays off: no --wifi network";
 
+/// What an RTL8852CE whose firmware ran is, as no network link.
+const RTW89_VERIFIED: &str = "RTL8852CE firmware verified; no station driver yet";
+
+/// Said when an RTL8852CE's MAC was found powered on.
+const RTW89_WAS_ON: &str =
+    "RTL8852CE: its MAC was left powered on; Stela powered it off before taking the device over";
+
+/// Record an RTL8852CE whose firmware ran. It is powered off again and runs
+/// no station, so it joins no links: like the other functions found but not
+/// driven to a device, it is listed with why, and its running firmware is
+/// reported. Its requester, domain, BAR2 and rings stay kept.
+fn rtw89_started(devices: &mut Devices, address: Address, class: [u8; 3], up: native::Rtw89Up) {
+    if up.was_on {
+        devices
+            .warnings
+            .push((address, Warning::Message(RTW89_WAS_ON)));
+    }
+    devices
+        .warnings
+        .push((address, Warning::Text(alloc::format!("{}", up.running))));
+    devices.unsupported.push((address, class, RTW89_VERIFIED));
+    devices.owners.push(up.kept);
+}
+
 /// The function a driver here claimed whose start is being accounted for,
 /// with the count of outcomes recorded before it started.
 #[derive(Default)]
@@ -2750,17 +2774,8 @@ unsafe fn attach_native(
                 clock: wifi.clock,
             };
             // SAFETY: as for tg3 below.
-            match unsafe { native::rtw89_wifi(services, address, inputs.handoff.completion, rtw89) }
-            {
-                // The chip is powered off again and runs no station, so it
-                // joins no links. Its claim, mapping, register window and
-                // the rings its firmware download ran on stay kept.
-                Ok((running, kept)) => {
-                    devices.owners.push(kept);
-                    devices
-                        .warnings
-                        .push((address, Warning::Text(alloc::format!("{running}"))));
-                }
+            match unsafe { native::rtw89_wifi(services, address, rtw89) } {
+                Ok(up) => rtw89_started(devices, address, function.class, up),
                 Err((error, kept)) => {
                     devices.failures.push((address, error));
                     devices.owners.extend(kept);
@@ -4212,206 +4227,46 @@ mod tests {
         assert_eq!(devices.subsystem(address, &devices.failures[0].1), "Wi-Fi");
     }
 
-    /// An rtw89 register window that records every access.
-    #[derive(Default)]
-    struct Registers {
-        reads: usize,
-        writes: Vec<(u32, u32)>,
-    }
-    impl net::wifi::realtek::ax::AxIo for Registers {
-        fn read8(&mut self, _: u32) -> Result<u8, net::wifi::realtek::ax::AxError> {
-            self.reads += 1;
-            Ok(0)
-        }
-        fn read16(&mut self, _: u32) -> Result<u16, net::wifi::realtek::ax::AxError> {
-            self.reads += 1;
-            Ok(0)
-        }
-        fn read32(&mut self, _: u32) -> Result<u32, net::wifi::realtek::ax::AxError> {
-            self.reads += 1;
-            Ok(0)
-        }
-        fn write8(&mut self, reg: u32, v: u8) -> Result<(), net::wifi::realtek::ax::AxError> {
-            self.writes.push((reg, v.into()));
-            Ok(())
-        }
-        fn write16(&mut self, reg: u32, v: u16) -> Result<(), net::wifi::realtek::ax::AxError> {
-            self.writes.push((reg, v.into()));
-            Ok(())
-        }
-        fn write32(&mut self, reg: u32, v: u32) -> Result<(), net::wifi::realtek::ax::AxError> {
-            self.writes.push((reg, v));
-            Ok(())
-        }
-        fn delay_us(&mut self, _: u64) {}
-        fn now_us(&mut self) -> Result<u64, net::wifi::realtek::ax::AxError> {
-            Ok(0)
-        }
-    }
-
-    /// A domain that maps nothing: a bring-up refused before its rings
-    /// reaches none of it.
-    struct NoDomain;
-    // SAFETY: refuses every operation; nothing is ever mapped.
-    unsafe impl crate::bus::dma::mapping::DmaDomain for NoDomain {
-        unsafe fn map(
-            &self,
-            _: &crate::bus::dma::pages::DmaPages,
-            _: crate::bus::dma::mapping::Direction,
-            _: u64,
-        ) -> Result<crate::bus::dma::mapping::DomainMapping, crate::bus::dma::mapping::DmaError>
-        {
-            Err(crate::bus::dma::mapping::DmaError::MappingFailed)
-        }
-        unsafe fn unmap(
-            &self,
-            _: crate::bus::dma::mapping::DomainMapping,
-        ) -> Result<(), crate::bus::dma::mapping::DmaError> {
-            Err(crate::bus::dma::mapping::DmaError::InvalidationFailed)
-        }
-        unsafe fn sync_for_device(
-            &self,
-            _: crate::bus::dma::mapping::DomainMapping,
-            _: core::ops::Range<usize>,
-            _: crate::bus::dma::mapping::Direction,
-        ) -> Result<(), crate::bus::dma::mapping::DmaError> {
-            Err(crate::bus::dma::mapping::DmaError::MappingFailed)
-        }
-        unsafe fn sync_for_cpu(
-            &self,
-            _: crate::bus::dma::mapping::DomainMapping,
-            _: core::ops::Range<usize>,
-            _: crate::bus::dma::mapping::Direction,
-        ) -> Result<(), crate::bus::dma::mapping::DmaError> {
-            Err(crate::bus::dma::mapping::DmaError::MappingFailed)
-        }
-    }
-
-    /// The RTL8852CE `native::rtw89_wifi` would read: cut 2 (CBV) in SYS_CFG1.
-    fn rtl8852ce() -> net::wifi::realtek::identity::Observed {
-        net::wifi::realtek::identity::Observed {
-            vendor: 0x10ec,
-            device: 0xc852,
-            subsystem_vendor: 0x1043,
-            subsystem_device: 0x1b0d,
-            pci_revision: 0,
-            sys_cfg1: 2 << 12,
-        }
-    }
-
-    /// Stage `provider`'s firmware for [`rtl8852ce`] through [`Registers`].
-    fn start_rtl8852ce(
-        provider: &dyn Provider,
-    ) -> (
-        Registers,
-        Result<
-            (
-                net::wifi::realtek::ax::Running,
-                net::wifi::realtek::ax::Rings,
-            ),
-            net::wifi::realtek::ax::BringUpError,
-        >,
-    ) {
-        let mut registers = Registers::default();
-        let services = services::tests::Refusing::default();
-        // SAFETY: `registers` is a model, not a device, and `NoDomain` maps
-        // nothing, so no DMA can be programmed anywhere.
-        let result = unsafe {
-            native::rtw89_start(
-                &mut registers,
-                rtl8852ce(),
-                provider,
-                services.pages(),
-                Arc::new(NoDomain),
-            )
-        };
-        (registers, result)
-    }
-
-    /// A stick without `rtw89/rtw8852c_fw-2.bin` fails the bring-up at its
-    /// firmware, before any register access, and the boot log says so.
+    /// An RTL8852CE whose firmware ran, left on by firmware, is reported by
+    /// its firmware and why it is no link, and its owner is kept.
     #[test]
-    fn missing_firmware_fails_before_power_on() {
-        use net::wifi::realtek::ax::{AxError, BringUpError};
-        let (registers, result) = start_rtl8852ce(&HandoffProvider::new(None));
-        let Err(failure) = result else {
-            panic!("an RTL8852CE came up with no firmware")
+    fn an_rtl8852ce_whose_firmware_ran_is_accounted_for_plainly() {
+        let wifi = identity(3, 0, 0x10ec, 0xc852, 0x02_80_00);
+        let mut devices = Devices {
+            network_functions: alloc::vec![wifi],
+            ..Devices::default()
         };
-        assert_eq!(
-            failure,
-            BringUpError {
-                step: "firmware",
-                error: AxError::Firmware("missing rtw89/rtw8852c_fw-2.bin"),
-            }
-        );
-        assert!(registers.writes.is_empty(), "{:x?}", registers.writes);
-        assert_eq!(registers.reads, 0);
-        let address = Address {
-            segment: 0,
-            bus: 3,
-            device: 0,
-            function: 0,
-        };
-        let error = Error::Rtw89Wifi(failure);
-        // Filed under Wi-Fi by its kind even without a recorded class, and
-        // printed as stela-boot's `report_failure` prints it.
-        let devices = Devices::default();
-        assert_eq!(
-            format!(
-                "HOST DEVICE FAILED pci={address} ({}) error={error}",
-                devices.subsystem(address, &error)
-            ),
-            "HOST DEVICE FAILED pci=0000:03:00.0 (Wi-Fi) error=rtw89: RTL8852CE bring-up: \
-             firmware: firmware: missing rtw89/rtw8852c_fw-2.bin"
-        );
-        // The network account line already names the chip and Wi-Fi.
-        assert_eq!(
-            format!("{}", plain(&error)),
-            "RTL8852CE bring-up: firmware: firmware: missing rtw89/rtw8852c_fw-2.bin"
-        );
-    }
-
-    /// A file that is not an rtw89 image (its header version byte reads
-    /// 0x5a) fails the same way, with its own reason, still before any
-    /// register access.
-    #[test]
-    fn malformed_firmware_fails_before_power_on() {
-        use net::wifi::realtek::ax::{AxError, BringUpError};
-        let bytes = alloc::vec![0x5a; 64];
-        let catalog = Catalog::from_handoff(vec![Resource {
-            name: "rtw89/rtw8852c_fw-2.bin",
-            target: Target {
-                driver: "realtek-wifi",
-                hardware: "pci:10ec:c852",
-                revision: net::wifi::realtek::identity::CHIP_REVISION,
-                board: None,
+        let up = native::Rtw89Up {
+            running: net::wifi::realtek::ax::Running {
+                cut: 2,
+                firmware: (0, 27, 56, 14),
+                mac: [0x00, 0xe0, 0x4c, 0x88, 0x52, 0xc0],
+                secure_boot: false,
             },
-            provenance: Provenance {
-                source: "synthetic-fixtures",
-                revision: "v1",
-                member: "fixtures/rtw8852c_fw-2.bin",
-                license: "CC0-1.0",
-            },
-            expected_length: bytes.len(),
-            expected_sha256: Sha256::digest(&bytes).into(),
-            bytes,
-        }])
-        .unwrap();
-        let (registers, result) = start_rtl8852ce(&HandoffProvider::new(Some(&catalog)));
-        let Err(failure) = result else {
-            panic!("an RTL8852CE came up on a malformed image")
+            was_on: true,
+            kept: Box::new(()),
         };
+        rtw89_started(&mut devices, wifi.address, wifi.class, up);
         assert_eq!(
-            failure,
-            BringUpError {
-                step: "firmware",
-                error: AxError::Firmware(
-                    "rtw89/rtw8852c_fw-2.bin has a header version other than 0"
-                ),
-            }
+            devices.network_account(),
+            ["0000:03:00.0 10ec:c852 Wi-Fi: RTL8852CE firmware verified; no station driver yet"]
         );
-        assert!(registers.writes.is_empty(), "{:x?}", registers.writes);
-        assert_eq!(registers.reads, 0);
+        let warnings: Vec<String> = devices
+            .warnings
+            .iter()
+            .map(|(address, warning)| format!("HOST WARNING pci={address}: {warning}"))
+            .collect();
+        assert_eq!(
+            warnings,
+            [
+                "HOST WARNING pci=0000:03:00.0: RTL8852CE: its MAC was left powered on; Stela \
+                 powered it off before taking the device over",
+                "HOST WARNING pci=0000:03:00.0: RTL8852CE firmware running: cut 2, firmware \
+                 0.27.56.14, MAC 00:e0:4c:88:52:c0, secure boot off",
+            ]
+        );
+        assert_eq!(devices.owners.len(), 1);
+        assert!(devices.failures.is_empty());
     }
 
     /// A warning of owned text prints on the boot log's `HOST WARNING`

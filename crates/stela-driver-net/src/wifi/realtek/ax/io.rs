@@ -29,6 +29,8 @@ pub enum AxError {
     /// Uncalibrated, retired or non-advancing time source.
     Clock,
     Firmware(&'static str),
+    /// The firmware file itself is missing or unusable; the message names it.
+    FirmwareFile(&'static str),
     Dma(&'static str),
     SecureBootUnsupported,
     /// The efuse could not be parsed (`-EINVAL` in `efuse.c`).
@@ -52,6 +54,7 @@ impl fmt::Display for AxError {
             }
             Self::Clock => f.write_str("time source unavailable or not advancing"),
             Self::Firmware(what) => write!(f, "firmware: {what}"),
+            Self::FirmwareFile(what) => f.write_str(what),
             Self::Dma(what) => write!(f, "dma: {what}"),
             Self::SecureBootUnsupported => f.write_str("secure-boot firmware is unsupported"),
             Self::Efuse(what) => write!(f, "efuse: {what}"),

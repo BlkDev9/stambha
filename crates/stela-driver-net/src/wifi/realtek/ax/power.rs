@@ -173,6 +173,19 @@ fn reset_pwr_state<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
     Ok(())
 }
 
+/// Whether `R_AX_IC_PWR_STATE` reads the MAC on, as
+/// `rtw89_mac_reset_pwr_state_ax` tests it. A register that reads all ones
+/// (the device is not answering) is an error, not "off".
+pub(crate) fn mac_on<I: AxIo + ?Sized>(io: &mut I) -> Result<bool, AxError> {
+    let state = io.read32(R_AX_IC_PWR_STATE)?;
+    if state == u32::MAX {
+        return Err(AxError::AllOnes {
+            register: R_AX_IC_PWR_STATE,
+        });
+    }
+    Ok((state & B_AX_WLMAC_PWR_STE_MASK) >> 8 == MAC_AX_MAC_ON)
+}
+
 /// `rtw89_mac_power_switch(true)` for PCIe: the already-on check, then
 /// `rtw8852c_pwr_on_func`. No scoreboard or efuse work (those follow in the
 /// caller).
@@ -181,16 +194,16 @@ fn power_on_once<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
     pwr_on_func(io)
 }
 
-/// `rtw89_mac_pwr_on`: on any failure, power off (its result ignored) and
-/// try the power switch once more.
 /// `rtw89_mac_power_switch(false)`: `rtw8852c_pwr_off_func`, then, only if it
 /// succeeded, `rtw89_mac_update_scoreboard(MAC_AX_NOTIFY_PWR_MAJOR)`, i.e.
 /// write8 `R_AX_SCOREBOARD + 3` = 0x80 (`mac.c:1580`, `btc_sb` of rtw8852c).
-fn power_switch_off<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
+pub(crate) fn power_switch_off<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
     power_off(io)?;
     io.write8(R_AX_SCOREBOARD + 3, MAC_AX_NOTIFY_PWR_MAJOR)
 }
 
+/// `rtw89_mac_pwr_on`: on any failure, power off (its result ignored) and
+/// try the power switch once more.
 pub fn power_on<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
     if power_on_once(io).is_ok() {
         return Ok(());
