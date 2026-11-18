@@ -951,6 +951,19 @@ fn rtw89_started(devices: &mut Devices, address: Address, class: [u8; 3], up: na
     devices.owners.push(up.kept);
 }
 
+/// Record an RTL8852CE whose bring-up failed: whether its MAC had been left
+/// on and was powered off, as on success, then the failure. Whatever it
+/// claimed stays kept.
+fn rtw89_failed(devices: &mut Devices, address: Address, down: native::Rtw89Down) {
+    if down.was_on {
+        devices
+            .warnings
+            .push((address, Warning::Message(RTW89_WAS_ON)));
+    }
+    devices.failures.push((address, down.error));
+    devices.owners.extend(down.kept);
+}
+
 /// The function a driver here claimed whose start is being accounted for,
 /// with the count of outcomes recorded before it started.
 #[derive(Default)]
@@ -2776,10 +2789,7 @@ unsafe fn attach_native(
             // SAFETY: as for tg3 below.
             match unsafe { native::rtw89_wifi(services, address, rtw89) } {
                 Ok(up) => rtw89_started(devices, address, function.class, up),
-                Err((error, kept)) => {
-                    devices.failures.push((address, error));
-                    devices.owners.extend(kept);
-                }
+                Err(down) => rtw89_failed(devices, address, down),
             }
             return;
         }
@@ -4267,6 +4277,57 @@ mod tests {
         );
         assert_eq!(devices.owners.len(), 1);
         assert!(devices.failures.is_empty());
+    }
+
+    /// An RTL8852CE whose MAC was left on and powered off, then whose
+    /// bring-up failed, still says its MAC was left on, before the failure,
+    /// and its owner is kept.
+    #[test]
+    fn an_rtl8852ce_that_failed_after_its_mac_was_powered_off_says_so() {
+        use net::wifi::realtek::ax::{AxError, BringUpError, Earlier};
+        let wifi = identity(3, 0, 0x10ec, 0xc852, 0x02_80_00);
+        let mut devices = Devices {
+            network_functions: alloc::vec![wifi],
+            ..Devices::default()
+        };
+        let down = native::Rtw89Down {
+            error: Error::Rtw89Wifi(BringUpError {
+                step: "firmware download",
+                error: AxError::FirmwareStatus {
+                    what: "not ready",
+                    fw_ctrl: 0x0000_0007,
+                },
+                earlier: Earlier::First {
+                    tries: 5,
+                    error: AxError::Timeout {
+                        register: 0x1080,
+                        mask: 0x0FFF_0000,
+                    },
+                },
+            }),
+            was_on: true,
+            kept: Some(Box::new(())),
+        };
+        rtw89_failed(&mut devices, wifi.address, down);
+        let warnings: Vec<String> = devices
+            .warnings
+            .iter()
+            .map(|(address, warning)| format!("HOST WARNING pci={address}: {warning}"))
+            .collect();
+        assert_eq!(
+            warnings,
+            [
+                "HOST WARNING pci=0000:03:00.0: RTL8852CE: its MAC was left powered on; Stela \
+              powered it off before taking the device over"
+            ]
+        );
+        assert_eq!(devices.failures.len(), 1);
+        assert_eq!(
+            format!("{}", devices.failures[0].1),
+            "rtw89: RTL8852CE bring-up: firmware download: not ready (0x01E0=0x00000007) (first \
+             of 5 attempts: timeout waiting on register 0x1080 mask 0xfff0000)"
+        );
+        assert_eq!(devices.owners.len(), 1);
     }
 
     /// A warning of owned text prints on the boot log's `HOST WARNING`

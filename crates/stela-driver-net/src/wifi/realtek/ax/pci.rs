@@ -639,7 +639,7 @@ impl Ch12<'_> {
             return Err(AxError::Dma("CH12 is stopped"));
         }
         if packet.is_empty() || packet.len() > FWCMD_SLOT_BYTES {
-            return Err(AxError::Dma("CH12 packet length"));
+            return Err(AxError::Dma("CH12 packet length out of range"));
         }
         let slot = usize::from(rings.ch12_host.get());
         let at = slot * FWCMD_SLOT_BYTES;

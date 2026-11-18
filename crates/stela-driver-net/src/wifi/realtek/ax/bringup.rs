@@ -32,7 +32,9 @@ const R_AX_SCOREBOARD: u32 = 0x00AC;
 /// `MAC_AX_NOTIFY_PWR_MAJOR`.
 const MAC_AX_NOTIFY_TP_MAJOR: u8 = 0x81;
 /// `rtw89_fw_download`: `for (retry = 0; retry < 5; retry++)` (`fw.c:2048`).
-const FWDL_TRIES: usize = 5;
+const FWDL_TRIES: u8 = 5;
+/// `rtw89_mac_pwr_on` (`mac.c:1588`): one power switch and one retry.
+const POWER_ON_TRIES: u8 = 2;
 
 /// An RTL8852CE whose firmware reported `RTW89_FWDL_WCPU_FW_INIT_RDY`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,24 +78,93 @@ pub struct BringUpError {
     /// runs [`quiesce`] before [`bring_up`] adds `"register window"`,
     /// `"identity"`, `"firmware"` and `"quiesce"`.
     pub step: &'static str,
+    /// The step's last failure.
     pub error: AxError,
+    /// What the step's retries ran into before `error`, kept because the
+    /// first failure is the likelier root cause.
+    pub earlier: Earlier,
+}
+
+/// What a retried bring-up step ran into before the error it reports.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Earlier {
+    /// The step was not retried, or its first attempt failed the same way.
+    #[default]
+    Nothing,
+    /// The first of `tries` attempts failed with `error`, which the last
+    /// attempt's error differs from.
+    First { tries: u8, error: AxError },
+    /// A `"pci pre-init"` re-run inside the firmware download: download
+    /// attempt `attempt` (from 1) failed with `stopped`, which left CH12
+    /// stopped, so the next attempt re-ran `pci::pre_init` first. `first`
+    /// is attempt 1's error, when that was an earlier, different one.
+    Ch12Stopped {
+        attempt: u8,
+        stopped: AxError,
+        first: Option<AxError>,
+    },
+}
+
+impl Earlier {
+    /// `First`, when `first` differs from `last`.
+    fn first_of(tries: u8, first: AxError, last: AxError) -> Self {
+        if first == last {
+            Self::Nothing
+        } else {
+            Self::First {
+                tries,
+                error: first,
+            }
+        }
+    }
+}
+
+impl BringUpError {
+    /// `step` failed with `error`, with nothing earlier.
+    pub const fn new(step: &'static str, error: AxError) -> Self {
+        Self {
+            step,
+            error,
+            earlier: Earlier::Nothing,
+        }
+    }
 }
 
 impl fmt::Display for BringUpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "RTL8852CE bring-up: {}: {}", self.step, self.error)
+        write!(f, "RTL8852CE bring-up: {}: {}", self.step, self.error)?;
+        match self.earlier {
+            Earlier::Nothing => Ok(()),
+            Earlier::First { tries, error } => write!(f, " (first of {tries} attempts: {error})"),
+            Earlier::Ch12Stopped {
+                attempt,
+                stopped,
+                first,
+            } => {
+                write!(
+                    f,
+                    " (re-run after firmware download attempt {attempt} of {FWDL_TRIES} failed \
+                     and stopped CH12: {stopped}"
+                )?;
+                if let Some(first) = first {
+                    write!(f, "; first of {FWDL_TRIES} attempts: {first}")?;
+                }
+                f.write_str(")")
+            }
+        }
     }
 }
 
 fn at(step: &'static str) -> impl FnOnce(AxError) -> BringUpError {
-    move |error| BringUpError { step, error }
+    move |error| BringUpError::new(step, error)
 }
 
 /// Bring an RTL8852CE of chip cut `cut` up to running firmware `image`, and
 /// read its MAC address, then power it off again. Steps, in Linux's order:
 ///
 /// 1. `"power on"`: `power::power_on`, with Linux's own power-off and
-///    single retry (`rtw89_mac_pwr_on`). A failure here returns at once.
+///    single retry (`rtw89_mac_pwr_on`). When the retry fails too, the error
+///    keeps both tries' failures.
 /// 2. `"secure boot"`: the efuse secure-boot bytes, then the
 ///    `MAC_AX_NOTIFY_TP_MAJOR` scoreboard write that closes
 ///    `rtw89_mac_power_switch(true)`. A secure-boot chip is refused with
@@ -102,15 +173,19 @@ fn at(step: &'static str) -> impl FnOnce(AxError) -> BringUpError {
 /// 4. `"mac pre-init"`: `dmac::pre_init`.
 /// 5. `"pci pre-init"`: `pci::pre_init`.
 /// 6. `"firmware download"`: up to five `fwdl::download` attempts
-///    (`fw.c:2043`), the last error returned. An attempt whose CH12 submit
-///    failed leaves CH12 stopped; the next attempt then runs `pci::pre_init`
-///    again first (a failure there is reported as `"pci pre-init"`).
+///    (`fw.c:2043`), the last error returned, with the first when they
+///    differ. An attempt whose CH12 submit failed leaves CH12 stopped; the
+///    next attempt then runs `pci::pre_init` again first (a failure there is
+///    reported as `"pci pre-init"`, with the download error that stopped
+///    CH12 and, when earlier and different, the first one).
 /// 7. `"efuse"`: the whole physical map, its logical map and the MAC.
 ///
-/// After `"power on"` succeeded, success and every failure end as
-/// `rtw89_chip_info_setup` does, in `rtw89_mac_pwr_off`: `power::power_off`,
-/// then, only if it succeeded, the `MAC_AX_NOTIFY_PWR_MAJOR` scoreboard
-/// write. Linux ignores the result of that power-off, and so does this.
+/// Success and every failure end as `rtw89_chip_info_setup` does after a
+/// power-on, in `rtw89_mac_pwr_off`: `power::power_off`, then, only if it
+/// succeeded, the `MAC_AX_NOTIFY_PWR_MAJOR` scoreboard write. Linux ignores
+/// the result of that power-off, and so does this. A failed `"power on"`
+/// ends the same way, so the chip is left off; Linux returns from it
+/// without, but its retry ran the same power-off between the two tries.
 ///
 /// On success the firmware result is reported with the `Rings` that DMA was
 /// started on. The caller must keep them (dropping them leaves every mapping
@@ -132,7 +207,14 @@ pub unsafe fn bring_up<I: AxIo + ?Sized>(
     cut: u8,
     image: &AxImage<'_>,
 ) -> Result<(Running, Rings), BringUpError> {
-    power::power_on(io).map_err(at("power on"))?;
+    if let Err(error) = power::power_on(io) {
+        power_down(io);
+        return Err(BringUpError {
+            step: "power on",
+            error: error.retry,
+            earlier: Earlier::first_of(POWER_ON_TRIES, error.first, error.retry),
+        });
+    }
     // SAFETY: the caller's `Rings::install` contract, forwarded unchanged.
     let mut rings = match unsafe { prepare(io, source, domain) } {
         Ok(rings) => rings,
@@ -250,9 +332,10 @@ unsafe fn start<I: AxIo + ?Sized>(
 }
 
 /// `rtw89_fw_download(RTW89_FW_NORMAL)` (`fw.c:2043`): up to five attempts
-/// of `__rtw89_fw_download`, the last error returned. A failed CH12 submit
-/// stops the queue (Linux's queue has no such state), so the next attempt
-/// restarts it with `pci::pre_init` first.
+/// of `__rtw89_fw_download`, the last error returned, with the first when it
+/// differs. A failed CH12 submit stops the queue (Linux's queue has no such
+/// state), so the next attempt restarts it with `pci::pre_init` first; if
+/// that fails, it is reported with the download error that stopped CH12.
 ///
 /// # Safety
 /// The `pci::pre_init` and `Ch12::submit` contracts for `io` and `rings`.
@@ -262,20 +345,40 @@ unsafe fn download<I: AxIo + ?Sized>(
     rings: &mut Rings,
     image: &AxImage<'_>,
 ) -> Result<(), BringUpError> {
-    let mut last = AxError::Firmware("not attempted");
-    for attempt in 0..FWDL_TRIES {
-        if attempt > 0 && rings.ch12_stopped() {
+    // SAFETY: the caller's `Ch12::submit` contract; `pci::pre_init`
+    // programmed `rings` through this `io`.
+    let first = match unsafe { fwdl::download(io, &mut rings.ch12(), image) } {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    let mut last = first;
+    for attempt in 2..=FWDL_TRIES {
+        if rings.ch12_stopped() {
             // SAFETY: the caller's `pci::pre_init` contract for these rings.
-            unsafe { pci::pre_init(io, cut, rings) }.map_err(at("pci pre-init"))?;
+            if let Err(error) = unsafe { pci::pre_init(io, cut, rings) } {
+                return Err(BringUpError {
+                    step: "pci pre-init",
+                    error,
+                    earlier: Earlier::Ch12Stopped {
+                        attempt: attempt - 1,
+                        stopped: last,
+                        first: (attempt > 2 && first != last).then_some(first),
+                    },
+                });
+            }
         }
-        // SAFETY: the caller's `Ch12::submit` contract; `pci::pre_init`
-        // programmed `rings` through this `io`.
+        // SAFETY: as for the first attempt; a stopped CH12 was restarted by
+        // `pci::pre_init` on these rings just above.
         match unsafe { fwdl::download(io, &mut rings.ch12(), image) } {
             Ok(()) => return Ok(()),
             Err(error) => last = error,
         }
     }
-    Err(at("firmware download")(last))
+    Err(BringUpError {
+        step: "firmware download",
+        error: last,
+        earlier: Earlier::first_of(FWDL_TRIES, first, last),
+    })
 }
 
 #[cfg(test)]

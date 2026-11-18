@@ -676,6 +676,27 @@ pub struct Rtw89Inputs {
     pub clock: Clock,
 }
 
+/// An RTL8852CE whose bring-up failed.
+pub struct Rtw89Down {
+    pub error: Error,
+    /// As [`Rtw89Up::was_on`]: whether its MAC had been left on, and so was
+    /// powered off, before the failure.
+    pub was_on: bool,
+    /// Whatever must outlive the device once claimed: its requester and
+    /// domain, its BAR2 mapping and register window, and any rings.
+    pub kept: Option<Box<dyn Any>>,
+}
+
+impl From<Failure> for Rtw89Down {
+    fn from((error, kept): Failure) -> Self {
+        Self {
+            error,
+            was_on: false,
+            kept,
+        }
+    }
+}
+
 /// An RTL8852CE whose firmware ran, powered off again.
 pub struct Rtw89Up {
     pub running: Running,
@@ -706,7 +727,7 @@ pub(super) unsafe fn rtw89_wifi(
     services: &dyn NativeServices,
     address: Address,
     inputs: Rtw89Inputs,
-) -> Result<Rtw89Up, Failure> {
+) -> Result<Rtw89Up, Rtw89Down> {
     let minimum = services
         .minimum_delay()
         .map_err(|error| (Error::Native(error), None))?;
@@ -714,14 +735,14 @@ pub(super) unsafe fn rtw89_wifi(
     let mut preparing = services.prepare_requester(address).map_err(refused)?;
     let bars = match rtw89_wake(preparing.function_mut(), minimum.as_ref()) {
         Ok(bars) => bars,
-        Err(error) => return Err(keep_error(error, preparing)),
+        Err(error) => return Err(keep_error(error, preparing).into()),
     };
     // A BAR is mapped during preparation, before any binding, as Intel's
     // PCIe Bluetooth maps its BAR0: the mapping grants register access only,
     // and the seal still holds Bus Master clear.
     let registers = match map(services, address, &bars, 2) {
         Ok(registers) => registers,
-        Err(error) => return Err(keep_error(Error::Native(error), preparing)),
+        Err(error) => return Err(keep_error(Error::Native(error), preparing).into()),
     };
     let (base, bytes) = match registers
         .bytes()
@@ -732,13 +753,14 @@ pub(super) unsafe fn rtw89_wifi(
             return Err(keep_error(
                 Error::Native(ServiceError::Mapping(error)),
                 (preparing, registers),
-            ));
+            )
+            .into());
         }
     };
     let (subsystem_vendor, subsystem_device, pci_revision) =
         match rtw89_decode(preparing.function_mut()) {
             Ok(identity) => identity,
-            Err(error) => return Err(keep_error(error, (preparing, registers))),
+            Err(error) => return Err(keep_error(error, (preparing, registers)).into()),
         };
     let (vendor, device) = {
         let function = preparing.function_mut();
@@ -753,25 +775,20 @@ pub(super) unsafe fn rtw89_wifi(
     {
         Ok(io) => io,
         Err(error) => {
-            let error = BringUpError {
-                step: "register window",
-                error,
-            };
+            let error = BringUpError::new("register window", error);
             return Err((
                 Error::Rtw89Wifi(error),
-                Some(Box::new((preparing, mapping))),
-            ));
+                Some(Box::new((preparing, mapping)) as Box<dyn Any>),
+            )
+                .into());
         }
     };
     // SYS_CFG1, with memory decode on: a read only.
     let sys_cfg1 = match io.read32(0xf0) {
         Ok(sys_cfg1) => sys_cfg1,
         Err(error) => {
-            let error = BringUpError {
-                step: "identity",
-                error,
-            };
-            return Err((Error::Rtw89Wifi(error), Some(Box::new((preparing, io)))));
+            let error = BringUpError::new("identity", error);
+            return Err(keep_error(Error::Rtw89Wifi(error), (preparing, io)).into());
         }
     };
     let observed = realtek_wifi::identity::Observed {
@@ -803,7 +820,11 @@ pub(super) unsafe fn rtw89_wifi(
         }),
         // A failure after the rings were programmed left them quarantined;
         // the requester, its domain and BAR2 stay kept.
-        Err(error) => Err((error, Some(Box::new(device)))),
+        Err((error, was_on)) => Err(Rtw89Down {
+            error,
+            was_on,
+            kept: Some(Box::new(device)),
+        }),
     }
 }
 
@@ -947,7 +968,9 @@ impl Rtw89Device for Rtw89Native {
 /// 4. set Bus Master;
 /// 5. [`bring_up`] on that domain.
 ///
-/// Returns the report, the rings DMA ran on, and whether the MAC was on.
+/// Returns the report, the rings DMA ran on, and whether the MAC was on;
+/// a failure is returned with whether the MAC was on as well, since a MAC
+/// left on was powered off before any failure past step 2.
 ///
 /// # Safety
 /// `device.io()` is the exclusive uncached BAR2 window of the original PCI
@@ -967,10 +990,11 @@ pub(super) unsafe fn rtw89_attach<D: Rtw89Device + ?Sized>(
     observed: realtek_wifi::identity::Observed,
     firmware: &dyn crate::firmware::Provider,
     pages: &dyn PageSource,
-) -> Result<(Running, Rings, bool), Error> {
+) -> Result<(Running, Rings, bool), (Error, bool)> {
     use realtek_wifi::firmware::Layout;
-    let fail = |step, error| Error::Rtw89Wifi(BringUpError { step, error });
-    let (profile, staged) = rtw89_stage(observed, firmware).map_err(Error::Rtw89Wifi)?;
+    let fail = |step, error| (Error::Rtw89Wifi(BringUpError::new(step, error)), false);
+    let (profile, staged) =
+        rtw89_stage(observed, firmware).map_err(|error| (Error::Rtw89Wifi(error), false))?;
     let Layout::Rtw89(parsed) = &staged.layout else {
         return Err(fail(
             "firmware",
@@ -978,6 +1002,28 @@ pub(super) unsafe fn rtw89_attach<D: Rtw89Device + ?Sized>(
         ));
     };
     let was_on = quiesce(device.io()).map_err(|error| fail("quiesce", error))?;
+    // SAFETY: this function's contract, with the chip just quiesced.
+    match unsafe { rtw89_take_over(device, profile.cut(), &parsed.image, pages) } {
+        Ok((running, rings)) => Ok((running, rings, was_on)),
+        Err(error) => Err((error, was_on)),
+    }
+}
+
+/// Steps 3 to 5 of [`rtw89_attach`], on a chip [`quiesce`] just stopped.
+///
+/// # Safety
+/// As for [`rtw89_attach`], and `quiesce` returned `Ok` on `device.io()`
+/// just before.
+#[expect(
+    clippy::result_large_err,
+    reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
+)]
+unsafe fn rtw89_take_over<D: Rtw89Device + ?Sized>(
+    device: &mut D,
+    cut: u8,
+    image: &realtek_wifi::firmware::AxImage<'_>,
+    pages: &dyn PageSource,
+) -> Result<(Running, Rings), Error> {
     // SAFETY: `acknowledge_quiescence`'s contract, point by point:
     // - Engine stop and submission exclusion, with no restart: Bus Master
     //   has been clear since the mount parked the function, so no engine of
@@ -1004,7 +1050,6 @@ pub(super) unsafe fn rtw89_attach<D: Rtw89Device + ?Sized>(
     //   Stela DMA backing before this point.
     let domain = unsafe { device.finalize() }?;
     device.master()?;
-    let image = &parsed.image;
     // SAFETY: `bring_up`'s contract:
     // - `device.io()` is the exclusive register window of exactly the
     //   requester whose own domain `finalize` just bound: the receipt
@@ -1016,9 +1061,7 @@ pub(super) unsafe fn rtw89_attach<D: Rtw89Device + ?Sized>(
     //   Bus Master, memory decode and INTx Disable).
     // - One worker: the probe drives this function alone, with no
     //   interrupt handler, reset or other engine reaching it.
-    let (running, rings) = unsafe { bring_up(device.io(), pages, domain, profile.cut(), image) }
-        .map_err(Error::Rtw89Wifi)?;
-    Ok((running, rings, was_on))
+    unsafe { bring_up(device.io(), pages, domain, cut, image) }.map_err(Error::Rtw89Wifi)
 }
 
 /// The RTL8852C profile of `observed`, and its firmware staged from
@@ -1034,7 +1077,7 @@ fn rtw89_stage(
     BringUpError,
 > {
     use realtek_wifi::identity::{Chip, IdentityError, Profile};
-    let fail = |step, error| BringUpError { step, error };
+    let fail = BringUpError::new;
     let profile = match Profile::select(observed) {
         Ok(profile) if profile.chip() == Chip::Rtl8852C => profile,
         Err(IdentityError::FailedRead) => {
@@ -1043,7 +1086,9 @@ fn rtw89_stage(
         Ok(_) | Err(IdentityError::UnsupportedPci | IdentityError::TestChip) => {
             return Err(fail(
                 "identity",
-                AxError::FirmwareFile("not an RTL8852CE, whose firmware this is"),
+                AxError::Identity(
+                    "its PCI vendor and device IDs are not the RTL8852CE's 10ec:c852",
+                ),
             ));
         }
     };
@@ -2071,7 +2116,11 @@ mod tests {
         let result = unsafe { rtw89_wifi(&services, address(), inputs) };
         assert!(matches!(
             result,
-            Err((Error::Native(ServiceError::Unavailable), None))
+            Err(Rtw89Down {
+                error: Error::Native(ServiceError::Unavailable),
+                was_on: false,
+                kept: None,
+            })
         ));
         // Through the cold preparation, never the sealed stopped claim.
         assert_eq!(*services.preparations.borrow(), [address()]);
@@ -2253,7 +2302,7 @@ mod tests {
     }
 
     /// What [`rtw89_attach`] returns.
-    type Attached = Result<(Running, Rings, bool), Error>;
+    type Attached = Result<(Running, Rings, bool), (Error, bool)>;
 
     /// Run [`rtw89_attach`] on a chip whose MAC reads `mac`.
     fn attach(
@@ -2286,8 +2335,8 @@ mod tests {
     #[test]
     fn missing_firmware_fails_before_any_register_access() {
         let (events, result) = attach(0, false, &crate::firmware::HandoffProvider::new(None));
-        let Err(error) = result else {
-            panic!("an RTL8852CE came up with no firmware")
+        let Err((error, false)) = result else {
+            panic!("an RTL8852CE came up with no firmware, or its MAC read on")
         };
         assert!(events.is_empty(), "{events:x?}");
         assert!(matches!(
@@ -2295,6 +2344,7 @@ mod tests {
             Error::Rtw89Wifi(BringUpError {
                 step: "firmware",
                 error: AxError::FirmwareFile("rtw89/rtw8852c_fw-2.bin is not on the USB stick"),
+                ..
             })
         ));
         let at = address();
@@ -2326,8 +2376,8 @@ mod tests {
             &crate::firmware::HandoffProvider::new(Some(&catalog)),
         );
         assert!(events.is_empty(), "{events:x?}");
-        let Err(error) = result else {
-            panic!("an RTL8852CE came up on a malformed image")
+        let Err((error, false)) = result else {
+            panic!("an RTL8852CE came up on a malformed image, or its MAC read on")
         };
         assert_eq!(
             alloc::format!("{error}"),
@@ -2363,20 +2413,24 @@ mod tests {
         assert!(events.len() > 3);
         assert!(matches!(
             result,
-            Err(Error::Rtw89Wifi(BringUpError { step, .. })) if step != "firmware" && step != "quiesce"
+            Err((Error::Rtw89Wifi(BringUpError { step, .. }), false))
+                if step != "firmware" && step != "quiesce"
         ));
     }
 
     /// A chip left on is powered off, coex told last, before its
-    /// quiescence is acknowledged; nothing is written before that.
+    /// quiescence is acknowledged; nothing is written before that. The
+    /// bring-up after it fails here (the model domain maps nothing), and the
+    /// failure still says the MAC was left on.
     #[test]
     fn a_chip_left_on_is_powered_off_before_the_acknowledgement() {
         let catalog = empty_image();
-        let (events, _) = attach(
+        let (events, result) = attach(
             0x100,
             false,
             &crate::firmware::HandoffProvider::new(Some(&catalog)),
         );
+        assert!(matches!(result, Err((Error::Rtw89Wifi(_), true))));
         let finalize = position(&events, Event::Finalize);
         assert_eq!(events[0], Event::Read(0x03F0));
         let before = &events[..finalize];
@@ -2413,14 +2467,15 @@ mod tests {
                 &crate::firmware::HandoffProvider::new(Some(&catalog)),
             );
             assert_eq!(events, [Event::Read(0x03F0)], "{mac:#x}");
-            let Err(error) = result else {
-                panic!("a MAC in state {state} came up")
+            let Err((error, false)) = result else {
+                panic!("a MAC in state {state} came up, or was taken as on")
             };
             assert!(matches!(
                 error,
                 Error::Rtw89Wifi(BringUpError {
                     step: "quiesce",
                     error: AxError::MacPowerState(found),
+                    ..
                 }) if found == state
             ));
             if state == 2 {
@@ -2433,7 +2488,8 @@ mod tests {
                     ),
                     "HOST DEVICE FAILED pci=0000:03:00.0 (Wi-Fi) error=rtw89: RTL8852CE bring-up: \
                      quiesce: the MAC is in firmware-managed low power (LPS), so its firmware may \
-                     still run; Bus Master stays off"
+                     still run; Bus Master stays off; power the machine fully off (not restart) \
+                     and boot again"
                 );
             }
         }
@@ -2449,8 +2505,8 @@ mod tests {
             &crate::firmware::HandoffProvider::new(Some(&catalog)),
         );
         assert!(events.is_empty(), "{events:x?}");
-        let Err(error) = result else {
-            panic!("an RTL8852CE came up on the firmware of another adapter")
+        let Err((error, false)) = result else {
+            panic!("an RTL8852CE came up on the firmware of another adapter, or its MAC read on")
         };
         assert_eq!(
             alloc::format!("{error}"),
@@ -2493,8 +2549,26 @@ mod tests {
         assert_eq!(events, [Event::Read(0x03F0), Event::Finalize]);
         assert!(matches!(
             result,
-            Err(Error::Native(ServiceError::Refused("model refusal")))
+            Err((Error::Native(ServiceError::Refused("model refusal")), false))
         ));
+    }
+
+    /// A function whose IDs name another chip fails its identity, with no
+    /// firmware wording.
+    #[test]
+    fn another_chip_is_refused_by_its_identity() {
+        let observed = realtek_wifi::identity::Observed {
+            device: 0xb852,
+            ..rtl8852ce()
+        };
+        let Err(error) = rtw89_stage(observed, &crate::firmware::HandoffProvider::new(None)) else {
+            panic!("an RTL8852BE was staged as an RTL8852CE")
+        };
+        assert_eq!(
+            alloc::format!("{error}"),
+            "RTL8852CE bring-up: identity: its PCI vendor and device IDs are not the RTL8852CE's \
+             10ec:c852"
+        );
     }
 
     /// An RTL8852CE configuration space with MSI enabled by firmware:
