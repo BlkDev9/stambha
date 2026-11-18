@@ -51,6 +51,11 @@ const TX_CHANNELS: usize = 13;
 const RX_CHANNELS: usize = 2;
 const TX_RING_BYTES: usize = TX_ENTRIES * BD_BYTES;
 const RX_RING_BYTES: usize = RX_ENTRIES * BD_BYTES;
+/// Each RX BD ring starts on its own page of the RX pool, so every DESA is
+/// page aligned whatever alignment the HAXI engine needs. (Linux's RPQ sits
+/// 256 BDs = 2048 bytes into its pool.)
+const RX_RING_STRIDE: usize = 4096;
+const _: () = assert!(RX_RING_BYTES <= RX_RING_STRIDE);
 /// `RTW89_TXCH_CH12`, the FWCMD channel.
 const CH12: usize = 12;
 
@@ -274,10 +279,17 @@ impl Rings {
     /// zeroed TX BDs, and each RX BD pointing at a zeroed buffer of
     /// `RX_BUFFER_BYTES`. Nothing reaches the device until `pre_init`.
     ///
-    /// `domain` must be the DMA domain of the requester that `pre_init`'s
-    /// register window drives, and the memory must be coherent for it (WB
-    /// with NoSnoop and ATS disabled), as for rtw88's rings.
-    pub fn install(source: &dyn PageSource, domain: Arc<dyn DmaDomain>) -> Result<Self, AxError> {
+    /// # Safety
+    /// `domain` isolates exactly the RTL8852C PCI requester whose register
+    /// window these rings will be given to by `pre_init`. `source` yields
+    /// real coherent WB DMA RAM for that requester, with NoSnoop and ATS
+    /// disabled (WB alone is not coherence proof). One worker owns the
+    /// device and these rings; no other engine, IRQ or reset worker touches
+    /// them.
+    pub unsafe fn install(
+        source: &dyn PageSource,
+        domain: Arc<dyn DmaDomain>,
+    ) -> Result<Self, AxError> {
         let tx = Allocation::new(
             source,
             domain.clone(),
@@ -287,7 +299,7 @@ impl Rings {
         let rx = Allocation::new(
             source,
             domain.clone(),
-            RX_CHANNELS * RX_RING_BYTES,
+            RX_CHANNELS * RX_RING_STRIDE,
             Direction::Bidirectional,
         )?;
         let mut rx_buffers = Vec::new();
@@ -322,18 +334,21 @@ impl Rings {
             .tx
             .dma
             .sync_for_device(0..TX_CHANNELS * TX_RING_BYTES)?;
-        // RX ring r entry e is buffer r * RX_ENTRIES + e, BD at the same index.
+        zero(&rings.rx, RX_CHANNELS * RX_RING_STRIDE)?;
+        // RX ring r entry e is buffer r * RX_ENTRIES + e; its BD is entry e
+        // of the ring that starts at page r of the pool.
         for (i, buffer) in rings.rx_buffers.iter().enumerate() {
             // `memset(skb->data, 0, buf_sz)` before `dma_map_single`.
             zero(buffer, RX_BUFFER_BYTES)?;
             buffer.dma.sync_for_device(0..RX_BUFFER_BYTES)?;
             let bd = encode_rxbd(RX_BUFFER_BYTES as u16, u64::from(buffer.address()?));
-            rings.rx.write(i * BD_BYTES, &bd)?;
+            let at = (i / RX_ENTRIES) * RX_RING_STRIDE + (i % RX_ENTRIES) * BD_BYTES;
+            rings.rx.write(at, &bd)?;
         }
         rings
             .rx
             .dma
-            .sync_for_device(0..RX_CHANNELS * RX_RING_BYTES)?;
+            .sync_for_device(0..RX_CHANNELS * RX_RING_STRIDE)?;
         Ok(rings)
     }
 
@@ -347,7 +362,7 @@ impl Rings {
     }
 
     fn rx_ring(&self, channel: usize) -> Result<u32, AxError> {
-        Ok(self.rx.address()? + (channel * RX_RING_BYTES) as u32)
+        Ok(self.rx.address()? + (channel * RX_RING_STRIDE) as u32)
     }
 }
 
@@ -383,7 +398,19 @@ fn zero(allocation: &Allocation, bytes: usize) -> Result<(), AxError> {
 ///
 /// Runs after the MAC's DMAC pre-init, as `rtw89_mac_partial_init` orders
 /// them; nothing here assumes it runs first. A failure leaves CH12 stopped.
-pub fn pre_init<I: AxIo + ?Sized>(io: &mut I, cut: u8, rings: &Rings) -> Result<(), AxError> {
+///
+/// # Safety
+/// `io` is the exclusive register window of exactly the RTL8852C requester
+/// that `rings`' DMA domain isolates, and `rings` was installed on real
+/// coherent WB RAM for it with NoSnoop and ATS disabled. This publishes
+/// every ring address to that device and starts its DMA (RX included).
+/// One worker owns the device and the queues: no other engine, IRQ or reset
+/// worker touches them.
+pub unsafe fn pre_init<I: AxIo + ?Sized>(
+    io: &mut I,
+    cut: u8,
+    rings: &Rings,
+) -> Result<(), AxError> {
     rings.ch12_ready.set(false);
     // rtw89_pci_ber: only on the Dell RTW89_QUIRK_PCI_BER DMI models.
     // rtw89_pci_rxdma_prefth, _l1off_pwroff, _l2_rxen_lat, _aphy_pwrcut,
@@ -574,7 +601,18 @@ impl Ch12<'_> {
     ///
     /// A failure after the packet was handed over leaves the queue refusing
     /// further packets until the next successful `pre_init`.
-    pub fn submit<I: AxIo + ?Sized>(&mut self, io: &mut I, packet: &[u8]) -> Result<(), AxError> {
+    ///
+    /// # Safety
+    /// `io` is the exclusive register window of the same RTL8852C requester
+    /// that `pre_init` programmed with these rings, and the `pre_init`
+    /// contract still holds: its DMA domain isolates that requester, the
+    /// rings are coherent WB RAM with NoSnoop and ATS disabled, and one
+    /// worker owns the device and this queue.
+    pub unsafe fn submit<I: AxIo + ?Sized>(
+        &mut self,
+        io: &mut I,
+        packet: &[u8],
+    ) -> Result<(), AxError> {
         let rings = &mut *self.rings;
         if !rings.ch12_ready.get() {
             return Err(AxError::Dma("CH12 is stopped"));

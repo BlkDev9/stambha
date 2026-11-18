@@ -15,7 +15,23 @@ const FWCMD: u32 = 0x1013_0000;
 const MAPPINGS: usize = 19;
 
 fn install(m: &Arc<Mutex<Model>>) -> Rings {
-    Rings::install(&Source, Arc::new(Domain(m.clone()))).unwrap()
+    // SAFETY: the model domain isolates only the modeled requester behind
+    // the test's `RegisterModel`; its pages are plain kept test RAM with no
+    // real device, and this test is the queue's only worker.
+    unsafe { Rings::install(&Source, Arc::new(Domain(m.clone()))) }.unwrap()
+}
+
+fn start(io: &mut RegisterModel, cut: u8, rings: &Rings) -> Result<(), AxError> {
+    // SAFETY: `io` is the modeled requester that `rings`' model domain
+    // isolates; no real device can reach the published IOVAs, and this test
+    // is the only worker.
+    unsafe { pre_init(io, cut, rings) }
+}
+
+fn send(rings: &mut Rings, io: &mut RegisterModel, packet: &[u8]) -> Result<(), AxError> {
+    // SAFETY: every test sends on the same `RegisterModel` that `start`
+    // programmed with these rings, under the same model-only contract.
+    unsafe { rings.ch12().submit(io, packet) }
 }
 
 /// The BD RAM reset (0x1000 bit3) self-clears, as the hardware's does.
@@ -53,7 +69,7 @@ fn running() -> (Arc<Mutex<Model>>, Rings, RegisterModel) {
     let m = Arc::new(Mutex::new(Model::default()));
     let rings = install(&m);
     let mut io = settled();
-    pre_init(&mut io, 2, &rings).unwrap();
+    start(&mut io, 2, &rings).unwrap();
     io.trace.clear();
     (m, rings, io)
 }
@@ -83,7 +99,7 @@ fn pre_init_matches_linux_sequence() {
             }
         }),
     );
-    pre_init(&mut io, 2, &rings).unwrap();
+    start(&mut io, 2, &rings).unwrap();
     let t = |channel: u32| TX_POOL + channel * 16 * 8;
     let expected = vec![
         // rtw89_pci_deglitch_setting, 8852C: 0x3800/0x3880 + RAC_ANA24 * 2 [11:8].
@@ -188,8 +204,8 @@ fn pre_init_matches_linux_sequence() {
         Op::W16(0x1210, 8), // RXQ
         Op::W32(0x1220, RX_POOL),
         Op::W32(0x1224, 0),
-        Op::W16(0x1212, 8), // RPQ
-        Op::W32(0x1228, RX_POOL + 8 * 8),
+        Op::W16(0x1212, 8), // RPQ: its own page of the RX pool.
+        Op::W32(0x1228, RX_POOL + 4096),
         Op::W32(0x122C, 0),
         // rtw89_pci_init_wp_16sel (pci.c:1722).
         Op::W32(0x1334, 0x0302_0100),
@@ -231,7 +247,7 @@ fn pre_init_writes(cut: u8) -> Vec<Op> {
     let m = Arc::new(Mutex::new(Model::default()));
     let rings = install(&m);
     let mut io = settled();
-    pre_init(&mut io, cut, &rings).unwrap();
+    start(&mut io, cut, &rings).unwrap();
     io.writes()
 }
 
@@ -299,7 +315,7 @@ fn install_points_every_rx_bd_at_a_zeroed_buffer() {
             state.mappings.len(),
             directions,
             device_read(&state, u64::from(TX_POOL), 13 * 16 * 8),
-            device_read(&state, u64::from(RX_POOL), 2 * 8 * 8),
+            device_read(&state, u64::from(RX_POOL), 2 * 4096),
             contents,
         )
     };
@@ -312,13 +328,17 @@ fn install_points_every_rx_bd_at_a_zeroed_buffer() {
     want.extend([Direction::FromDevice; 16]);
     assert_eq!(directions, want);
     assert_eq!(tx_bds, vec![0; 13 * 16 * 8]);
+    // RXQ's 8 BDs start the pool and RPQ's start its second page; the rest
+    // of each page stays zero.
+    let mut want = vec![0u8; 2 * 4096];
     for (i, buffer) in buffers.iter().enumerate() {
         // le16 buf_size 11498, le16 opt 0 (dma[39:32] = 0), le32 dma.
-        let mut bd = vec![0xEA, 0x2C, 0, 0];
-        bd.extend_from_slice(&buffer.to_le_bytes());
-        assert_eq!(rx_bds[i * 8..][..8], bd[..]);
+        let at = (i / 8) * 4096 + (i % 8) * 8;
+        want[at..at + 4].copy_from_slice(&[0xEA, 0x2C, 0, 0]);
+        want[at + 4..at + 8].copy_from_slice(&buffer.to_le_bytes());
         assert_eq!(contents[i], vec![0; RX_BUFFER_BYTES]);
     }
+    assert_eq!(rx_bds, want);
     // Never programmed: every mapping is returned.
     drop(rings);
     assert!(m.lock().unwrap().mappings.is_empty());
@@ -341,7 +361,7 @@ fn submit_waits_for_reclaim() {
         (s.syncs, s.cpu_syncs)
     };
     let packet: Vec<u8> = (0..16 + 2020).map(|i| i as u8).collect();
-    rings.ch12().submit(&mut io, &packet).unwrap();
+    send(&mut rings, &mut io, &packet).unwrap();
     assert_eq!(
         io.trace,
         [
@@ -368,29 +388,29 @@ fn submit_waits_for_reclaim() {
 #[test]
 fn submit_times_out_without_reclaim() {
     let (_m, mut rings, mut io) = running();
-    let start = io.now;
+    let began = io.now;
     assert_eq!(
-        rings.ch12().submit(&mut io, &[1, 2, 3]),
+        send(&mut rings, &mut io, &[1, 2, 3]),
         Err(AxError::Timeout {
             register: 0x1080,
             mask: 0x0FFF_0000
         })
     );
-    assert!(io.now - start >= 400_000);
+    assert!(io.now - began >= 400_000);
     assert_eq!(io.trace[0], Op::W16(0x1080, 1));
     assert!(io.writes()[1..].iter().all(|op| *op == Op::Delay(1)));
     // The entry may still be in flight: nothing more is sent.
     io.trace.clear();
     assert_eq!(
-        rings.ch12().submit(&mut io, &[4]),
+        send(&mut rings, &mut io, &[4]),
         Err(AxError::Dma("CH12 is stopped"))
     );
     assert!(io.trace.is_empty());
     // A new pre_init drains the DMA and restarts CH12 from index 0.
-    pre_init(&mut io, 2, &rings).unwrap();
+    start(&mut io, 2, &rings).unwrap();
     io.trace.clear();
     reclaim_at_once(&mut io);
-    rings.ch12().submit(&mut io, &[5]).unwrap();
+    send(&mut rings, &mut io, &[5]).unwrap();
     assert_eq!(io.trace, [Op::W16(0x1080, 1), Op::R32(0x1080)]);
 }
 
@@ -398,9 +418,8 @@ fn submit_times_out_without_reclaim() {
 fn submit_wraps_at_ring_size() {
     let (m, mut rings, mut io) = running();
     reclaim_at_once(&mut io);
-    let mut ch12 = rings.ch12();
     for i in 0..17u8 {
-        ch12.submit(&mut io, &[i; 40]).unwrap();
+        send(&mut rings, &mut io, &[i; 40]).unwrap();
     }
     let kicks: Vec<u16> = io
         .trace
@@ -433,17 +452,17 @@ fn submit_refuses_before_pre_init_and_bad_lengths() {
     let mut rings = install(&m);
     let mut io = settled();
     assert_eq!(
-        rings.ch12().submit(&mut io, &[1]),
+        send(&mut rings, &mut io, &[1]),
         Err(AxError::Dma("CH12 is stopped"))
     );
-    pre_init(&mut io, 2, &rings).unwrap();
+    start(&mut io, 2, &rings).unwrap();
     io.trace.clear();
     let length = Err(AxError::Dma("CH12 packet length"));
-    assert_eq!(rings.ch12().submit(&mut io, &[]), length);
-    assert_eq!(rings.ch12().submit(&mut io, &[0; 4097]), length);
+    assert_eq!(send(&mut rings, &mut io, &[]), length);
+    assert_eq!(send(&mut rings, &mut io, &[0; 4097]), length);
     assert!(io.trace.is_empty());
     reclaim_at_once(&mut io);
-    rings.ch12().submit(&mut io, &[7; 4096]).unwrap();
+    send(&mut rings, &mut io, &[7; 4096]).unwrap();
 }
 
 #[test]
@@ -453,7 +472,7 @@ fn failed_idle_poll_keeps_rings_unpublished_and_ch12_stopped() {
     let mut io = settled();
     io.set32(0x101C, 1 << 18); // CH12 stays busy.
     assert_eq!(
-        pre_init(&mut io, 2, &rings),
+        start(&mut io, 2, &rings),
         Err(AxError::Timeout {
             register: 0x101C,
             mask: 0x0007_FF00
@@ -465,7 +484,7 @@ fn failed_idle_poll_keeps_rings_unpublished_and_ch12_stopped() {
             .any(|op| matches!(op, Op::W16(0x1038, _) | Op::W32(0x1280, _)))
     );
     assert_eq!(
-        rings.ch12().submit(&mut io, &[1]),
+        send(&mut rings, &mut io, &[1]),
         Err(AxError::Dma("CH12 is stopped"))
     );
     drop(rings);
