@@ -71,7 +71,10 @@ impl fmt::Display for Running {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BringUpError {
     /// One of `"power on"`, `"secure boot"`, `"dma rings"`,
-    /// `"mac pre-init"`, `"pci pre-init"`, `"firmware download"`, `"efuse"`.
+    /// `"mac pre-init"`, `"pci pre-init"`, `"firmware download"`, `"efuse"`;
+    /// the probe that stages the firmware and opens the register window
+    /// before [`bring_up`] adds `"identity"`, `"firmware"` and
+    /// `"register window"`.
     pub step: &'static str,
     pub error: AxError,
 }
