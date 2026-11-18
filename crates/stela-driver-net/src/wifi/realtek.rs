@@ -5,6 +5,7 @@
 //! firmware layout from rtw89 and nothing more of it yet. Pinned rtw88/rtw89 are
 //! hardware references, not a Linux kernel interface.
 pub mod attach;
+pub mod ax;
 pub mod beacon;
 pub mod bit_rate;
 pub mod bootstrap;
