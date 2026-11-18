@@ -18,6 +18,7 @@ const R_AX_SYS_ADIE_PAD_PWR_CTRL: u32 = 0x0018;
 const R_AX_AFE_CTRL1: u32 = 0x0024;
 const R_AX_SYS_SDIO_CTRL: u32 = 0x0070;
 const R_AX_SYS_ISO_CTRL_EXTEND: u32 = 0x0080;
+const R_AX_SCOREBOARD: u32 = 0x00AC;
 const R_AX_PLATFORM_ENABLE: u32 = 0x0088;
 const R_AX_WLLPS_CTRL: u32 = 0x0090;
 const R_AX_PMC_DBG_CTRL2: u32 = 0x00CC;
@@ -84,6 +85,7 @@ const B_AX_SYM_CTRL_SPS_PWMFREQ: u32 = bit(10);
 const B_AX_WL_XTAL_SI_CMD_POLL: u32 = bit(31);
 const B_AX_WLMAC_PWR_STE_MASK: u32 = 0x300; // GENMASK(9, 8)
 const MAC_AX_MAC_ON: u32 = 1;
+const MAC_AX_NOTIFY_PWR_MAJOR: u8 = 0x80;
 const XTAL_SI_NORMAL_WRITE: u32 = 0;
 const XTAL_SI_NORMAL_READ: u32 = 1;
 
@@ -181,11 +183,19 @@ fn power_on_once<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
 
 /// `rtw89_mac_pwr_on`: on any failure, power off (its result ignored) and
 /// try the power switch once more.
+/// `rtw89_mac_power_switch(false)`: `rtw8852c_pwr_off_func`, then, only if it
+/// succeeded, `rtw89_mac_update_scoreboard(MAC_AX_NOTIFY_PWR_MAJOR)`, i.e.
+/// write8 `R_AX_SCOREBOARD + 3` = 0x80 (`mac.c:1580`, `btc_sb` of rtw8852c).
+fn power_switch_off<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
+    power_off(io)?;
+    io.write8(R_AX_SCOREBOARD + 3, MAC_AX_NOTIFY_PWR_MAJOR)
+}
+
 pub fn power_on<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
     if power_on_once(io).is_ok() {
         return Ok(());
     }
-    let _ = power_off(io);
+    let _ = power_switch_off(io);
     power_on_once(io)
 }
 
@@ -288,9 +298,11 @@ fn pwr_on_func<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
     )
 }
 
-/// `rtw89_mac_power_switch(false)` for PCIe: `rtw8852c_pwr_off_func`
-/// (`rtw8852c.c:439-530`). An unplugged device would use another function
-/// in Linux; that path does not exist here.
+/// `rtw89_mac_power_switch(false)` without its tail: `rtw8852c_pwr_off_func`
+/// (`rtw8852c.c:439-530`) only. Linux then notifies BT coex through the
+/// scoreboard (`power_switch_off` does that for `power_on`'s retry); a caller
+/// powering off on its own must append `write8(0x00AF, 0x80)`. An unplugged
+/// device would use another function in Linux; that path does not exist here.
 pub fn power_off<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
     xtal_si_write(io, XTAL_SI_ANAPAR_WL, XTAL_SI_RFC2RF, XTAL_SI_RFC2RF)?;
     xtal_si_write(io, XTAL_SI_ANAPAR_WL, 0, XTAL_SI_OFF_EI)?;
@@ -581,8 +593,10 @@ mod tests {
         // Power-off first, then the whole power-on.
         let off = off_trace();
         assert_eq!(w[..off.len()], off[..]);
+        // mac.c:1580: power_switch(false) tells BT coex WL went down.
+        assert_eq!(w[off.len()], Op::W8(0x00AF, 0x80));
         // The retry starts from the off sequence's leftover SYS_PW_CTRL (APFM_SWLPS set).
-        assert_eq!(w[off.len()], Op::W32(0x0004, 0x0003_0400));
+        assert_eq!(w[off.len() + 1], Op::W32(0x0004, 0x0003_0400));
         assert_eq!(w.last(), Some(&Op::W32(0x02DC, 0x0100_0000)));
         let dmac = Op::W32(0x8400, 0x7FFF_C000);
         assert_eq!(w.iter().filter(|op| **op == dmac).count(), 1);
@@ -594,7 +608,9 @@ mod tests {
         m.on_read(0x03F0, Box::new(|_m: &mut RegisterModel| 0x100));
         assert_eq!(power_on(&mut m), Err(AxError::AlreadyPowered));
         // Exactly one power-off ran; the power-on body never started.
-        assert_eq!(m.writes(), off_trace());
+        let mut expected = off_trace();
+        expected.push(Op::W8(0x00AF, 0x80));
+        assert_eq!(m.writes(), expected);
     }
 
     #[test]
