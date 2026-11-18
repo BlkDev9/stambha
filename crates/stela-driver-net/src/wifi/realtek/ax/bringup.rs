@@ -158,22 +158,35 @@ fn power_down<I: AxIo + ?Sized>(io: &mut I) {
     let _ = power::power_switch_off(io);
 }
 
-/// Stop an RTL8852CE that firmware or an earlier driver left powered on,
-/// before its requester is taken over: when `R_AX_IC_PWR_STATE` reads the
-/// MAC on (`rtw89_mac_reset_pwr_state_ax`'s test), `rtw89_mac_power_switch
-/// (false)` runs (`rtw8852c_pwr_off_func`, then the `MAC_AX_NOTIFY_PWR_MAJOR`
-/// scoreboard). A MAC that reads off has nothing to stop. Returns whether
-/// the MAC was on.
+/// Stop an RTL8852CE that firmware or an earlier driver left running,
+/// before its requester is taken over, by its MAC power state
+/// (`R_AX_IC_PWR_STATE[9:8]`, `reg.h:332-334`):
+/// - 0, `MAC_AX_MAC_OFF`: nothing runs; nothing is written.
+/// - 1, `MAC_AX_MAC_ON`: the PCIe WPDMA is stopped and the AXI master and
+///   TX/RX HCI DMA disabled ([`pci::stop_dma`], the start of
+///   `rtw89_pci_ops_mac_pre_init_ax`), then `rtw89_mac_power_switch(false)`
+///   powers the MAC down (`rtw8852c_pwr_off_func`: WCPU, DMAC and CMAC
+///   functions off), then the `MAC_AX_NOTIFY_PWR_MAJOR` scoreboard.
+/// - 2, `MAC_AX_MAC_LPS`, firmware-managed power save with the WCPU alive
+///   and its HCI DMA path live, and 3, undefined: refused with
+///   `MacPowerState`, nothing written. Leaving LPS is the firmware's
+///   handshake, which is not ported, so the chip is never taken as stopped.
 ///
-/// With the MAC off its WCPU and DMA engines are unpowered; this proves
-/// nothing about DMA the device issued before, which the caller excludes
-/// (Bus Master clear).
+/// Returns whether the MAC was on. This proves nothing about DMA the device
+/// issued before, which the caller excludes (Bus Master clear).
 pub fn quiesce<I: AxIo + ?Sized>(io: &mut I) -> Result<bool, AxError> {
-    if !power::mac_on(io)? {
-        return Ok(false);
+    match power::mac_state(io)? {
+        power::MAC_AX_MAC_OFF => Ok(false),
+        power::MAC_AX_MAC_ON_STATE => {
+            pci::stop_dma(io)?;
+            power::power_switch_off(io)?;
+            Ok(true)
+        }
+        state => {
+            debug_assert!(state == power::MAC_AX_MAC_LPS || state == 3);
+            Err(AxError::MacPowerState(state))
+        }
     }
-    power::power_switch_off(io)?;
-    Ok(true)
 }
 
 /// The tail of `rtw89_mac_power_switch(true)` (`mac.c:1557-1570`), then the

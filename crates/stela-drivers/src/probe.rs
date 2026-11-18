@@ -4216,7 +4216,7 @@ mod tests {
             country: None,
         };
         let mut ecam = rtl8852ce_ecam();
-        let services = services::tests::Refusing::default();
+        let services = services::tests::Refusing::minimum_only();
         let devices = probe_rtl8852ce(&mut ecam, &services, Some(&network));
         assert!(devices.unsupported.is_empty(), "{:?}", devices.unsupported);
         assert_eq!(*services.preparations.borrow(), [address]);

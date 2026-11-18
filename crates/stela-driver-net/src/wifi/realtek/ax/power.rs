@@ -173,17 +173,24 @@ fn reset_pwr_state<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
     Ok(())
 }
 
-/// Whether `R_AX_IC_PWR_STATE` reads the MAC on, as
-/// `rtw89_mac_reset_pwr_state_ax` tests it. A register that reads all ones
-/// (the device is not answering) is an error, not "off".
-pub(crate) fn mac_on<I: AxIo + ?Sized>(io: &mut I) -> Result<bool, AxError> {
+/// `MAC_AX_MAC_OFF` (`reg.h:332`).
+pub(crate) const MAC_AX_MAC_OFF: u8 = 0;
+/// `MAC_AX_MAC_LPS` (`reg.h:334`): firmware-managed power save, WCPU alive.
+pub(crate) const MAC_AX_MAC_LPS: u8 = 2;
+/// `MAC_AX_MAC_ON` (`reg.h:333`), as a field value.
+pub(crate) const MAC_AX_MAC_ON_STATE: u8 = MAC_AX_MAC_ON as u8;
+
+/// The MAC power state field, `R_AX_IC_PWR_STATE[9:8]`, that
+/// `rtw89_mac_reset_pwr_state_ax` reads. A register that reads all ones
+/// (the device is not answering) is an error, not a state.
+pub(crate) fn mac_state<I: AxIo + ?Sized>(io: &mut I) -> Result<u8, AxError> {
     let state = io.read32(R_AX_IC_PWR_STATE)?;
     if state == u32::MAX {
         return Err(AxError::AllOnes {
             register: R_AX_IC_PWR_STATE,
         });
     }
-    Ok((state & B_AX_WLMAC_PWR_STE_MASK) >> 8 == MAC_AX_MAC_ON)
+    Ok(((state & B_AX_WLMAC_PWR_STE_MASK) >> 8) as u8)
 }
 
 /// `rtw89_mac_power_switch(true)` for PCIe: the already-on check, then

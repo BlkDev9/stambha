@@ -37,6 +37,10 @@ pub enum AxError {
     Efuse(&'static str),
     /// `rtw89_mac_reset_pwr_state_ax`: the MAC is already powered on (-EBUSY).
     AlreadyPowered,
+    /// `R_AX_IC_PWR_STATE[9:8]` read a state in which the chip cannot be
+    /// taken as stopped: 2 (`MAC_AX_MAC_LPS`, its firmware alive) or 3
+    /// (undefined).
+    MacPowerState(u8),
 }
 
 impl fmt::Display for AxError {
@@ -59,6 +63,15 @@ impl fmt::Display for AxError {
             Self::SecureBootUnsupported => f.write_str("secure-boot firmware is unsupported"),
             Self::Efuse(what) => write!(f, "efuse: {what}"),
             Self::AlreadyPowered => f.write_str("MAC has already powered on"),
+            Self::MacPowerState(2) => f.write_str(
+                "the MAC is in firmware-managed low power (LPS), so its firmware may still run; \
+                 Bus Master stays off",
+            ),
+            Self::MacPowerState(state) => write!(
+                f,
+                "the MAC power state reads {state}, which rtw89 does not define; Bus Master \
+                 stays off"
+            ),
         }
     }
 }

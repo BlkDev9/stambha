@@ -399,22 +399,50 @@ fn quiet(state: u32) -> RegisterModel {
 
 #[test]
 fn quiesce_leaves_a_mac_that_reads_off_alone() {
-    for state in [0x000, 0x200, 0x300] {
-        let mut io = quiet(state);
-        assert_eq!(quiesce(&mut io), Ok(false));
-        assert!(io.writes().is_empty(), "{state:#x}");
-    }
+    let mut io = quiet(0x000);
+    assert_eq!(quiesce(&mut io), Ok(false));
+    assert!(io.writes().is_empty());
 }
 
 #[test]
-fn quiesce_powers_off_a_mac_left_on_and_tells_coex() {
+fn quiesce_refuses_a_mac_in_lps_or_an_undefined_state_and_writes_nothing() {
+    for (state, field) in [(0x200, 2), (0x300, 3)] {
+        let mut io = quiet(state);
+        assert_eq!(quiesce(&mut io), Err(AxError::MacPowerState(field)));
+        assert!(io.writes().is_empty(), "{state:#x}");
+    }
+    assert_eq!(
+        AxError::MacPowerState(2).to_string(),
+        "the MAC is in firmware-managed low power (LPS), so its firmware may still run; Bus \
+         Master stays off"
+    );
+    assert_eq!(
+        AxError::MacPowerState(3).to_string(),
+        "the MAC power state reads 3, which rtw89 does not define; Bus Master stays off"
+    );
+}
+
+#[test]
+fn quiesce_stops_the_pcie_dma_then_powers_off_a_mac_left_on_and_tells_coex() {
     let mut io = quiet(0x100);
     assert_eq!(quiesce(&mut io), Ok(true));
-    let mut off = quiet(0x100);
-    power::power_off(&mut off).unwrap();
-    let mut expected = off.writes();
+    let mut expected = quiet(0x100);
+    pci::stop_dma(&mut expected).unwrap();
+    power::power_off(&mut expected).unwrap();
+    let mut expected = expected.writes();
     expected.push(Op::W8(0x00AF, 0x80));
     assert_eq!(io.writes(), expected);
+    // Linux's exact bits: STOP_WPDMA (0x1010 bit19), then STOP_AXI_MST
+    // (0x1000 bit17) set and TXHCI_EN/RXHCI_EN (bits 7, 15) cleared, all
+    // before the power-off's first XTAL SI command.
+    assert_eq!(
+        io.writes()[..3],
+        [
+            Op::W32(0x1010, 1 << 19),
+            Op::W32(0x1000, 1 << 17),
+            Op::W32(0x1000, 1 << 17),
+        ]
+    );
 }
 
 #[test]

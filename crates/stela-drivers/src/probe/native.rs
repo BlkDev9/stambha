@@ -691,7 +691,8 @@ pub struct Rtw89Up {
 /// Bring an RTL8852CE up to running firmware and power it off again, as
 /// Linux's probe leaves it (`rtw89_pci_probe` through
 /// `rtw89_chip_info_setup`); `rtw89_pci_setup_mapping` finds its registers
-/// in BAR2. The requester is taken through the mount's cold preparation, so
+/// in BAR2. The requester is taken through the mount's cold preparation and
+/// brought to D0 there ([`rtw89_wake`]), so
 /// Bus Master stays sealed off until the chip is quiesced and its own
 /// domain is bound ([`rtw89_attach`]).
 ///
@@ -706,9 +707,12 @@ pub(super) unsafe fn rtw89_wifi(
     address: Address,
     inputs: Rtw89Inputs,
 ) -> Result<Rtw89Up, Failure> {
+    let minimum = services
+        .minimum_delay()
+        .map_err(|error| (Error::Native(error), None))?;
     let refused = |error: ServiceError| (Error::Native(error), None);
     let mut preparing = services.prepare_requester(address).map_err(refused)?;
-    let bars = match preparing.function_mut().bars() {
+    let bars = match rtw89_wake(preparing.function_mut(), minimum.as_ref()) {
         Ok(bars) => bars,
         Err(error) => return Err(keep_error(error, preparing)),
     };
@@ -801,6 +805,22 @@ pub(super) unsafe fn rtw89_wifi(
         // the requester, its domain and BAR2 stay kept.
         Err(error) => Err((error, Some(Box::new(device)))),
     }
+}
+
+/// Restore D0 under preparation, then size the BARs, as the attaches of
+/// Intel's PCIe Bluetooth and bcm4377 do: a chip firmware left in D3hot then
+/// answers its registers, and the BARs a D3hot soft reset cleared are
+/// written back before they are sized. Bus Master stays sealed clear.
+#[expect(
+    clippy::result_large_err,
+    reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
+)]
+fn rtw89_wake<C: ConfigSpace>(
+    function: &mut Function<C>,
+    minimum: &dyn crate::bus::pci::power::Timer,
+) -> Result<[Option<Bar>; 6], Error> {
+    function.power_up(minimum)?;
+    Ok(function.bars()?)
 }
 
 /// The RTL8852CE's subsystem IDs and revision, then memory decode on with
@@ -961,11 +981,16 @@ pub(super) unsafe fn rtw89_attach<D: Rtw89Device + ?Sized>(
     // SAFETY: `acknowledge_quiescence`'s contract, point by point:
     // - Engine stop and submission exclusion, with no restart: Bus Master
     //   has been clear since the mount parked the function, so no engine of
-    //   the chip reached memory. `quiesce` just read R_AX_IC_PWR_STATE and,
-    //   for a MAC left on, ran `rtw8852c_pwr_off_func`, which powers the MAC
-    //   (its WCPU, DMAC and HCI DMA) down; a MAC that read off runs nothing.
-    //   No Stela queue or ring exists yet, and only `bring_up` below powers
-    //   the MAC on again, after the binding.
+    //   the chip reached memory. `quiesce` just read the MAC power state
+    //   (R_AX_IC_PWR_STATE[9:8]) and returned only for two states:
+    //   `MAC_AX_MAC_OFF`, in which the WCPU and every DMA engine are
+    //   unpowered; or `MAC_AX_MAC_ON`, after it stopped the PCIe WPDMA
+    //   (B_AX_STOP_WPDMA), stopped the AXI master and disabled the TX/RX HCI
+    //   DMA (`rtw89_pci_ctrl_dma_all(false)`), then powered the MAC down
+    //   (`rtw8852c_pwr_off_func`: the WCPU and the MAC-domain DMAC and CMAC
+    //   functions off). LPS, where the firmware is alive, and the undefined
+    //   state were refused before this. No Stela queue or ring exists yet,
+    //   and only `bring_up` below powers the MAC on again, after the binding.
     // - Firmware, IRQ delivery and worker users retired: the mount's cold
     //   grant excludes earlier firmware, IRQ and work users; MSI, MSI-X and
     //   INTx were turned off before BAR2 was read, no handler exists, and
@@ -1034,8 +1059,10 @@ fn staging(error: &realtek_wifi::identity::StageError) -> &'static str {
     use realtek_wifi::{firmware::ParseError, identity::StageError};
     match error {
         StageError::Resource(error) => match error.kind {
-            ErrorKind::Missing | ErrorKind::WrongTarget => {
-                "rtw89/rtw8852c_fw-2.bin is not on the USB stick"
+            ErrorKind::Missing => "rtw89/rtw8852c_fw-2.bin is not on the USB stick",
+            ErrorKind::WrongTarget => {
+                "rtw89/rtw8852c_fw-2.bin is on the USB stick only for another adapter, neither \
+                 this one nor the RTL8852CE chip binding"
             }
             ErrorKind::Truncated { .. } => {
                 "rtw89/rtw8852c_fw-2.bin on the USB stick is shorter than an rtw89 header"
@@ -2032,7 +2059,7 @@ mod tests {
     /// A refused claim of an RTL8852CE keeps no owner and touches nothing.
     #[test]
     fn a_refused_rtw89_claim_keeps_no_owner() {
-        let services = Refusing::default();
+        let services = Refusing::minimum_only();
         let inputs = Rtw89Inputs {
             firmware: Box::leak(Box::new(crate::firmware::HandoffProvider::new(None))),
             pages: services.pages(),
@@ -2192,12 +2219,18 @@ mod tests {
 
     /// A catalog holding `bytes` as `rtw89/rtw8852c_fw-2.bin` for the chip.
     fn catalog(bytes: Vec<u8>) -> crate::firmware::Catalog {
+        catalog_for("pci:10ec:c852", bytes)
+    }
+
+    /// A catalog holding `bytes` as `rtw89/rtw8852c_fw-2.bin`, bound to
+    /// `hardware`.
+    fn catalog_for(hardware: &str, bytes: Vec<u8>) -> crate::firmware::Catalog {
         use sha2::{Digest, Sha256};
         crate::firmware::Catalog::from_handoff(alloc::vec![crate::firmware::Resource {
             name: "rtw89/rtw8852c_fw-2.bin",
             target: crate::firmware::Target {
                 driver: "realtek-wifi",
-                hardware: "pci:10ec:c852",
+                hardware,
                 revision: realtek_wifi::identity::CHIP_REVISION,
                 board: None,
             },
@@ -2351,11 +2384,101 @@ mod tests {
             .iter()
             .filter(|event| matches!(event, Event::Write(..)))
             .collect();
-        // rtw8852c_pwr_off_func's last write sets APFM_SWLPS (0x0004 bit10).
+        // The PCIe WPDMA stops first: STOP_WPDMA (0x1010 bit19), then the
+        // AXI master stopped (0x1000 bit17) and TX/RX HCI DMA cleared.
+        assert_eq!(writes[0], &Event::Write(0x1010, 1 << 19));
+        assert_eq!(writes[1], &Event::Write(0x1000, 1 << 17));
+        assert!(
+            matches!(writes[2], Event::Write(0x1000, value) if value & (1 << 7 | 1 << 15) == 0)
+        );
+        // Then rtw8852c_pwr_off_func, its first write an XTAL SI command and
+        // its last setting APFM_SWLPS (0x0004 bit10), then the scoreboard.
+        assert!(matches!(writes[3], Event::Write(0x0270, _)));
         assert!(writes.contains(&&Event::Write(0x0004, 1 << 17 | 1 << 10)));
         assert_eq!(writes.last(), Some(&&Event::Write(0x00AF, 0x80)));
         assert!(!before.contains(&Event::Master));
         assert_eq!(events[finalize + 1], Event::Master);
+    }
+
+    /// A MAC in LPS, its firmware alive, or in the undefined state 3 is never
+    /// taken as stopped: nothing is written, the quiescence is never
+    /// acknowledged and Bus Master stays sealed off.
+    #[test]
+    fn a_mac_in_lps_or_an_undefined_state_is_never_finalized() {
+        let catalog = empty_image();
+        for (mac, state) in [(0x200, 2), (0x300, 3)] {
+            let (events, result) = attach(
+                mac,
+                false,
+                &crate::firmware::HandoffProvider::new(Some(&catalog)),
+            );
+            assert_eq!(events, [Event::Read(0x03F0)], "{mac:#x}");
+            let Err(error) = result else {
+                panic!("a MAC in state {state} came up")
+            };
+            assert!(matches!(
+                error,
+                Error::Rtw89Wifi(BringUpError {
+                    step: "quiesce",
+                    error: AxError::MacPowerState(found),
+                }) if found == state
+            ));
+            if state == 2 {
+                let at = address();
+                let devices = crate::probe::Devices::default();
+                assert_eq!(
+                    alloc::format!(
+                        "HOST DEVICE FAILED pci={at} ({}) error={error}",
+                        devices.subsystem(at, &error)
+                    ),
+                    "HOST DEVICE FAILED pci=0000:03:00.0 (Wi-Fi) error=rtw89: RTL8852CE bring-up: \
+                     quiesce: the MAC is in firmware-managed low power (LPS), so its firmware may \
+                     still run; Bus Master stays off"
+                );
+            }
+        }
+    }
+
+    /// The file on the stick, bound to another adapter, is named as such.
+    #[test]
+    fn firmware_for_another_adapter_is_named_as_such() {
+        let catalog = catalog_for("pci:10ec:b852", alloc::vec![0; 32]);
+        let (events, result) = attach(
+            0,
+            false,
+            &crate::firmware::HandoffProvider::new(Some(&catalog)),
+        );
+        assert!(events.is_empty(), "{events:x?}");
+        let Err(error) = result else {
+            panic!("an RTL8852CE came up on the firmware of another adapter")
+        };
+        assert_eq!(
+            alloc::format!("{error}"),
+            "rtw89: RTL8852CE bring-up: firmware: rtw89/rtw8852c_fw-2.bin is on the USB stick \
+             only for another adapter, neither this one nor the RTL8852CE chip binding"
+        );
+    }
+
+    /// A function firmware left in D3hot is brought to D0 before its BARs
+    /// are sized.
+    #[test]
+    fn d0_is_restored_before_the_bars_are_sized() {
+        let Ok(mut function) = Function::new(address(), Config::d3hot()) else {
+            panic!("the configuration fixture is a function")
+        };
+        let minimum = crate::minimum_model::owned(Clock {
+            ticks_per_microsecond: 1000,
+        });
+        // Only the order is checked: the BARs of the fixture are not real.
+        let _ = rtw89_wake(&mut function, minimum.as_ref());
+        let writes = &function.config().1;
+        let pmcsr = writes.iter().position(|offset| *offset == 0x44);
+        let sizing = writes
+            .iter()
+            .position(|offset| (0x10..0x28).contains(offset));
+        assert!(pmcsr.is_some() && sizing.is_some(), "{writes:x?}");
+        assert!(pmcsr < sizing, "{writes:x?}");
+        assert_eq!(function.config().0[0x44 / 4] & 3, 0);
     }
 
     /// A refused finalization leaves Bus Master clear.
@@ -2376,8 +2499,18 @@ mod tests {
 
     /// An RTL8852CE configuration space with MSI enabled by firmware:
     /// subsystem 1043:1b0d, revision 0, and an MSI capability at 0x50.
-    struct Config([u32; 64]);
+    struct Config([u32; 64], Vec<u16>);
     impl Config {
+        /// As [`Self::new`], with a power management capability at 0x40
+        /// whose PMCSR says D3hot.
+        fn d3hot() -> Self {
+            let mut config = Self::new();
+            config.0[0x34 / 4] = 0x40;
+            // PM: ID 1, next 0x50; PMCSR D3hot.
+            config.0[0x40 / 4] = 0x03 << 16 | 0x50 << 8 | 0x01;
+            config.0[0x44 / 4] = 3;
+            config
+        }
         fn new() -> Self {
             let mut words = [0; 64];
             words[0] = 0xc852_10ec;
@@ -2388,7 +2521,7 @@ mod tests {
             words[0x34 / 4] = 0x50;
             // MSI: ID 5, last, 64-bit, enabled.
             words[0x50 / 4] = (1 << 7 | 1) << 16 | 0x05;
-            Self(words)
+            Self(words, Vec::new())
         }
         fn command(&self) -> u16 {
             self.0[1] as u16
@@ -2408,18 +2541,21 @@ mod tests {
             Ok(self.0[usize::from(offset / 4)])
         }
         fn write8(&mut self, offset: u16, value: u8) -> Result<(), crate::bus::pci::ConfigError> {
+            self.1.push(offset);
             let word = &mut self.0[usize::from(offset / 4)];
             let shift = offset % 4 * 8;
             *word = *word & !(0xff << shift) | u32::from(value) << shift;
             Ok(())
         }
         fn write16(&mut self, offset: u16, value: u16) -> Result<(), crate::bus::pci::ConfigError> {
+            self.1.push(offset);
             let word = &mut self.0[usize::from(offset / 4)];
             let shift = offset % 4 * 8;
             *word = *word & !(0xffff << shift) | u32::from(value) << shift;
             Ok(())
         }
         fn write32(&mut self, offset: u16, value: u32) -> Result<(), crate::bus::pci::ConfigError> {
+            self.1.push(offset);
             self.0[usize::from(offset / 4)] = value;
             Ok(())
         }
