@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 // Copyright(c) 2019-2020  Realtek Corporation
+// Copyright(c) 2019-2022  Realtek Corporation
 //! RTL8852CE (PCIe) efuse access, from `rtw89_enable_efuse_pwr_cut_ddv` /
 //! `rtw89_disable_efuse_pwr_cut_ddv` (`efuse.c:74`, `:93`),
 //! `rtw89_dump_physical_efuse_map_ddv` and its 5-try wrapper
-//! `rtw89_dump_physical_efuse_map` (`efuse.c:112-198`),
-//! `rtw89_dump_logical_efuse_map` (`efuse.c:200-250`),
+//! `rtw89_dump_physical_efuse_map` (`efuse.c:113-228`),
+//! `rtw89_dump_logical_efuse_map` (`efuse.c:238-279`),
 //! `rtw89_efuse_recognize_mss_index_v0` / `_info_v1` and
-//! `rtw89_efuse_read_fw_secure_ax` (`efuse.c:421-500`), with the chip sizes of
+//! `rtw89_efuse_read_fw_secure_ax` (`efuse.c:427-516`), with the chip sizes of
 //! `rtw8852c_chip_info` and the MAC offset of `struct rtw8852c_efuse`
 //! (`rtw8852c.h:33-103`). Only the DDV (non-DAV) physical map is read; the
 //! DAV map, phycap, the efuse version byte and all other logical fields are
@@ -31,7 +32,7 @@ const SEC_CTRL_EFUSE_SIZE: usize = 4;
 const PHYSICAL_EFUSE_SIZE: usize = 1216;
 const LOGICAL_EFUSE_SIZE: usize = 2048;
 
-// efuse.c:21 and the 5-try loop of rtw89_dump_physical_efuse_map.
+// efuse.c:15 and the 5-try (efuse.c:211-228) loop of rtw89_dump_physical_efuse_map.
 const EFUSE_EXTERNALPN_ADDR_AX: u16 = 0x5EC;
 const DUMP_TRIES: usize = 5;
 
@@ -74,6 +75,9 @@ fn dump_once<I: AxIo + ?Sized>(io: &mut I, start: u16, out: &mut [u8]) -> Result
         let addr = u32::from(start) + i as u32;
         let ctl = (addr << 16) & B_AX_EF_ADDR_MASK;
         io.write32(R_AX_EFUSE_CTRL, ctl & !B_AX_EF_RDY)?;
+        // `read_poll_timeout_atomic(..., delay_before_read = true)`: a 1 us
+        // wait after the write, before the first sample (efuse.c:126-128).
+        io.delay_us(READ_POLL_INTERVAL_US);
         let value = poll32_value(
             io,
             R_AX_EFUSE_CTRL,
@@ -119,10 +123,10 @@ pub enum SecureBoot {
     },
 }
 
-/// `otp_key_info_{externalPN,customer,serialNum}` (`efuse.c:35-37`).
+/// `otp_key_info_{externalPN,customer,serialNum}` (`efuse.c:25-27`).
 const OTP_KEY_INFO: [(u8, u8, u8); 2] = [(0x0, 0x0, 0x0), (0x0, 0x1, 0x1)];
 
-/// `rtw89_efuse_recognize_mss_index_v0` (`efuse.c:455`): the matching row.
+/// `rtw89_efuse_recognize_mss_index_v0` (`efuse.c:459`): the matching row.
 fn mss_index_v0(b1: u8, b2: u8) -> Option<u8> {
     let external_pn = 0xFF - b1;
     let customer = 0xF - (b2 & 0x0F);
@@ -135,14 +139,14 @@ fn mss_index_v0(b1: u8, b2: u8) -> Option<u8> {
         .map(|i| i as u8)
 }
 
-/// `rtw89_efuse_recognize_mss_info_v1` (`efuse.c:430`) reduced to its verdict:
+/// `rtw89_efuse_recognize_mss_info_v1` (`efuse.c:427`) reduced to its verdict:
 /// `get_mss_dev_type_idx` accepts only these device types. (The 8852B special
 /// case does not apply.)
 fn mss_info_v1_valid(b1: u8) -> bool {
     matches!(b1 & 0x0F, 0xC | 0xA | 0x9 | 0x6 | 0xF)
 }
 
-/// The decision of `rtw89_efuse_read_fw_secure_ax` (`efuse.c:484`) on the two
+/// The decision of `rtw89_efuse_read_fw_secure_ax` (`efuse.c:484-516`) on the two
 /// bytes at 0x5EC and 0x5ED. Both 0xFF is off. Otherwise secure boot is on
 /// only if the v0 key table or the v1 device type accepts them.
 pub fn decode_secure_boot(b1: u8, b2: u8) -> SecureBoot {
@@ -166,7 +170,7 @@ pub fn secure_boot<I: AxIo + ?Sized>(io: &mut I) -> Result<SecureBoot, AxError> 
     Ok(decode_secure_boot(sec[0], sec[1]))
 }
 
-/// `rtw89_dump_logical_efuse_map` (`efuse.c:200`) for the 8852C DDV map: a
+/// `rtw89_dump_logical_efuse_map` (`efuse.c:238`) for the 8852C DDV map: a
 /// 2048-byte map filled with 0xFF, then each block's words placed, parsing
 /// from physical index 4. Linux's `-EINVAL` returns are `AxError::Efuse`.
 pub fn logical_map(physical: &[u8]) -> Result<Vec<u8>, AxError> {
@@ -281,9 +285,10 @@ mod tests {
         read_physical(&mut m, 0x5EC, &mut out).unwrap();
         assert_eq!(out, [0xA5]);
         let mut want = enable_ops();
-        // efuse.c:122-125: whole-word write of addr << 16 with RDY clear,
+        // efuse.c:124-132: whole-word write of addr << 16 with RDY clear,
         // then one read of the poll.
         want.push(Op::W32(0x0030, 0x05EC_0000));
+        want.push(Op::Delay(1)); // delay_before_read (efuse.c:126-128)
         want.push(Op::R32(0x0030));
         want.extend(disable_ops());
         assert_eq!(m.trace, want);
@@ -314,7 +319,7 @@ mod tests {
     #[test]
     fn read_physical_retries_whole_dump_and_leaves_power_cut_on_failure() {
         // The controller is not ready until past the first poll's 1 s
-        // timeout; the second whole dump then succeeds (efuse.c:182-195).
+        // timeout; the second whole dump then succeeds (efuse.c:211-228).
         let phys = phys_with(&[(0x10, 0x42)]);
         let mut m = RegisterModel::new();
         m.on_read(
@@ -377,7 +382,7 @@ mod tests {
 
     #[test]
     fn secure_boot_on_when_a_key_table_row_matches() {
-        // efuse.c:455-470: externalPN = 0xFF - b1, customer = 0xF - b2[3:0],
+        // efuse.c:459-480: externalPN = 0xFF - b1, customer = 0xF - b2[3:0],
         // serialNum = 0x7 - b2[6:4]; row 0 is {0,0,0}, row 1 is {0,1,1}.
         // b1 = 0xFF, b2 = 0x7F: PN 0, customer 0, serial 0 -> row 0.
         assert_eq!(
@@ -411,7 +416,7 @@ mod tests {
         // The brief expected On for 0x5EC = 0x01, 0x5ED = 0xFF. Linux:
         // v0 needs externalPN 0 (b1 == 0xFF); v1 maps device type 0x1 to
         // INV, so `can_mss_v0 || can_mss_v1` is false and secure_boot stays
-        // false (efuse.c:497-499).
+        // false (efuse.c:508-511).
         assert_eq!(decode_secure_boot(0x01, 0xFF), SecureBoot::Off);
         // Device type 0xE is not valid either.
         assert_eq!(decode_secure_boot(0xFE, 0xFF), SecureBoot::Off);
@@ -474,7 +479,7 @@ mod tests {
             p
         };
         // Header at 1208 (< 1212), word 0 at 1210..1212: Linux rejects only
-        // phy_idx + 1 > 1211, and 1211 is not past it (efuse.c:237).
+        // phy_idx + 1 > 1211, and 1211 is not past it (efuse.c:269).
         let p = padded(
             1208,
             &[(1208, 0x00), (1209, 0x0E), (1210, 0x55), (1211, 0x66)],
