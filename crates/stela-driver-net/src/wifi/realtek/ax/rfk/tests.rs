@@ -746,3 +746,233 @@ fn dack_swsi_stuck_fails_after_the_coex_start() {
             .all(|o| !matches!(o, Op::RfW(..) | Op::RfR(..)))
     );
 }
+
+/// The `(i, q)` TIA offsets an RX DCK model answers, by RF 0x00 [14:10].
+type Tia = [(u32, u32); 32];
+
+/// An RX DCK model: SWSI answered, RF 0x05 0x12345 on both paths, RF 0x93
+/// b5 (done) set on path `p` when `done[p]`, RF 0x95 b3 (check) set when
+/// `check`, and RF 0x92 [7:5] = `res`. Reads of RF 0x92 and 0x93 answer
+/// their [15:9] from `tia` keyed on RF 0x00 [14:10], other bits as stored.
+fn rx_dck_model(done: [bool; 2], check: bool, res: u32, tia: Tia) -> RegisterModel {
+    let mut m = RegisterModel::new();
+    m.emulate_rf();
+    for p in 0..2u8 {
+        m.set_rf(p, 0x05, 0x12345);
+        m.set_rf(p, 0x92, res << 5);
+        m.set_rf(p, 0x93, if done[p as usize] { 1 << 5 } else { 0 });
+        m.set_rf(p, 0x95, if check { 1 << 3 } else { 0 });
+        let index = move |m: &RegisterModel| ((m.get_rf(p, 0x00) >> 10) & 0x1F) as usize;
+        m.on_rf_read(
+            p,
+            0x92,
+            Box::new(move |m| (m.get_rf(p, 0x92) & !0xFE00) | (tia[index(m)].0 << 9)),
+        );
+        m.on_rf_read(
+            p,
+            0x93,
+            Box::new(move |m| (m.get_rf(p, 0x93) & !0xFE00) | (tia[index(m)].1 << 9)),
+        );
+    }
+    m
+}
+
+/// One `_rx_dck_toggle` whose first poll sample is done.
+fn rx_dck_toggle_ops(p: u8) -> [Op; 4] {
+    [
+        Op::RfW(p, 0x92, 1, 0),
+        Op::RfW(p, 0x92, 1, 1),
+        Op::RfR(p, 0x93),
+        Op::RfW(p, 0x92, 1, 0),
+    ]
+}
+
+/// The recover's select of `index` in RF 0x00 [14:10] and its two reads.
+fn rx_dck_read_ops(p: u8, index: u32) -> [Op; 3] {
+    [
+        Op::RfW(p, 0x00, 0x7C00, index << 10),
+        Op::RfR(p, 0x92),
+        Op::RfR(p, 0x93),
+    ]
+}
+
+/// `_rx_dck_value_rewrite` of `v` to LUT `addr`.
+fn rx_dck_rewrite_ops(p: u8, addr: u32, v: u32) -> [Op; 9] {
+    [
+        Op::RfW(p, 0xEC, 0x80000, 0x80000),
+        Op::RfW(p, 0xF0, 0x10000, 0x10000),
+        Op::RfW(p, 0x92, 2, 2),
+        Op::RfW(p, 0x33, 0xFF, addr),
+        Op::RfW(p, 0x3F, F, v),
+        Op::RfW(p, 0x3F, F, v),
+        Op::RfW(p, 0x92, 2, 0),
+        Op::RfW(p, 0xF0, 0x10000, 0),
+        Op::RfW(p, 0xEC, 0x80000, 0),
+    ]
+}
+
+/// The recover's eight index reads, in Linux order.
+const RX_DCK_INDEXES: [u32; 8] = [0x00, 0x01, 0x0C, 0x0D, 0x10, 0x11, 0x1C, 0x1D];
+
+#[test]
+fn rx_dck_single_toggle_when_check_is_clear() {
+    let mut m = rx_dck_model([true; 2], false, 0, [(0, 0); 32]);
+    assert_eq!(rx_dck(&mut m), Ok(([false, false], [0, 0])));
+    let mut want = Vec::new();
+    for p in 0..2u8 {
+        want.extend([
+            Op::RfR(p, 0x05),
+            Op::RfW(p, 0x05, 1, 0),
+            Op::RfW(p, 0x00, 0xF0000, 0x30000),
+            Op::RfW(p, 0x00, 2, 0),
+            Op::RfW(p, 0x93, 0xF, 0),
+        ]);
+        want.extend(rx_dck_toggle_ops(p));
+        want.push(Op::RfR(p, 0x95));
+        for index in RX_DCK_INDEXES {
+            want.extend(rx_dck_read_ops(p, index));
+        }
+        want.push(Op::RfW(p, 0x05, F, 0x12345));
+    }
+    assert_eq!(rf_only(&m), want);
+    for p in 0..2u8 {
+        // RF 0x05 restored whole; RF 0x00 left in RX mode at the last index.
+        assert_eq!(m.get_rf(p, 0x05), 0x12345);
+        assert_eq!(m.get_rf(p, 0x00), 0x30000 | (0x1D << 10));
+    }
+}
+
+#[test]
+fn rx_dck_second_toggle_when_res_above_one() {
+    let mut m = rx_dck_model([true; 2], true, 3, [(0, 0); 32]);
+    assert_eq!(rx_dck(&mut m), Ok(([false, false], [0, 0])));
+    let ops = rf_only(&m);
+    for p in 0..2u8 {
+        let at = first(&ops, Op::RfW(p, 0x93, 0xF, 0)) + 1;
+        let mut want = Vec::from(rx_dck_toggle_ops(p));
+        want.extend([
+            Op::RfR(p, 0x95),
+            Op::RfR(p, 0x92),
+            Op::RfW(p, 0x8F, 0xE00, 0x600),
+        ]);
+        want.extend(rx_dck_toggle_ops(p));
+        want.push(Op::RfW(p, 0x8F, 0xE00, 0x200));
+        want.extend(rx_dck_read_ops(p, 0x00));
+        assert_eq!(ops[at..at + want.len()], want[..]);
+        assert_eq!(m.get_rf(p, 0x8F), 0x200);
+    }
+}
+
+#[test]
+fn rx_dck_res_of_one_skips_the_second_toggle() {
+    let mut m = rx_dck_model([true; 2], true, 1, [(0, 0); 32]);
+    assert_eq!(rx_dck(&mut m), Ok(([false, false], [0, 0])));
+    let ops = rf_only(&m);
+    let at = first(&ops, Op::RfR(0, 0x95));
+    assert_eq!(
+        ops[at..at + 3],
+        [
+            Op::RfR(0, 0x95),
+            Op::RfR(0, 0x92),
+            Op::RfW(0, 0x00, 0x7C00, 0)
+        ]
+    );
+    assert!(!ops.iter().any(|op| matches!(op, Op::RfW(_, 0x8F, ..))));
+}
+
+#[test]
+fn rx_dck_recover_rewrites_an_out_of_range_offset() {
+    let mut tia = [(0, 0); 32];
+    tia[0x00] = (0x40, 0x40);
+    tia[0x0C] = (0x60, 0x45);
+    let mut m = rx_dck_model([true; 2], false, 0, tia);
+    assert_eq!(rx_dck(&mut m), Ok(([false, false], [1, 1])));
+    let ops = rf_only(&m);
+    for p in 0..2u8 {
+        // i is 0x20 off and takes the base's 0x40; q is 5 off and is kept:
+        // ((0x45 >> 1) << 6) | (0x40 >> 1) = 0x8A0.
+        let at = first(&ops, Op::RfW(p, 0x00, 0x7C00, 0x0C << 10));
+        let mut want = Vec::from(rx_dck_read_ops(p, 0x0C));
+        want.extend(rx_dck_rewrite_ops(p, 0x0C, 0x8A0));
+        want.extend(rx_dck_read_ops(p, 0x0D));
+        assert_eq!(ops[at..at + want.len()], want[..]);
+        assert_eq!(m.get_rf(p, 0x3F), 0x8A0);
+        assert_eq!(m.get_rf(p, 0x33), 0x0C);
+        // Every enable is cleared again.
+        assert_eq!(m.get_rf(p, 0xEC) & 0x80000, 0);
+        assert_eq!(m.get_rf(p, 0xF0) & 0x10000, 0);
+        assert_eq!(m.get_rf(p, 0x92) & 2, 0);
+    }
+    assert_eq!(
+        ops.iter()
+            .filter(|op| matches!(op, Op::RfW(_, 0x3F, ..)))
+            .count(),
+        4
+    );
+}
+
+#[test]
+fn rx_dck_threshold_is_asymmetric() {
+    // A delta of 9 on i and 10 on q passes.
+    let mut tia = [(0, 0); 32];
+    tia[0x10] = (0x20, 0x20);
+    tia[0x1C] = (0x29, 0x2A);
+    let mut m = rx_dck_model([true; 2], false, 0, tia);
+    assert_eq!(rx_dck(&mut m), Ok(([false, false], [0, 0])));
+    assert!(
+        !rf_only(&m)
+            .iter()
+            .any(|op| matches!(op, Op::RfW(_, 0x3F, ..)))
+    );
+    // 10 on both fails the pass check, but neither is over the threshold,
+    // so the target's own values are rewritten:
+    // ((0x2A >> 1) << 6) | (0x2A >> 1) = 0x555.
+    tia[0x1C] = (0x2A, 0x2A);
+    let mut m = rx_dck_model([true; 2], false, 0, tia);
+    assert_eq!(rx_dck(&mut m), Ok(([false, false], [1, 1])));
+    let ops = rf_only(&m);
+    for p in 0..2u8 {
+        let at = first(&ops, Op::RfW(p, 0x00, 0x7C00, 0x1C << 10)) + 3;
+        assert_eq!(ops[at..at + 9], rx_dck_rewrite_ops(p, 0x1C, 0x555));
+    }
+}
+
+#[test]
+fn rx_dck_toggle_timeout_is_recorded() {
+    let mut m = rx_dck_model([false, true], false, 0, [(0, 0); 32]);
+    assert_eq!(rx_dck(&mut m), Ok(([true, false], [0, 0])));
+    let ops = m.rf_ops();
+    let on = first(&ops, Op::RfW(0, 0x92, 1, 1));
+    let off = on + first(&ops[on..], Op::RfW(0, 0x92, 1, 0));
+    let poll = &ops[on + 1..off];
+    // read_poll_timeout_atomic(.., 2, 2000, false, ..): 1001 samples, each
+    // with its 2 us SWSI settle, and 1000 2 us waits between them.
+    assert_eq!(
+        poll.iter().filter(|op| **op == Op::RfR(0, 0x93)).count(),
+        1001
+    );
+    assert_eq!(poll.iter().filter(|op| **op == Op::Delay(2)).count(), 2001);
+    assert_eq!(poll.len(), 1001 + 2001);
+    // Path A still checks, recovers and restores, and path B runs.
+    let rest = rf_only(&m);
+    // The pulse, its 1001 samples, then the pulse cleared.
+    let after = first(&rest, Op::RfW(0, 0x92, 1, 1)) + 1 + 1001 + 1;
+    assert_eq!(rest[after - 1], Op::RfW(0, 0x92, 1, 0));
+    assert_eq!(rest[after], Op::RfR(0, 0x95));
+    assert!(rest.contains(&Op::RfW(0, 0x05, F, 0x12345)));
+    assert_eq!(rest.last(), Some(&Op::RfW(1, 0x05, F, 0x12345)));
+}
+
+#[test]
+fn rx_dck_swsi_stuck_fails() {
+    let mut m = rx_dck_model([true; 2], false, 0, [(0, 0); 32]);
+    m.swsi_status = 1 << 24;
+    assert!(matches!(
+        rx_dck(&mut m),
+        Err(AxError::Timeout {
+            register: 0x1174C,
+            ..
+        })
+    ));
+    assert!(rf_only(&m).is_empty());
+}

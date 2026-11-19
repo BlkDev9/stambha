@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 // Copyright(c) 2019-2022  Realtek Corporation
-//! The analog front-end calibrations an RTL8852C runs first in
+//! The analog front-end and receiver calibrations an RTL8852C runs in
 //! `rtw8852c_rfk_init` (pinned rtw89/rtw8852c.c:1985-1997), from
 //! rtw8852c_rfk.c, with the DRCK and DACK tables from rtw8852c_rfk_table.c:
 //! - [`rck`] is `rtw8852c_rck` (rtw8852c_rfk.c:4133-4139), `_rck`
@@ -17,7 +17,13 @@
 //!   (:443-452), `_dack_reset` (:407-412), `_check_dack_done` (:489-506),
 //!   `_dack_backup_s0`/`_s1` (:251-301) and `_dack_reload_by_path`
 //!   (:303-359), and the `dack_reload_defs`, `dack_reset_defs_a`/`_b` and
-//!   `dack_defs_s0`/`_s1` tables (rtw8852c_rfk_table.c:7-48).
+//!   `dack_defs_s0`/`_s1` tables (rtw8852c_rfk_table.c:7-48);
+//! - [`rx_dck`] is `rtw8852c_rx_dck(PHY0, false)` (:4223-4226), `_rx_dck`
+//!   (:4169-4221) with `retry_limit` 1 on path A, then B: `_set_rx_dck`
+//!   (:1738-1754) with `_rx_dck_toggle` (:1719-1736), then
+//!   `_rx_dck_recover` (:1670-1717) with `_rx_dck_fix_if_need`
+//!   (:1645-1668) and `_rx_dck_value_rewrite` (:1570-1595): the receivers'
+//!   DC offsets.
 //!
 //! BB registers go through [`bb`] (`rtw89_phy_write32_mask` and
 //! `rtw89_phy_read32_mask`, every write a read-modify-write) and RF
@@ -41,9 +47,9 @@
 //! ported, nor are `rtw89_btc_phymap` and the `dack_done`/`dack_cnt`
 //! bookkeeping, which are memory only.
 //!
-//! This module grants no RX DCK, IQK, DPK, TSSI or LCK, no PHY 1 and no
-//! channel: it leaves the calibration results in the registers and returns
-//! them.
+//! This module grants no IQK, DPK, TSSI, LCK or RX DCK tracking, no PHY 1
+//! and no channel: it leaves the calibration results in the registers and
+//! returns them.
 use super::bb;
 use super::coex;
 use super::elements::RfPath;
@@ -203,6 +209,48 @@ const DACK_SIDES: [DackSide; 2] = [
         dadck: [0xC160, 0xC184],
     },
 ];
+
+/// `RR_MOD_DCK` [14:10], RX DCK's offset index, and `RR_MOD_LO_SEL` b1
+/// (reg.h:8540, 8555).
+const RR_MOD_DCK: u32 = 0x7C00;
+const RR_MOD_LO_SEL: u32 = 1 << 1;
+/// `RR_DCK` 0x92 with `RR_DCK_TIA` [15:9], `RR_DCK_DONE` [7:5],
+/// `RR_DCK_FINE` b1 and `RR_DCK_LV` b0; `RR_DCK1` 0x93 with `RR_DCK1_TIA`
+/// [15:9], `RR_DCK1_DONE` b5 and `RR_DCK1_CLR` [3:0]; `RR_DCKC` 0x95 with
+/// `RR_DCKC_CHK` b3 (reg.h:8734-8749).
+const RR_DCK: u32 = 0x92;
+const RR_DCK_TIA: u32 = 0xFE00;
+const RR_DCK_DONE: u32 = 0xE0;
+const RR_DCK_FINE: u32 = 1 << 1;
+const RR_DCK_LV: u32 = 1 << 0;
+const RR_DCK1: u32 = 0x93;
+const RR_DCK1_TIA: u32 = 0xFE00;
+const RR_DCK1_DONE: u32 = 1 << 5;
+const RR_DCK1_CLR: u32 = 0xF;
+const RR_DCKC: u32 = 0x95;
+const RR_DCKC_CHK: u32 = 1 << 3;
+/// `RR_RXBB2` 0x8F with `RR_RXBB2_IDAC` [11:9] (reg.h:8725, 8729).
+const RR_RXBB2: u32 = 0x8F;
+const RR_RXBB2_IDAC: u32 = 0xE00;
+/// The LUT write path: `RR_LUTPLL` 0xEC `RR_CAL_RW` b19, `RR_RFC` 0xF0
+/// `RR_WCAL` b16, `RR_LUTWA` 0x33 and `RR_LUTWD0` 0x3F with
+/// `RR_LUTWD0_MB` [11:6] and `_LB` [5:0] (reg.h:8627-8634, 8803-8811), and
+/// `MASKBYTE0` (core.h:40).
+const RR_LUTPLL: u32 = 0xEC;
+const RR_CAL_RW: u32 = 1 << 19;
+const RR_RFC: u32 = 0xF0;
+const RR_WCAL: u32 = 1 << 16;
+const RR_LUTWA: u32 = 0x33;
+const RR_LUTWD0: u32 = 0x3F;
+const RR_LUTWD0_MB: u32 = 0xFC0;
+const RR_LUTWD0_LB: u32 = 0x3F;
+const MASKBYTE0: u32 = 0xFF;
+/// `_dck_addr_bs` and `_dck_addr` (rtw8852c_rfk.c:73-74): each group's
+/// base and target offset index, each the even one of a pair.
+const DCK_ADDR_BS: [u8; 2] = [0x00, 0x10];
+const DCK_ADDR: [u8; 2] = [0x0C, 0x1C];
+/// `_rx_dck_fix_if_need`'s `th` (rtw8852c_rfk.c:1648).
+const RX_DCK_TH: i32 = 10;
 
 /// The `read_poll_timeout_atomic(.., 1, 10000, false, ..)` of DRCK, ADDCK
 /// and DACK: at most 9992 samples, 1 us apart.
@@ -499,6 +547,154 @@ fn dack_reload<I: AxIo + ?Sized>(
     let v = (u32::from(biask) << 22) | (u32::from(dadck) << 14);
     bb::write32(io, addr, v)?;
     bb::set32(io, addr, 1 << 0)
+}
+
+/// `rtw8852c_rx_dck(PHY0, is_afe = false)` (rtw8852c_rfk.c:4223-4226), as
+/// `rtw8852c_rfk_init` calls it: `_rx_dck` (:4169-4221) with `retry_limit`
+/// 1 on path A, then B (`_kpath` is `RF_AB` without DBCC, :80-92). Returns,
+/// per path, whether a `_rx_dck_toggle` poll timed out (Linux only warns
+/// "RXDCK timeout") and how many offsets `_rx_dck_recover` rewrote.
+///
+/// There is no coex notify here: only `rtw8852c_rx_dck_track` (:4265,
+/// :4279) notifies `BTC_WRFKT_RXDCK`. `is_afe` is unused by 8852C's
+/// `_set_rx_dck`, `is_tssi_mode` is false at init so `R_P0_TSSI_TRK` is
+/// not touched, and `rx_dck->thermal` is memory only. RF 0x00 is left in
+/// RX mode at the last offset index, as Linux leaves it.
+pub fn rx_dck<I: AxIo + ?Sized>(io: &mut I) -> Result<([bool; 2], [u8; 2]), AxError> {
+    let mut timed_out = [false; 2];
+    let mut rewrites = [0; 2];
+    for (i, path) in [RfPath::A, RfPath::B].into_iter().enumerate() {
+        (timed_out[i], rewrites[i]) = rx_dck_path(io, path)?;
+    }
+    Ok((timed_out, rewrites))
+}
+
+/// One path of `_rx_dck`. With `retry_limit` 1 the first try is the last,
+/// so `_rx_dck_rek_check` never runs and `_rx_dck_recover` always does.
+fn rx_dck_path<I: AxIo + ?Sized>(io: &mut I, path: RfPath) -> Result<(bool, u8), AxError> {
+    let reg5 = rf::read_rf(io, path, RR_RSV1, RFREG_MASK)?;
+    rf::write_rf(io, path, RR_RSV1, RR_RSV1_RST, 0)?;
+    rf::write_rf(io, path, RR_MOD, RR_MOD_MASK, RR_MOD_V_RX)?;
+    // rtwdev->dbcc_en, false.
+    rf::write_rf(io, path, RR_MOD, RR_MOD_LO_SEL, 0)?;
+    let timed_out = set_rx_dck(io, path)?;
+    let rewrites = rx_dck_recover(io, path)?;
+    rf::write_rf(io, path, RR_RSV1, RFREG_MASK, reg5)?;
+    Ok((timed_out, rewrites))
+}
+
+/// `_set_rx_dck` (rtw8852c_rfk.c:1738-1754): clear `RR_DCK1_CLR`, toggle,
+/// and if `RR_DCKC_CHK` is set and `RR_DCK_DONE` is over 1, toggle again
+/// with that value in `RR_RXBB2_IDAC`, then set it back to 1. Returns
+/// whether either toggle's poll timed out.
+fn set_rx_dck<I: AxIo + ?Sized>(io: &mut I, path: RfPath) -> Result<bool, AxError> {
+    rf::write_rf(io, path, RR_DCK1, RR_DCK1_CLR, 0)?;
+    let mut timed_out = rx_dck_toggle(io, path)?;
+    if rf::read_rf(io, path, RR_DCKC, RR_DCKC_CHK)? == 0 {
+        return Ok(timed_out);
+    }
+    let res = rf::read_rf(io, path, RR_DCK, RR_DCK_DONE)?;
+    if res > 1 {
+        rf::write_rf(io, path, RR_RXBB2, RR_RXBB2_IDAC, res)?;
+        timed_out |= rx_dck_toggle(io, path)?;
+        rf::write_rf(io, path, RR_RXBB2, RR_RXBB2_IDAC, 1)?;
+    }
+    Ok(timed_out)
+}
+
+/// `_rx_dck_toggle` (rtw8852c_rfk.c:1719-1736): pulse `RR_DCK_LV` and wait
+/// for `RR_DCK1_DONE` with `read_poll_timeout_atomic(.., 2, 2000, false,
+/// ..)`, at most 1001 samples. Returns whether the poll timed out.
+fn rx_dck_toggle<I: AxIo + ?Sized>(io: &mut I, path: RfPath) -> Result<bool, AxError> {
+    rf::write_rf(io, path, RR_DCK, RR_DCK_LV, 0)?;
+    rf::write_rf(io, path, RR_DCK, RR_DCK_LV, 1)?;
+    let timed_out = matches!(
+        poll_sample_atomic(
+            io,
+            2,
+            2000,
+            false,
+            |io| rf::read_rf(io, path, RR_DCK1, RR_DCK1_DONE),
+            |v| v != 0,
+        )?,
+        Polled::Expired(_)
+    );
+    rf::write_rf(io, path, RR_DCK, RR_DCK_LV, 0)?;
+    Ok(timed_out)
+}
+
+/// `_rx_dck_recover` (rtw8852c_rfk.c:1670-1717): for each of the two
+/// groups, read the base offsets at `_dck_addr_bs` and `+1`, then the
+/// target's at `_dck_addr` and `+1`, each target checked against its base
+/// right after it is read. Returns how many targets were rewritten.
+fn rx_dck_recover<I: AxIo + ?Sized>(io: &mut I, path: RfPath) -> Result<u8, AxError> {
+    let mut rewrites = 0;
+    for (bs, tg) in DCK_ADDR_BS.into_iter().zip(DCK_ADDR) {
+        let even_bs = dck_offsets(io, path, bs)?;
+        let odd_bs = dck_offsets(io, path, bs + 1)?;
+        let even = dck_offsets(io, path, tg)?;
+        rewrites += u8::from(rx_dck_fix_if_need(io, path, tg, even_bs, even)?);
+        let odd = dck_offsets(io, path, tg + 1)?;
+        rewrites += u8::from(rx_dck_fix_if_need(io, path, tg + 1, odd_bs, odd)?);
+    }
+    Ok(rewrites)
+}
+
+/// Select offset index `addr` in `RR_MOD_DCK` and read its `(i, q)`:
+/// `RR_DCK_TIA` and `RR_DCK1_TIA`.
+fn dck_offsets<I: AxIo + ?Sized>(io: &mut I, path: RfPath, addr: u8) -> Result<(u8, u8), AxError> {
+    rf::write_rf(io, path, RR_MOD, RR_MOD_DCK, addr.into())?;
+    // 7-bit fields.
+    let i = rf::read_rf(io, path, RR_DCK, RR_DCK_TIA)? as u8;
+    let q = rf::read_rf(io, path, RR_DCK1, RR_DCK1_TIA)? as u8;
+    Ok((i, q))
+}
+
+/// `_rx_dck_fix_if_need` (rtw8852c_rfk.c:1645-1668): pass when the i delta
+/// is under 10 and the q delta at most 10 (Linux's asymmetric test).
+/// Otherwise a value more than 10 off takes its base's, and the pair is
+/// rewritten even if neither is (a delta of exactly 10 on i). Returns
+/// whether it rewrote.
+fn rx_dck_fix_if_need<I: AxIo + ?Sized>(
+    io: &mut I,
+    path: RfPath,
+    addr: u8,
+    (i_bs, q_bs): (u8, u8),
+    (i, q): (u8, u8),
+) -> Result<bool, AxError> {
+    // C's abs() of the u8s promoted to int.
+    let di = (i32::from(i_bs) - i32::from(i)).abs();
+    let dq = (i32::from(q_bs) - i32::from(q)).abs();
+    if di < RX_DCK_TH && dq <= RX_DCK_TH {
+        return Ok(false);
+    }
+    let i = if di > RX_DCK_TH { i_bs } else { i };
+    let q = if dq > RX_DCK_TH { q_bs } else { q };
+    rx_dck_value_rewrite(io, path, addr, i, q)?;
+    Ok(true)
+}
+
+/// `_rx_dck_value_rewrite` (rtw8852c_rfk.c:1570-1595): write the 7-bit
+/// `(i, q)` halved into the 6-bit `RR_LUTWD0_LB`/`_MB` of LUT entry `addr`,
+/// the data word twice, between the LUT write enables. Linux reads nothing
+/// back: its "Final" debug print decodes the value it wrote.
+fn rx_dck_value_rewrite<I: AxIo + ?Sized>(
+    io: &mut I,
+    path: RfPath,
+    addr: u8,
+    i: u8,
+    q: u8,
+) -> Result<(), AxError> {
+    let v = ((u32::from(q >> 1) << 6) & RR_LUTWD0_MB) | (u32::from(i >> 1) & RR_LUTWD0_LB);
+    rf::write_rf(io, path, RR_LUTPLL, RR_CAL_RW, 1)?;
+    rf::write_rf(io, path, RR_RFC, RR_WCAL, 1)?;
+    rf::write_rf(io, path, RR_DCK, RR_DCK_FINE, 1)?;
+    rf::write_rf(io, path, RR_LUTWA, MASKBYTE0, addr.into())?;
+    rf::write_rf(io, path, RR_LUTWD0, RFREG_MASK, v)?;
+    rf::write_rf(io, path, RR_LUTWD0, RFREG_MASK, v)?;
+    rf::write_rf(io, path, RR_DCK, RR_DCK_FINE, 0)?;
+    rf::write_rf(io, path, RR_RFC, RR_WCAL, 0)?;
+    rf::write_rf(io, path, RR_LUTPLL, RR_CAL_RW, 0)
 }
 
 #[cfg(test)]
