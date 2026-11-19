@@ -9,6 +9,7 @@
 //! chip off again. It grants no station, no RF or baseband setup, and no
 //! interrupts: nothing past the firmware's ready status runs.
 pub mod bringup;
+pub mod cmac;
 pub mod dmac;
 pub mod efuse;
 pub mod fwdl;
