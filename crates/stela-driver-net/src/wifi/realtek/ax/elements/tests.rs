@@ -180,6 +180,51 @@ fn a_file_with_no_container_has_no_tables() {
 }
 
 #[test]
+fn an_element_ending_exactly_at_the_end_of_the_file_is_kept() {
+    let mut b = container(32, 16);
+    element(&mut b, ID_BB_REG, [0; 4], 0, 0, &pairs(&[(1, 1), (2, 2)]));
+    assert_eq!(b.len() % 16, 0, "the body already ends on the alignment");
+    let t = phy_tables(&b, 0).unwrap();
+    assert_eq!(listed(&t.bb.unwrap()), [(1, 1), (2, 2)]);
+    assert_eq!(t.stopped, None);
+}
+
+#[test]
+fn elements_follow_the_last_entry_not_the_furthest_one() {
+    // rtw89_mfw_get_size (fw.c:687-688) uses info[fw_nr - 1].
+    let mut b = alloc::vec![0u8; 48];
+    b[0] = 0xff;
+    b[1] = 2;
+    for (entry, (shift, size)) in [(48u32, 100u32), (48, 16)].into_iter().enumerate() {
+        let at = 16 + 16 * entry;
+        b[at + 4..at + 8].copy_from_slice(&shift.to_le_bytes());
+        b[at + 8..at + 12].copy_from_slice(&size.to_le_bytes());
+    }
+    b.resize(64, 0);
+    element(&mut b, ID_RF_NCTL, [0; 4], 0, 0, &pairs(&[(9, 9)]));
+    assert_eq!(listed(&phy_tables(&b, 0).unwrap().nctl.unwrap()), [(9, 9)]);
+}
+
+#[test]
+fn a_container_end_that_wraps_to_zero_is_refused() {
+    // Linux aligns in u32: 0xffff_fff0 + 8 rounds to 0, -EINVAL.
+    let mut b = container(32, 16);
+    b[20..24].copy_from_slice(&0xffff_fff0u32.to_le_bytes());
+    b[24..28].copy_from_slice(&8u32.to_le_bytes());
+    assert_eq!(phy_tables(&b, 0).err(), Some(ElementError::EmptyContainer));
+}
+
+#[test]
+fn a_pair_index_past_the_table_is_none() {
+    let mut b = container(32, 16);
+    element(&mut b, ID_BB_REG, [0; 4], 0, 0, &pairs(&[(1, 1)]));
+    let bb = phy_tables(&b, 0).unwrap().bb.unwrap();
+    assert_eq!(bb.get(1), None);
+    assert_eq!(bb.get(usize::MAX / 8), None);
+    assert_eq!(bb.get(usize::MAX), None);
+}
+
+#[test]
 fn a_container_with_no_elements_has_no_tables() {
     let b = container(32, 16);
     let t = phy_tables(&b, 0).unwrap();

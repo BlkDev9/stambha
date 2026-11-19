@@ -54,7 +54,7 @@ impl<'a> Reg2<'a> {
     /// Pair `index` as (addr, data).
     pub fn get(&self, index: usize) -> Option<(u32, u32)> {
         let at = index.checked_mul(PAIR)?;
-        self.regs.get(at..at + PAIR).map(pair)
+        self.regs.get(at..at.checked_add(PAIR)?).map(pair)
     }
 
     /// Every pair in file order.
@@ -205,10 +205,11 @@ fn elements_start(firmware: &[u8]) -> Result<usize, ElementError> {
         });
     }
     let last = MFW_HEADER + (count - 1) * MFW_ENTRY;
-    let end = le32(firmware, last + 4).wrapping_add(le32(firmware, last + 8)) as usize;
-    match end.next_multiple_of(ELEMENT_ALIGN) {
+    // Linux sums and aligns in u32, so an end that wraps to 0 is refused.
+    let end = le32(firmware, last + 4).wrapping_add(le32(firmware, last + 8));
+    match end.wrapping_add(ELEMENT_ALIGN as u32 - 1) & !(ELEMENT_ALIGN as u32 - 1) {
         0 => Err(ElementError::EmptyContainer),
-        start => Ok(start),
+        start => Ok(start as usize),
     }
 }
 
