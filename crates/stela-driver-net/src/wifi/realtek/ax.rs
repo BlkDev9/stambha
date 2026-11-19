@@ -15,15 +15,16 @@
 //! pages ([`radio::init_rf_reg`]) from the firmware file's own PHY tables
 //! (found by [`elements`], walked by RFE type and cut by [`phy_table`], BB
 //! and RF registers reached by [`bb`] and [`rf`]), then the register end
-//! state of the coex start with BT off ([`coex`]). [`bring_up`] puts these
-//! in Linux's order before powering the chip off again. The non-RFK calls
-//! of `rtw89_phy_dm_init`'s first part (thermals, BB GPIO set-up, env
-//! monitor, PHY status bitmaps, DIG, crystal cap and EDCCA) are ported in
-//! [`dm`], and the first calibrations of `rtw8852c_rfk_init` (RCK, and DACK
-//! with its DRCK, ADDCK and coex notify) in [`rfk`], but [`bring_up`] does
-//! not run them yet. It grants no `rtw89_phy_dm_init`, no calibration, no
-//! channel, no station and no interrupts: the chip is powered off at the
-//! end, and nothing past the coex init and its report reads runs.
+//! state of the coex start with BT off ([`coex`]). Then `rtw89_phy_dm_init`
+//! runs ([`phy::calibrate`]): its first part (thermals, BB GPIO set-up, env
+//! monitor, PHY status bitmaps, DIG, crystal cap and EDCCA) and its tail
+//! (TX power reference, efuse trims, RX path) from [`dm`], the NCTL table
+//! ([`bb::init_rf_nctl`]), and `rtw8852c_rfk_init`'s RCK, DACK with its
+//! DRCK, ADDCK and coex notify, and RX DCK from [`rfk`]. [`bring_up`] puts
+//! these in Linux's order before powering the chip off again. It grants no
+//! channel, no IQK, DPK, TSSI or tracking, no station and no interrupts:
+//! the chip is powered off at the end, and nothing past
+//! `rtw89_phy_dm_init` runs.
 pub mod bb;
 pub mod bringup;
 pub mod c2h;
@@ -58,7 +59,7 @@ pub use io::{
     poll_sample, poll_sample_atomic, poll32, poll32_atomic, poll32_value, poll32_value_atomic,
     set8, set16, set32,
 };
-pub use phy::PhyReport;
+pub use phy::{PhyReport, RfkReport};
 // `pci::pre_init` and `dmac::pre_init` are reached by their module only.
 pub use pci::{Ch12, Rings, encode_txbd};
 pub use power::{power_on, xtal_si_read, xtal_si_write};
