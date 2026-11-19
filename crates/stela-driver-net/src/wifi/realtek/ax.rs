@@ -20,6 +20,7 @@ pub mod power;
 pub mod sys;
 #[cfg(test)]
 pub(crate) mod tests;
+pub mod trx;
 
 pub use bringup::{BringUpError, Earlier, Running, bring_up, quiesce};
 pub use fwdl::download;

@@ -297,7 +297,7 @@ const B_AX_TX_TIMEOUT_SEL_MASK: u32 = 0x3 << 30;
 const AX_TX_TO_VAL: u32 = 0x2;
 
 /// `rtw89_mac_check_mac_en_ax(RTW89_MAC_0, RTW89_DMAC_SEL)` (`mac.c:62`).
-fn check_dmac_en<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
+pub(super) fn check_dmac_en<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
     let want = B_AX_MAC_FUNC_EN | B_AX_DMAC_FUNC_EN;
     let value = io.read32(R_AX_DMAC_FUNC_EN)?;
     // RTW89_R32_EA and RTW89_R32_DEAD (`core.h:51`).
