@@ -12,8 +12,10 @@
 //! before powering the chip off again. The PHY tables the firmware file
 //! carries are found ([`elements`]) and can be walked by RFE type and cut
 //! ([`phy_table`]), and BB and RF registers can be reached ([`bb`], and
-//! [`rf`] through the direct window or SWSI), but nothing writes the tables
-//! yet. The bring-up writes no BB or RF register and grants no calibration,
+//! [`rf`] through the direct window or SWSI). The BB/RF reset
+//! ([`sys::reset_bb_rf`]) and `rtw89_phy_init_bb_reg` ([`bb::init_bb_reg`])
+//! are ported, but the bring-up runs neither yet and no radio table is
+//! written. The bring-up writes no BB or RF register and grants no calibration,
 //! no station and no interrupts: the chip is powered off at the end, and
 //! nothing past that one H2C runs.
 pub mod bb;
