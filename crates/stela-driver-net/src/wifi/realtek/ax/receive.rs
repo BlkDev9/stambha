@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 // Copyright(c) 2019-2020  Realtek Corporation
 // Copyright(c) 2019-2022  Realtek Corporation
+// Copyright(c) 2020-2022  Realtek Corporation
 //! An RTL8852C's RX dispatcher for the scan: each RXQ buffer goes where
 //! `rtw89_core_rx` (`core.c:4527-4559`) sends it. A C2H is parsed and
 //! handed on (`rtw89_core_rx_process_report`, `core.c:4087-4103`), and a
@@ -26,10 +27,11 @@
 //! matches and flushes each queued frame on its own, so the restriction
 //! changes no kept frame's outcome. Unlike Linux's unbounded `rx_queue`,
 //! at most [`MAX_PENDING`] frames wait; past that a frame is delivered at
-//! once without a signal. Each delivered frame loses its 4-byte FCS
-//! (`RX_INCLUDES_FCS`, `core.c:7497`). Rate conversion, radiotap, station
-//! statistics, the PN check and the MCC channel fix are not ported: none
-//! applies to an unassociated scan. Device input is bounds-checked: a
+//! once without a signal, ahead of the older frames still waiting, so
+//! delivery is then out of arrival order. Each delivered frame loses its
+//! 4-byte FCS (`RX_INCLUDES_FCS`, `core.c:7497`). Rate conversion,
+//! radiotap, station statistics, the PN check and the MCC channel fix are
+//! not ported: none applies to an unassociated scan. Device input is bounds-checked: a
 //! malformed buffer is an error, a short frame or C2H is counted, and the
 //! queue never grows past its bound. This module reads no register and
 //! grants no DMA, no channel switch and no frame parsing past the frame
@@ -99,10 +101,11 @@ pub enum Event<'a> {
 /// frames, not assembled. `other_frames`: WIFI frames that are not beacons
 /// or probe responses. `short_frames`: beacons and probe responses shorter
 /// than a header and an FCS (or WIFI payloads without a frame-control
-/// byte). `ppdu`: PPDU statuses that drained the queue. `ppdu_ignored`:
-/// PPDU statuses that came before any WIFI frame (`curr` above
-/// `RTW89_MAX_PPDU_CNT`). `overflow`: frames delivered without a signal
-/// because the queue was full. `c2h_skipped`: C2Hs too short to parse.
+/// byte). `ppdu`: PPDU statuses processed (`curr` ≤ 8), including those
+/// that found the queue empty. `ppdu_ignored`: PPDU statuses that came
+/// before any WIFI frame (`curr` above `RTW89_MAX_PPDU_CNT`). `overflow`: frames delivered without a signal
+/// because the queue was full; such a frame goes out ahead of the older
+/// frames still waiting. `c2h_skipped`: C2Hs too short to parse.
 /// Other packet types are dropped uncounted, as Linux drops them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RxCounts {
@@ -180,8 +183,9 @@ impl Receiver {
         self.cur
     }
 
-    /// How many frames wait for their PPDU status.
-    pub fn pending(&self) -> usize {
+    /// How many frames wait for their PPDU status (tests only).
+    #[cfg(test)]
+    pub(crate) fn pending(&self) -> usize {
         self.pending.len()
     }
 
