@@ -286,3 +286,97 @@ fn hfc_init_refuses_inconsistent_public_pages() {
         Err(AxError::Mac("HCI flow control public pages do not add up"))
     );
 }
+
+/// DMAC enabled, and the STA scheduler reporting `SS_INIT_DONE_1` once
+/// `SS_EN` has been written.
+fn sta_model() -> RegisterModel {
+    let mut m = RegisterModel::new();
+    m.set32(0x8400, 0x6000_0000);
+    m.set32(0x9D00, 0);
+    m.set32(0x9D04, 0);
+    m.set32(0x9D1C, 0);
+    m.on_read(
+        0x9E10,
+        Box::new(|m: &mut RegisterModel| m.get32(0x9E10) | 0x8000_0000),
+    );
+    m
+}
+
+#[test]
+fn sta_sch_mpdu_sec_match_linux_sequence() {
+    let mut m = sta_model();
+    sta_sch_init(&mut m).unwrap();
+    mpdu_proc_init(&mut m).unwrap();
+    sec_eng_init(&mut m).unwrap();
+    // sta_sch_init_ax (mac.c:2425), mpdu_proc_init_ax (:2458), sec_eng_init_ax
+    // (:2479). The second 0x9E10 write is the NONEMPTY clear, on a value that
+    // already has bit 28 clear.
+    assert_eq!(
+        m.writes(),
+        [
+            Op::W8(0x9E10, 0x01),
+            Op::W32(0x9E10, 0xA000_0001),
+            Op::W32(0x9E10, 0xA000_0001),
+            Op::W32(0x9E50, 0x0A00),
+            Op::W32(0x9C04, 0x02A9_5A95),
+            Op::W32(0x9C14, 0x0000_AA55),
+            Op::W32(0x9C00, 0x3),
+            Op::W32(0x9C40, 0x010E_05F0),
+            Op::W32(0x9D00, 0x71F),
+            Op::W32(0x9D04, 0x3),
+            Op::W32(0x9D1C, 0x8000_0000),
+        ]
+    );
+}
+
+#[test]
+fn sec_eng_keeps_tx_partial_mode() {
+    let mut m = sta_model();
+    m.set32(0x9D00, 0x800);
+    sec_eng_init(&mut m).unwrap();
+    assert_eq!(m.writes()[0], Op::W32(0x9D00, 0xF1F));
+}
+
+#[test]
+fn sta_sch_init_timeout() {
+    let mut m = sta_model();
+    m.on_read(0x9E10, Box::new(|m: &mut RegisterModel| m.get32(0x9E10)));
+    assert_eq!(
+        sta_sch_init(&mut m),
+        Err(AxError::Timeout {
+            register: 0x9E10,
+            mask: 0x8000_0000
+        })
+    );
+}
+
+#[test]
+fn sta_sch_mpdu_sec_refuse_a_disabled_dmac() {
+    for step in [sta_sch_init, mpdu_proc_init, sec_eng_init] {
+        let mut m = sta_model();
+        m.set32(0x8400, 0);
+        assert!(matches!(step(&mut m), Err(AxError::Dma(_))));
+        assert!(m.writes().is_empty());
+    }
+}
+
+#[test]
+fn dmac_init_runs_in_linux_order() {
+    let mut m = ready();
+    m.set32(0x8400, 0x6000_0000);
+    m.set32(0x1700, 0x0000_0C39);
+    m.set32(0x179C, 0x0C9C);
+    m.on_read(
+        0x9E10,
+        Box::new(|m: &mut RegisterModel| m.get32(0x9E10) | 0x8000_0000),
+    );
+    init(&mut m).unwrap();
+    let pos = |want: fn(&Op) -> bool| m.trace.iter().position(want).unwrap();
+    let dle = pos(|op| matches!(op, Op::W32(0x8C40, _)));
+    let preload = pos(|op| matches!(op, Op::W32(0x9F48, _)));
+    let hfc = pos(|op| matches!(op, Op::W32(0x1790, _)));
+    let sta = pos(|op| matches!(op, Op::W8(0x9E10, _)));
+    let mpdu = pos(|op| matches!(op, Op::W32(0x9C04, _)));
+    let sec = pos(|op| matches!(op, Op::W32(0x9D1C, _)));
+    assert!(dle < preload && preload < hfc && hfc < sta && sta < mpdu && mpdu < sec);
+}

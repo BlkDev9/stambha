@@ -14,15 +14,13 @@
 //! `reg.h`.
 //!
 //! Only the RTL8852C, PCIe branches are ported. `pre_init` lays out DLFW;
-//! `dle_init(&SCC, None)` (the `RTW89_QTA_SCC` layout, `rtw8852c.c:97`),
-//! `preload_init` (`preload_init_set_ax`, `mac.c:2345`) and `hfc_init` (the
-//! full `en && h2c_en` path with the SCC `hfc_param`, `mac.c:1194`) are the
-//! DMAC init's later steps. This module does not grant the BB pre-init, the
-//! PCI pre-init, the rest of `dmac_init_ax` (`sta_sch`, `mpdu_proc`,
-//! `sec_eng`), or firmware readiness.
-// `dmac::init` (milestone 2a, task 3) is the only user of `SCC`, `preload_init`
-// and `hfc_init`; until it lands they are exercised by the tests alone.
-#![allow(dead_code)]
+//! `init` is `dmac_init_ax` (`mac.c:2521`): `dle_init(&SCC, None)` (the
+//! `RTW89_QTA_SCC` layout, `rtw8852c.c:97`), `preload_init`
+//! (`preload_init_set_ax`, `mac.c:2345`), `hfc_init` (the full `en && h2c_en`
+//! path with the SCC `hfc_param`, `mac.c:1194`), then `sta_sch_init_ax`
+//! (`:2425`), `mpdu_proc_init_ax` (`:2458`) and `sec_eng_init_ax` (`:2479`).
+//! This module does not grant the BB pre-init, the PCI pre-init, the CMAC
+//! init, or firmware readiness.
 use super::io::{AxError, AxIo, clear32, field32, poll32, set32};
 
 // reg.h / mac.h (pinned rtw89).
@@ -261,6 +259,42 @@ const R_AX_TXPKTCTL_B0_PRELD_CFG1: u32 = 0x9F4C;
 const B_AX_B0_PRELD_NXT_TXENDWIN_MASK: u32 = 0xF << 8;
 const B_AX_B0_PRELD_NXT_RSVMINSZ_MASK: u32 = 0xFF;
 const PRELD_NEXT_WND: u32 = 1;
+
+// STA scheduler, MPDU processor, security engine (reg.h:1820-1907).
+const R_AX_SS_CTRL: u32 = 0x9E10;
+const B_AX_SS_EN: u8 = 1 << 0;
+const B_AX_SS_NONEMPTY_SS2FINFO_EN: u32 = 1 << 28;
+const B_AX_SS_WARM_INIT_FLG: u32 = 1 << 29;
+const B_AX_SS_INIT_DONE_1: u32 = 1 << 31;
+const R_AX_SS2FINFO_PATH: u32 = 0x9E50;
+const B_AX_SS_DEST_QUEUE_MASK: u32 = 0x3F << 8;
+const SS2F_PATH_WLCPU: u32 = 0x0A;
+/// `TRXCFG_WAIT_CNT` (`mac.h:599`), microseconds.
+const TRXCFG_WAIT_CNT: u64 = 2000;
+const R_AX_MPDU_PROC: u32 = 0x9C00;
+const B_AX_APPEND_FCS: u32 = 1 << 0;
+const B_AX_A_ICV_ERR: u32 = 1 << 1;
+const R_AX_ACTION_FWD0: u32 = 0x9C04;
+const TRXCFG_MPDU_PROC_ACT_FRWD: u32 = 0x02A9_5A95;
+const R_AX_TF_FWD: u32 = 0x9C14;
+const TRXCFG_MPDU_PROC_TF_FRWD: u32 = 0x0000_AA55;
+const R_AX_CUT_AMSDU_CTRL: u32 = 0x9C40;
+const TRXCFG_MPDU_PROC_CUT_CTRL: u32 = 0x010E_05F0;
+const R_AX_SEC_ENG_CTRL: u32 = 0x9D00;
+const B_AX_SEC_TX_ENC: u32 = 1 << 0;
+const B_AX_SEC_RX_DEC: u32 = 1 << 1;
+const B_AX_BC_DEC: u32 = 1 << 2;
+const B_AX_MC_DEC: u32 = 1 << 3;
+const B_AX_UC_MGNT_DEC: u32 = 1 << 4;
+const B_AX_CLK_EN_WEP_TKIP: u32 = 1 << 8;
+const B_AX_CLK_EN_WAPI: u32 = 1 << 9;
+const B_AX_CLK_EN_CGCMP: u32 = 1 << 10;
+const R_AX_SEC_MPDU_PROC: u32 = 0x9D04;
+const B_AX_APPEND_MIC: u32 = 1 << 0;
+const B_AX_APPEND_ICV: u32 = 1 << 1;
+const R_AX_SEC_DEBUG1: u32 = 0x9D1C;
+const B_AX_TX_TIMEOUT_SEL_MASK: u32 = 0x3 << 30;
+const AX_TX_TO_VAL: u32 = 0x2;
 
 /// `rtw89_mac_check_mac_en_ax(RTW89_MAC_0, RTW89_DMAC_SEL)` (`mac.c:62`).
 fn check_dmac_en<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
@@ -560,6 +594,69 @@ pub(super) fn hfc_init<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
         hfc_upd_ch_info(io, ch)?;
     }
     hfc_upd_mix_info(io)
+}
+
+/// `sta_sch_init_ax` (`mac.c:2425`), with `_patch_ss2f_path` (`:2414`), which
+/// the RTL8852C does not skip.
+fn sta_sch_init<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
+    check_dmac_en(io)?;
+    let ctrl = io.read8(R_AX_SS_CTRL)?;
+    io.write8(R_AX_SS_CTRL, ctrl | B_AX_SS_EN)?;
+    poll32(
+        io,
+        R_AX_SS_CTRL,
+        B_AX_SS_INIT_DONE_1,
+        B_AX_SS_INIT_DONE_1,
+        1,
+        TRXCFG_WAIT_CNT,
+    )?;
+    set32(io, R_AX_SS_CTRL, B_AX_SS_WARM_INIT_FLG)?;
+    clear32(io, R_AX_SS_CTRL, B_AX_SS_NONEMPTY_SS2FINFO_EN)?;
+    field32(
+        io,
+        R_AX_SS2FINFO_PATH,
+        B_AX_SS_DEST_QUEUE_MASK,
+        SS2F_PATH_WLCPU,
+    )
+}
+
+/// `mpdu_proc_init_ax` (`mac.c:2458`).
+fn mpdu_proc_init<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
+    check_dmac_en(io)?;
+    io.write32(R_AX_ACTION_FWD0, TRXCFG_MPDU_PROC_ACT_FRWD)?;
+    io.write32(R_AX_TF_FWD, TRXCFG_MPDU_PROC_TF_FRWD)?;
+    set32(io, R_AX_MPDU_PROC, B_AX_APPEND_FCS | B_AX_A_ICV_ERR)?;
+    io.write32(R_AX_CUT_AMSDU_CTRL, TRXCFG_MPDU_PROC_CUT_CTRL)
+}
+
+/// `sec_eng_init_ax` (`mac.c:2479`), RTL8852C on PCIe: `UC_MGNT_DEC` is set
+/// and `TX_PARTIAL_MODE` is left as found (cleared only for USB, `:2499`).
+fn sec_eng_init<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
+    check_dmac_en(io)?;
+    let ctrl = io.read32(R_AX_SEC_ENG_CTRL)?
+        | B_AX_CLK_EN_CGCMP
+        | B_AX_CLK_EN_WAPI
+        | B_AX_CLK_EN_WEP_TKIP
+        | B_AX_SEC_TX_ENC
+        | B_AX_SEC_RX_DEC
+        | B_AX_MC_DEC
+        | B_AX_BC_DEC
+        | B_AX_UC_MGNT_DEC;
+    io.write32(R_AX_SEC_ENG_CTRL, ctrl)?;
+    let mpdu = io.read32(R_AX_SEC_MPDU_PROC)? | B_AX_APPEND_ICV | B_AX_APPEND_MIC;
+    io.write32(R_AX_SEC_MPDU_PROC, mpdu)?;
+    field32(io, R_AX_SEC_DEBUG1, B_AX_TX_TIMEOUT_SEL_MASK, AX_TX_TO_VAL)
+}
+
+/// `dmac_init_ax(rtwdev, 0)` (`mac.c:2521`), RTL8852C on PCIe, with the SCC
+/// layout.
+pub fn init<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
+    dle_init(io, &SCC, None)?;
+    preload_init(io)?;
+    hfc_init(io)?;
+    sta_sch_init(io)?;
+    mpdu_proc_init(io)?;
+    sec_eng_init(io)
 }
 
 /// `rtw89_mac_ctrl_hci_dma_trx(true)` (`mac.h:1642`) then
