@@ -371,3 +371,378 @@ fn addck_reload_splits_each_path_and_keeps_other_bits() {
         0xC000_00FF | (3 << 28) | (0x3FF << 18) | (0x001 << 8)
     );
 }
+
+/// A DACK model: SWSI answered, the CMAC enabled and the scoreboard's
+/// firmware byte as milestone 1 leaves it (for the coex notify), DRCK's and
+/// both ADDCK polls met, and every DACK done bit set except S1's 0xC140 b31
+/// when `s1_done` is false. S0's MSBK register 0xC05C reads the 0xC000
+/// [4:1] selector in [31:24] (with its done bit b2), so `msbk[0][0][i] = i`;
+/// S0's bias 0xC048 reads 0x554 ([11:2] = 0x155) and its DADCK 0xC060 reads
+/// 0x7A in [31:24]. Every other DACK result reads 0.
+fn dack_model(s1_done: bool) -> RegisterModel {
+    let mut m = RegisterModel::new();
+    m.emulate_rf();
+    m.set32(0xC000, 0x4000_0000);
+    m.set32(0x00AC, 0x8100_0000);
+    m.set32(DRCK_RES, 0x8);
+    m.set32(ADDCKR[0], 1);
+    m.set32(ADDCKR[1], 1);
+    m.set32(0x1C040, 1 << 31);
+    m.set32(0x1C064, 1 << 31);
+    m.set32(0x1C080, 1 << 2);
+    m.set32(0x1C140, if s1_done { 1 << 31 } else { 0 });
+    m.set32(0x1C164, 1 << 31);
+    m.set32(0x1C15C, 1 << 2);
+    m.set32(0x1C180, 1 << 2);
+    m.on_read(
+        0x1C05C,
+        Box::new(|m| (((m.get32(0x1C000) >> 1) & 0xF) << 24) | (1 << 2)),
+    );
+    m.set32(0x1C048, 0x554);
+    m.set32(0x1C060, 0x7A00_0000);
+    m
+}
+
+/// The index of the first `op` in `trace`.
+fn first(trace: &[Op], op: Op) -> usize {
+    trace
+        .iter()
+        .position(|o| *o == op)
+        .unwrap_or_else(|| panic!("{op:?} not in the trace"))
+}
+
+/// The index of the first 32-bit write of `reg` in `trace`.
+fn first_w32(trace: &[Op], reg: u32) -> usize {
+    trace
+        .iter()
+        .position(|o| matches!(o, Op::W32(r, _) if *r == reg))
+        .unwrap_or_else(|| panic!("no write of {reg:#x}"))
+}
+
+/// `_dack_reload_by_path`'s four MSBK words from `base` (0x1C200 plus the
+/// index and path offsets), each followed by its debug read-back.
+fn msbk_words(base: u32, words: [u32; 4]) -> Vec<Op> {
+    words
+        .iter()
+        .zip((0..).map(|k: u32| base + 4 * k))
+        .flat_map(|(&v, reg)| [Op::W32(reg, v), Op::R32(reg)])
+        .collect()
+}
+
+/// The reload's bias/DADCK word `v` at `reg`, then its b0 set.
+fn bias_word(reg: u32, v: u32) -> [Op; 3] {
+    [Op::W32(reg, v), Op::R32(reg), Op::W32(reg, v | 1)]
+}
+
+#[test]
+fn dack_s0_reloads_packed_msbk_words() {
+    let mut m = dack_model(true);
+    assert_eq!(dack(&mut m).unwrap().dack_timed_out, [false, false]);
+    let base = 0x1C200;
+    let at = first(&m.trace, Op::W32(base, 0x0F0E_0D0C));
+    let mut want = msbk_words(base, [0x0F0E_0D0C, 0x0B0A_0908, 0x0706_0504, 0x0302_0100]);
+    want.extend(bias_word(0x1C210, 0x555E_8000));
+    assert_eq!(m.trace[at..at + want.len()], want[..]);
+    // Index 1 (the 0xC020/0xC080 side, whose MSBK, bias and DADCK read 0
+    // here), then path B's two indexes, each at its own offset.
+    for off in [0x14, 0x28, 0x3C] {
+        let b = base + off;
+        let at = first(&m.trace, Op::W32(b, 0));
+        let mut want = msbk_words(b, [0; 4]);
+        want.extend(bias_word(b + 0x10, 0));
+        assert_eq!(m.trace[at..at + want.len()], want[..]);
+    }
+    // Each reload starts with dack_reload_defs: b17 of 0xC004, 0xC024,
+    // 0xC104 and 0xC124.
+    let w = m.writes();
+    let at = first(&w, Op::W32(base, 0x0F0E_0D0C));
+    assert_eq!(
+        w[at - 4..at],
+        [
+            Op::W32(0x1C004, 0x0302_0000),
+            Op::W32(0x1C024, 0x0302_0000),
+            Op::W32(0x1C104, 0x2_0000),
+            Op::W32(0x1C124, 0x2_0000),
+        ]
+    );
+}
+
+#[test]
+fn dack_runs_notify_drck_addck_s0_s1_notify_in_order() {
+    let mut m = dack_model(true);
+    dack(&mut m).unwrap();
+    let t = &m.trace;
+    let order = [
+        first(t, Op::W32(0x00AC, 0x8100_4803)),
+        first(t, Op::W32(0x1C0C4, 0x40)),
+        first(t, Op::RfW(0, 0x00, F, 0x337E1)),
+        first_w32(t, 0x1C0F4),
+        first(t, Op::RfW(0, 0x01, F, 0)),
+        first_w32(t, 0x112A0),
+        first_w32(t, 0x132A0),
+        first(t, Op::W32(0x00AC, 0x8100_4003)),
+    ];
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+    // The coex START comes first, with its grant, and the STOP's 1 ms ends
+    // the trace.
+    assert_eq!(t[0], Op::W32(0xDA48, 0x5_7DDF));
+    assert_eq!(t.last(), Some(&Op::Delay(1000)));
+}
+
+#[test]
+fn dack_returns_drck_and_addck_results() {
+    let mut m = dack_model(true);
+    m.set32(DRCK_RES, 0x0006_8008);
+    m.set32(ADDCKR[0], (0x155 << 10) | 0x2AB);
+    m.set32(ADDCKR[1], (0x3FF << 10) | 0x001);
+    assert_eq!(
+        dack(&mut m),
+        Ok(Dack {
+            drck: 0x0D,
+            drck_timed_out: false,
+            addck: [(0x155, 0x2AB), (0x3FF, 0x001)],
+            addck_timed_out: [false, false],
+            dack_timed_out: [false, false],
+        })
+    );
+    // The ADDCK results reloaded into 0xC0F8/0xC1F8.
+    assert_eq!(
+        m.get32(ADDCK_RL[0]),
+        (3 << 28) | (0x155 << 18) | (0x2AB << 8)
+    );
+    assert_eq!(
+        m.get32(ADDCK_RL[1]),
+        (3 << 28) | (0x3FF << 18) | (0x001 << 8)
+    );
+}
+
+#[test]
+fn dack_restores_rf_mode_and_reg5() {
+    let mut m = dack_model(true);
+    m.set_rf(0, 0x00, 0x33C01);
+    m.set_rf(1, 0x00, 0x33C01);
+    dack(&mut m).unwrap();
+    let rf = rf_only(&m);
+    // The whole SWSI view of _dac_cal: both RR_MOD reads, after DRCK the
+    // reg5 clear and the 0x337E1 mode, after ADDCK RR_MODOPT cleared, and
+    // after S1 the mode and reg5 restored.
+    assert_eq!(
+        rf,
+        [
+            Op::RfR(0, 0x00),
+            Op::RfR(1, 0x00),
+            Op::RfW(0, 0x05, 1, 0),
+            Op::RfW(1, 0x05, 1, 0),
+            Op::RfW(0, 0x00, F, 0x337E1),
+            Op::RfW(1, 0x00, F, 0x337E1),
+            Op::RfW(0, 0x01, F, 0),
+            Op::RfW(1, 0x01, F, 0),
+            Op::RfW(0, 0x00, F, 0x33C01),
+            Op::RfW(1, 0x00, F, 0x33C01),
+            Op::RfW(0, 0x05, 1, 1),
+            Op::RfW(1, 0x05, 1, 1),
+        ]
+    );
+    for p in 0..2u8 {
+        assert_eq!(m.get_rf(p, 0x00), 0x33C01);
+        assert_eq!(m.get_rf(p, 0x05) & 1, 1);
+    }
+}
+
+#[test]
+fn dack_s0_matches_linux_sequence() {
+    let mut m = dack_model(true);
+    dack(&mut m).unwrap();
+    let w = m.writes();
+    let start = first_w32(&w, 0x112A0);
+    assert_eq!(
+        w[start..start + 16],
+        [
+            // txck_force(A, true, DAC_160M).
+            Op::W32(0x112A0, 0),
+            Op::W32(0x112A0, 0x3000),
+            Op::W32(0x112A0, 0xB000),
+            // dack_defs_s0.
+            Op::W32(0x112B8, 0x4000_0000),
+            Op::W32(0x1030C, 0x1000_0000),
+            Op::W32(0x1032C, 0),
+            Op::W32(0x1C004, 0x0300_0000),
+            Op::W32(0x1C024, 0x0300_0000),
+            // _dack_reset(A).
+            Op::W32(0x1C000, 0),
+            Op::W32(0x1C000, 0x2_0000),
+            // The trigger, its one met sample (no wait), the trigger off.
+            Op::W32(0x1C004, 0x0300_0001),
+            Op::W32(0x1C004, 0x0300_0000),
+            // txck_force(A, false, ..).
+            Op::W32(0x112A0, 0x3000),
+            // _dack_backup_s0: the debug mode, then the first selectors.
+            Op::W32(0x112B8, 0x4000_0000),
+            Op::W32(0x1C000, 0x2_0000),
+            Op::W32(0x1C020, 0),
+        ]
+    );
+    // Sixteen selector pairs, then dack_reload_defs, before the first word.
+    for i in 0..16u32 {
+        let k = start + 14 + 2 * i as usize;
+        assert_eq!(w[k], Op::W32(0x1C000, 0x2_0000 | (i << 1)));
+        assert_eq!(w[k + 1], Op::W32(0x1C020, i << 1));
+    }
+    assert_eq!(
+        first(&w, Op::W32(0x1C200, 0x0F0E_0D0C)),
+        start + 14 + 32 + 4
+    );
+    // The done chain: one sample reads the four registers in order.
+    let trig = first(&m.trace, Op::W32(0x1C004, 0x0300_0001));
+    assert_eq!(
+        m.trace[trig + 1..trig + 5],
+        [
+            Op::R32(0x1C040),
+            Op::R32(0x1C064),
+            Op::R32(0x1C05C),
+            Op::R32(0x1C080),
+        ]
+    );
+    // The backup's last selector pair and its reads, then bias and DADCK of
+    // both sides, then the first reload.
+    let bk = first(&m.trace, Op::W32(0x1C000, 0x2_001E));
+    assert_eq!(
+        m.trace[bk + 1..bk + 12],
+        [
+            Op::R32(0x1C05C),
+            Op::R32(0x1C020),
+            Op::W32(0x1C020, 0x1E),
+            Op::R32(0x1C080),
+            Op::R32(0x1C048),
+            Op::R32(0x1C06C),
+            Op::R32(0x1C060),
+            Op::R32(0x1C084),
+            Op::R32(0x1C004),
+            Op::W32(0x1C004, 0x0302_0000),
+            Op::R32(0x1C024),
+        ]
+    );
+    // After both reloads, 0x12B8 b30 is cleared and S1 starts.
+    let s1 = first_w32(&w, 0x132A0);
+    assert_eq!(w[s1 - 1], Op::W32(0x112B8, 0));
+    assert_eq!(
+        w[s1 - 3..s1 - 1],
+        [Op::W32(0x1C224, 0), Op::W32(0x1C224, 1)]
+    );
+}
+
+#[test]
+fn dack_s1_matches_linux_sequence() {
+    let mut m = dack_model(true);
+    dack(&mut m).unwrap();
+    let w = m.writes();
+    let start = first_w32(&w, 0x132A0);
+    assert_eq!(
+        w[start..start + 16],
+        [
+            Op::W32(0x132A0, 0),
+            Op::W32(0x132A0, 0x3000),
+            Op::W32(0x132A0, 0xB000),
+            // dack_defs_s1 (0x030C and 0x032C are already set by S0's).
+            Op::W32(0x132B8, 0x4000_0000),
+            Op::W32(0x1030C, 0x1000_0000),
+            Op::W32(0x1032C, 0),
+            // b17 is left set by S0's reloads.
+            Op::W32(0x1C104, 0x0302_0000),
+            Op::W32(0x1C124, 0x0302_0000),
+            Op::W32(0x1C100, 0),
+            Op::W32(0x1C100, 0x2_0000),
+            Op::W32(0x1C104, 0x0302_0001),
+            Op::W32(0x1C104, 0x0302_0000),
+            Op::W32(0x132A0, 0x3000),
+            Op::W32(0x132B8, 0x4000_0000),
+            Op::W32(0x1C100, 0x2_0000),
+            Op::W32(0x1C120, 0),
+        ]
+    );
+    let trig = first(&m.trace, Op::W32(0x1C104, 0x0302_0001));
+    assert_eq!(
+        m.trace[trig + 1..trig + 5],
+        [
+            Op::R32(0x1C140),
+            Op::R32(0x1C164),
+            Op::R32(0x1C15C),
+            Op::R32(0x1C180),
+        ]
+    );
+    let bk = first(&m.trace, Op::W32(0x1C100, 0x2_001E));
+    assert_eq!(
+        m.trace[bk + 1..bk + 9],
+        [
+            Op::R32(0x1C15C),
+            Op::R32(0x1C120),
+            Op::W32(0x1C120, 0x1E),
+            Op::R32(0x1C180),
+            Op::R32(0x1C148),
+            Op::R32(0x1C16C),
+            Op::R32(0x1C160),
+            Op::R32(0x1C184),
+        ]
+    );
+    // Path B's second reload, then 0x32B8 b30 cleared, then the restore.
+    let end = first(&w, Op::W32(0x132B8, 0));
+    assert_eq!(w[end - 2..end], [Op::W32(0x1C24C, 0), Op::W32(0x1C24C, 1)]);
+}
+
+#[test]
+fn dack_s1_timeout_is_recorded_on_path_b() {
+    let mut m = dack_model(false);
+    assert_eq!(dack(&mut m).unwrap().dack_timed_out, [false, true]);
+    let t = &m.trace;
+    let trig = first(t, Op::W32(0x1C104, 0x0302_0001));
+    let stop = trig + first(&t[trig..], Op::W32(0x1C104, 0x0302_0000));
+    // read_poll_timeout_atomic(.., 1, 10000, ..): 9992 samples, 9991 waits,
+    // each sample stopping at 0xC140.
+    let poll = &t[trig..stop];
+    assert_eq!(
+        poll.iter().filter(|o| **o == Op::R32(0x1C140)).count(),
+        9992
+    );
+    assert_eq!(poll.iter().filter(|o| **o == Op::Delay(1)).count(), 9991);
+    assert!(
+        !poll
+            .iter()
+            .any(|o| matches!(o, Op::R32(0x1C164 | 0x1C15C | 0x1C180)))
+    );
+    // S1's backup and both reloads still run, then the restore and STOP.
+    let bk = first(t, Op::W32(0x1C100, 0x2_001E));
+    assert!(bk > stop);
+    for b in [0x1C228, 0x1C23C] {
+        assert!(first(t, Op::W32(b + 0x10, 0)) > bk);
+        assert!(t.contains(&Op::W32(b + 0x10, 1)));
+    }
+    assert!(first(t, Op::W32(0x132B8, 0)) > bk);
+    assert_eq!(t.last(), Some(&Op::Delay(1000)));
+}
+
+#[test]
+fn dack_s0_timeout_is_recorded_on_path_a_and_s1_runs() {
+    let mut m = dack_model(true);
+    m.set32(0x1C064, 0);
+    assert_eq!(dack(&mut m).unwrap().dack_timed_out, [true, false]);
+    assert!(m.trace.contains(&Op::W32(0x1C104, 0x0302_0001)));
+}
+
+#[test]
+fn dack_swsi_stuck_fails_after_the_coex_start() {
+    let mut m = dack_model(true);
+    m.swsi_status = 1 << 24;
+    assert!(matches!(
+        dack(&mut m),
+        Err(AxError::Timeout {
+            register: 0x1174C,
+            ..
+        })
+    ));
+    assert!(m.trace.contains(&Op::W32(0x00AC, 0x8100_4803)));
+    assert!(
+        rf_only(&m)
+            .iter()
+            .all(|o| !matches!(o, Op::RfW(..) | Op::RfR(..)))
+    );
+}
