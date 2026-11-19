@@ -43,10 +43,13 @@
 //! table H2Cs through the same session. [`scan`] runs these in Linux's order
 //! (core start, channel 1, vif init), then the firmware's passive scan
 //! offload over 38 channels, and keeps the beacons and probe responses it
-//! hears as networks by BSSID. [`bring_up`] calls none of these yet:
-//! the bring-up grants no channel, no IQK, DPK, TSSI or tracking, no station
-//! and no interrupts; the chip is powered off at the end, and nothing past
-//! `rtw89_phy_dm_init` runs.
+//! hears as networks by BSSID. [`bring_up`] runs [`scan::run`] after
+//! `rtw89_phy_dm_init`, with the BB gain table, efuse RX gain offsets, RPL
+//! bias and cut the steps before it produced, and reports the networks with
+//! RF 0x18 read through both of its windows ([`Rf18`]). The bring-up grants
+//! no channel but the scan's boot channel, no IQK, DPK, TSSI or tracking, no
+//! association, no transmission request and no interrupts; the chip is
+//! powered off at the end.
 pub mod bb;
 pub mod bringup;
 pub mod c2h;
@@ -80,7 +83,7 @@ pub(crate) mod tests;
 pub mod trx;
 pub mod vif;
 
-pub use bringup::{BringUpError, Earlier, Host, Running, bring_up, quiesce};
+pub use bringup::{BringUpError, Earlier, Host, Rf18, Rf18Line, Running, bring_up, quiesce};
 pub use command::H2cAck;
 pub use fwdl::download;
 pub use io::{
@@ -92,4 +95,4 @@ pub use phy::{PhyReport, RfkReport};
 // `pci::pre_init` and `dmac::pre_init` are reached by their module only.
 pub use pci::{Ch12, Rings, encode_txbd};
 pub use power::{power_on, xtal_si_read, xtal_si_write};
-pub use scan::{Listed, ScanReport};
+pub use scan::{Listed, Network, ScanEnd, ScanReport};

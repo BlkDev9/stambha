@@ -299,7 +299,20 @@ impl Firmware {
     /// Answer CH12 and RXQ index reads on `io`, replacing any earlier hooks
     /// of 0x1080 and 0x1218.
     pub fn install(self, io: &mut RegisterModel) {
-        let state = Rc::new(RefCell::new(State {
+        let state = self.answering();
+        let ch12 = state.clone();
+        io.on_read(
+            CH12_IDX,
+            Box::new(move |r: &mut RegisterModel| ch12.ch12(r)),
+        );
+        io.on_read(RXQ_IDX, Box::new(move |r: &mut RegisterModel| state.rxq(r)));
+    }
+
+    /// The firmware as [`Answering`], for hooks of 0x1080 and 0x1218 that
+    /// hand it over only from some point on, as the bring-up's do once
+    /// OFLD_CFG's scripted acks are out.
+    pub fn answering(self) -> Answering {
+        Answering(Rc::new(RefCell::new(State {
             fw: self,
             ch12: 0,
             channels: Vec::new(),
@@ -307,16 +320,32 @@ impl Firmware {
             batches: VecDeque::new(),
             ppdu_cnt: 0,
             hw: 0,
-        }));
-        let ch12 = state.clone();
-        io.on_read(
-            CH12_IDX,
-            Box::new(move |r: &mut RegisterModel| ch12.borrow_mut().ch12(r)),
-        );
-        io.on_read(
-            RXQ_IDX,
-            Box::new(move |r: &mut RegisterModel| state.borrow_mut().rxq(r)),
-        );
+        })))
+    }
+}
+
+/// A [`Firmware`] behind index reads its caller forwards.
+#[derive(Clone)]
+pub struct Answering(Rc<RefCell<State>>);
+
+impl Answering {
+    /// A CH12 index read (0x1080), as [`Firmware::install`] answers it.
+    pub fn ch12(&self, r: &mut RegisterModel) -> u32 {
+        self.0.borrow_mut().ch12(r)
+    }
+
+    /// An RXQ index read (0x1218), as [`Firmware::install`] answers it.
+    pub fn rxq(&self, r: &mut RegisterModel) -> u32 {
+        self.0.borrow_mut().rxq(r)
+    }
+
+    /// From now on the next H2C is read from FWCMD slot `ch12` and the next
+    /// RXQ buffer written to entry `hw`: the slots and entries before them
+    /// were someone else's.
+    pub fn resume_at(&self, ch12: usize, hw: usize) {
+        let mut state = self.0.borrow_mut();
+        state.ch12 = ch12 % TX_ENTRIES;
+        state.hw = hw % RX_ENTRIES;
     }
 }
 

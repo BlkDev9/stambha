@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 // Copyright(c) 2019-2020  Realtek Corporation
 // Copyright(c) 2020  Realtek Corporation
+// Copyright(c) 2019-2022  Realtek Corporation
+// Copyright(c) 2020-2022  Realtek Corporation
 //! An RTL8852C's first passive scan, from the end of `rtw89_core_start` to
 //! the end of the firmware's scan offload (M2c spec S2, S8-S13), as
 //! `rtw89_ops_hw_scan` (`mac80211.c:1279-1320`) runs it from idle.
@@ -30,9 +32,12 @@
 //! Frames still queued from core start and vif init are flushed away before
 //! `Scanner::begin`; frames drained between ADD_SCANOFLD_CH and SCANOFLD's
 //! DONE_ACK are held until `Scanner::submitted`; after END_SCAN or the stop,
-//! RXQ is drained until a poll finds it empty, and only then is the
-//! receiver flushed into the scan, so frames still waiting for their PPDU
-//! status are kept, without RSSI.
+//! RXQ is drained until a poll finds it empty, or for at most 64 polls
+//! (`MAX_TAIL_POLLS`), which the report then says
+//! ([`ScanReport::tail_capped`]); only then is the receiver flushed into the
+//! scan, so frames still waiting for their PPDU status are kept, without
+//! RSSI. Between ADD_SCANOFLD_CH's DONE_ACK and SCANOFLD start the request
+//! is rechecked with `Scanner::validate_submission`.
 //!
 //! Where Linux aborts a failed `rtw89_hw_scan_offload` (`mac80211.c:1315`),
 //! the scan start fails instead and the caller powers the chip off.
@@ -181,9 +186,12 @@ pub struct Network {
 /// `Scanner::begin` on, those it refused, those too short to be a frame,
 /// those that are no MPDU, and those past a bound: a new BSSID past 512, or
 /// more than 64 frames before `Scanner::submitted`.
-/// `rxq_full` is [`Rings::rxq_full_batches`]; `refused` the session
-/// ledger's first refused H2C. `networks` holds the strongest
-/// [`MAX_LISTED`] of `networks_total`, strongest first.
+/// `rxq_full` is [`Rings::rxq_full_batches`]; `tail_capped` says the drain
+/// after END_SCAN or the stop hit its cap, 64 polls that each found RXQ
+/// entries, so RXQ was never seen empty and frames may have been left in
+/// it; `refused` the session ledger's first refused H2C, its return raw.
+/// `networks` holds the strongest [`MAX_LISTED`] of `networks_total`,
+/// strongest first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanReport {
     pub channels: u8,
@@ -194,6 +202,7 @@ pub struct ScanReport {
     pub without_rssi: u16,
     pub dropped: u16,
     pub rxq_full: u16,
+    pub tail_capped: bool,
     pub refused: Option<Refused>,
     pub networks_total: u16,
     pub networks: [Option<Network>; MAX_LISTED],
@@ -252,7 +261,9 @@ impl fmt::Display for ScanEnd {
     }
 }
 
-/// Spec S13.3: the suffix the host check appends to the bring-up line.
+/// Spec S13.3: the suffix the host check appends to the bring-up line, with
+/// Stela's own `, RXQ not drained after 64 polls` after `RXQ full` when
+/// [`ScanReport::tail_capped`].
 impl fmt::Display for ScanReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -271,6 +282,9 @@ impl fmt::Display for ScanReport {
         }
         if self.rxq_full != 0 {
             write!(f, ", RXQ full {}", self.rxq_full)?;
+        }
+        if self.tail_capped {
+            write!(f, ", RXQ not drained after {MAX_TAIL_POLLS} polls")?;
         }
         if let Some(r) = self.refused {
             write!(
@@ -630,7 +644,8 @@ fn is_end(event: &Event<'_>) -> bool {
 }
 
 /// Step `"scan start"`: the gate, spec S8, `Scanner::begin`, then
-/// ADD_SCANOFLD_CH and SCANOFLD each with its wait, and `submitted`.
+/// ADD_SCANOFLD_CH with its wait, `Scanner::validate_submission`, SCANOFLD
+/// with its wait, and `submitted`.
 ///
 /// # Safety
 /// As [`run`].
@@ -694,6 +709,12 @@ unsafe fn start<I: AxIo + ?Sized>(
         )
     }
     .map_err(command)?;
+    // `Scanner`'s contract: the request is rechecked (budget and channel
+    // policy) just before it is handed to the transport, SCANOFLD start,
+    // which `submitted` then records. A budget already spent cancels it.
+    scan.scanner
+        .validate_submission(scan.ticket, io.now_us()?, &mut PassiveList)
+        .map_err(refusal)?;
     let packet = session.h2c.scanofld(MAC_ID, PORT, true);
     // SAFETY: as above.
     unsafe {
@@ -742,9 +763,12 @@ unsafe fn finish<I: AxIo + ?Sized>(
         }
     }
     let ended_us = io.now_us()?;
+    // Capped unless a poll finds RXQ empty.
+    let mut tail_capped = true;
     for _ in 0..MAX_TAIL_POLLS {
         // SAFETY: as above, `drain`'s.
         if unsafe { session.drain(io, &mut |e| scan.event(e)) }? == 0 {
+            tail_capped = false;
             break;
         }
     }
@@ -788,6 +812,7 @@ unsafe fn finish<I: AxIo + ?Sized>(
                 .saturating_sub(scan.short_before),
         ),
         rxq_full: session.rings().rxq_full_batches(),
+        tail_capped,
         refused: session.ledger.refused,
         networks_total,
         networks,

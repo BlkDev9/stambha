@@ -671,6 +671,7 @@ fn every_suffix_prints_in_order() {
     let mut r = scan(|_| {}).report();
     r.dropped = 3;
     r.rxq_full = 2;
+    r.tail_capped = true;
     r.refused = Some(Refused {
         class: 6,
         func: 0,
@@ -678,8 +679,10 @@ fn every_suffix_prints_in_order() {
         ret: 9,
     });
     assert!(
-        r.to_string()
-            .ends_with("(0 without RSSI), dropped 3, RXQ full 2, H2C 6/0 seq 15 returned 9"),
+        r.to_string().ends_with(
+            "(0 without RSSI), dropped 3, RXQ full 2, RXQ not drained after 64 polls, H2C \
+             6/0 seq 15 returned 9"
+        ),
         "{r}"
     );
 }
@@ -835,4 +838,72 @@ fn six_ghz_and_band_3_reports_are_handled() {
         r.networks[1],
         Some(network(OFFICE, HwBand::G5, 165, Some(-70), b"Office"))
     );
+}
+
+/// A LEAVE_CH report on 2.4 GHz channel 1: a C2H the scan only counts.
+fn leave_ch() -> Vec<u8> {
+    scanofld(4, 0, 0, 1, 105)
+}
+
+#[test]
+fn the_tail_drain_stops_at_its_cap_and_says_so() {
+    // 63 batches after END_SCAN: the 64th tail poll finds RXQ empty.
+    let r = scan(|fw| {
+        for _ in 0..MAX_TAIL_POLLS - 1 {
+            fw.after_end(vec![leave_ch()]);
+        }
+    })
+    .report();
+    assert!(!r.tail_capped);
+    assert!(!r.to_string().contains("RXQ not drained"), "{r}");
+    // 64: every tail poll consumed a batch, so RXQ was never seen empty, and
+    // the 65th batch is left in the ring.
+    let s = scan(|fw| {
+        for _ in 0..=MAX_TAIL_POLLS {
+            fw.after_end(vec![leave_ch()]);
+        }
+        fw.after_end(vec![mgnt_frame(0x80, BROADCAST, HOME, b"Late", None, 6)]);
+    });
+    let r = s.report();
+    assert!(r.tail_capped);
+    assert_eq!((r.end, r.networks_total), (ScanEnd::Ok, 0));
+    assert!(
+        r.to_string()
+            .ends_with("(0 without RSSI), RXQ not drained after 64 polls"),
+        "{r}"
+    );
+}
+
+#[test]
+fn the_submission_is_validated_before_scanofld() {
+    // The clock jumps past the scan budget while ADD_SCANOFLD_CH (the 16th
+    // kick, seq 18) waits for its DONE_ACK: the scanner's recheck before
+    // SCANOFLD cancels the request, and SCANOFLD is never sent.
+    let (m, mut rings, mut io) = chip();
+    let fw = Firmware::new(&m).answering();
+    let ch12 = fw.clone();
+    io.on_read(
+        0x1080,
+        alloc::boxed::Box::new(move |r: &mut RegisterModel| ch12.ch12(r)),
+    );
+    let mut jumped = false;
+    io.on_read(
+        0x1218,
+        alloc::boxed::Box::new(move |r: &mut RegisterModel| {
+            if !jumped && kicks(&r.trace).len() == 16 {
+                r.now += SCAN_WAIT_US;
+                jumped = true;
+            }
+            fw.rxq(r)
+        }),
+    );
+    let (got, _) = scan_on(&mut rings, &mut io, FIRMWARE);
+    assert_eq!(
+        got,
+        Err(ScanError {
+            step: "scan start",
+            error: AxError::Scan("scan timed out")
+        })
+    );
+    assert_eq!(kicks(&io.trace).len(), 16);
 }

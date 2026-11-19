@@ -80,7 +80,10 @@ pub enum AxError {
         /// The last RXQ hardware index read (`IDX` [27:16]).
         rxq_hw: u16,
     },
-    /// The firmware acknowledged an H2C with a non-zero return code.
+    /// The firmware acknowledged an H2C with a return code that fails it.
+    /// `ret` is the DONE_ACK's `H2C_RETURN` byte raw, before the mask that
+    /// decided the failure (ADD_SCANOFLD_CH fails on bits 5:0 only), and
+    /// prints so.
     H2cRejected {
         class: u8,
         func: u8,
@@ -158,7 +161,8 @@ impl fmt::Display for AxError {
                 ret,
             } => write!(
                 f,
-                "firmware refused H2C class {class} func {func:#x} seq {seq} (return {ret})"
+                "firmware refused H2C class {class} func {func:#x} seq {seq} (raw return \
+                 {ret:#04x})"
             ),
             Self::Scan(what) => write!(f, "scan: {what}"),
             Self::FirmwareStatus { what, fw_ctrl } => write!(f, "{what} (0x01E0={fw_ctrl:#010x})"),
