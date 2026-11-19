@@ -20,15 +20,13 @@ use super::c2h::{self, C2h};
 use super::h2c::{H2C_CAT_MAC, H2C_CL_MAC_FW_OFLD, H2C_FUNC_OFLD_CFG, H2c};
 use super::io::{AxError, AxIo, poll_sample};
 use super::pci::Rings;
-use super::rx::{self, RxBuffer};
+use super::rx::{self, RX_TYPE_C2H, RxBuffer};
 
 /// `RTW89_WAIT_FOR_COND_TIMEOUT` (`core.h:5930`): 100 ms.
 pub const ACK_WAIT_US: u64 = 100_000;
 /// The RXQ index sampling interval (spec S1.9).
 pub const ACK_POLL_US: u64 = 50;
 
-/// `RTW89_CORE_RX_TYPE_C2H` (`core.h:236`).
-const RX_TYPE_C2H: u8 = 10;
 const LOG_TEXT_BYTES: usize = 48;
 
 /// The first `LOG_TEXT_BYTES` printable ASCII bytes of a plain firmware
@@ -136,7 +134,7 @@ impl Seen {
                 ack.unmatched_ack = ack.unmatched_ack.saturating_add(1)
             }
             Some(C2h::Log(text)) if ack.log.is_none() => ack.log = Some(LogText::new(text)),
-            Some(C2h::Log(_) | C2h::FormattedLog | C2h::Other { .. }) => {
+            Some(C2h::Log(_) | C2h::FormattedLog | C2h::ScanOfld(_) | C2h::Other { .. }) => {
                 ack.other_c2h = ack.other_c2h.saturating_add(1)
             }
         }
