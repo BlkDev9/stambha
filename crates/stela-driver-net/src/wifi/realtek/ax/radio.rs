@@ -30,6 +30,7 @@ use super::pci::Rings;
 use super::phy_table::{self, RADIO_A, RADIO_B};
 use super::rf::{self, RFREG_MASK};
 use alloc::vec::Vec;
+use core::fmt;
 
 /// `RTW89_H2C_RF_PAGE_SIZE` (fw.h:4663): words in one RF_REG page.
 pub const RF_PAGE_WORDS: usize = 500;
@@ -61,30 +62,73 @@ pub struct RfInit {
     pub words: [u16; 2],
 }
 
-/// Why [`init_rf_reg`] failed, split as the bring-up names its steps.
+/// Why [`init_rf_reg`] failed, split as the bring-up names its steps, with
+/// the path (and for a page, the page) it failed on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RfInitError {
-    /// A radio table selected nothing or reached an unselected ELSE, or an
-    /// RF write failed: step `"rf init"`.
-    Table(AxError),
-    /// An RF_REG page was not sent on CH12: step `"rf h2c"`.
-    Submit(AxError),
+    /// `path`'s radio table selected nothing or reached an unselected ELSE,
+    /// or one of its RF writes failed: step `"rf init"`.
+    Table { path: RfPath, error: AxError },
+    /// `path`'s RF_REG page `page` (its H2C func) was not sent on CH12:
+    /// step `"rf h2c"`.
+    Submit {
+        path: RfPath,
+        page: u8,
+        error: AxError,
+    },
 }
 
 impl RfInitError {
     /// The bring-up step this failure names.
     pub fn step(&self) -> &'static str {
         match self {
-            Self::Table(_) => "rf init",
-            Self::Submit(_) => "rf h2c",
+            Self::Table { .. } => "rf init",
+            Self::Submit { .. } => "rf h2c",
         }
     }
 
     /// The underlying error.
     pub fn error(&self) -> AxError {
         match *self {
-            Self::Table(error) | Self::Submit(error) => error,
+            Self::Table { error, .. } | Self::Submit { error, .. } => error,
         }
+    }
+
+    /// Where it failed.
+    pub fn at(&self) -> RfAt {
+        match *self {
+            Self::Table { path, .. } => RfAt { path, page: None },
+            Self::Submit { path, page, .. } => RfAt {
+                path,
+                page: Some(page),
+            },
+        }
+    }
+}
+
+/// The RF path, and for an RF_REG H2C the page, an RF init failure
+/// happened on. Linux logs neither (it only warns of a failed page,
+/// phy.c:2034-2036); a bring-up line names them, as `"path B"` or
+/// `"path A page 1"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RfAt {
+    pub path: RfPath,
+    pub page: Option<u8>,
+}
+
+impl fmt::Display for RfAt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let path = match self.path {
+            RfPath::A => "A",
+            RfPath::B => "B",
+            RfPath::C => "C",
+            RfPath::D => "D",
+        };
+        write!(f, "path {path}")?;
+        if let Some(page) = self.page {
+            write!(f, " page {page}")?;
+        }
+        Ok(())
     }
 }
 
@@ -130,7 +174,18 @@ fn config_rf_reg_v1<I: AxIo + ?Sized>(
 /// CH12; a path that stored nothing sends nothing. A submit returns once
 /// CH12 has consumed the packet, and nothing waits for the firmware.
 ///
-/// A failure stops everything after it: no later page, no later slot.
+/// A failure stops everything after it: no later page, no later slot. It
+/// names the path, and for a page its index ([`RfInitError::at`]).
+///
+/// `h2c` must be the state the OFLD_CFG H2C leaves (seq 1), as it is in
+/// Linux, where `rtw89_fw_h2c_set_ofld_cfg` is the last H2C of
+/// `rtw89_mac_init` (mac.c:4394) and this runs next (core.c:6676-6693). The
+/// pinned file's tables then send one page per path, at seq 1 (path B) and
+/// 2 (path A), and neither falls on the forced-REC_ACK rule (`seq % 4 ==
+/// 0`, fw.c:1641), so the firmware is asked for no acknowledgement. Called
+/// at another state, a page at a multiple of 4 would ask for a REC_ACK that
+/// nothing here reads; it would stay in RXQ for the next poll. This is not
+/// checked: the bring-up threads the one `H2c` from OFLD_CFG through.
 ///
 /// # Safety
 /// The contract of `Ch12::submit`: `io` is the exclusive register window of
@@ -158,7 +213,7 @@ pub unsafe fn init_rf_reg<I: AxIo + ?Sized>(
         let applied = phy_table::apply(&table, table_name(path), rfe, cv, &mut |addr, data| {
             config_rf_reg_v1(io, path, addr, data, &mut words)
         })
-        .map_err(RfInitError::Table)?;
+        .map_err(|error| RfInitError::Table { path, error })?;
         done.applied[slot] = applied;
         // At most RF_WORDS (1500) are stored, which fits.
         done.words[slot] = words.len() as u16;
@@ -167,7 +222,11 @@ pub unsafe fn init_rf_reg<I: AxIo + ?Sized>(
         for (page, chunk) in words.chunks(RF_PAGE_WORDS).enumerate() {
             let (_, packet) = h2c.rf_reg(path, page as u8, chunk);
             // SAFETY: the caller's contract is `submit`'s, word for word.
-            unsafe { rings.ch12().submit(io, &packet) }.map_err(RfInitError::Submit)?;
+            unsafe { rings.ch12().submit(io, &packet) }.map_err(|error| RfInitError::Submit {
+                path,
+                page: page as u8,
+                error,
+            })?;
         }
     }
     Ok(done)

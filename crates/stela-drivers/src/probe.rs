@@ -4263,6 +4263,7 @@ mod tests {
                     skipped: 0,
                     log: None,
                 },
+                phy: None,
             },
             was_on: true,
             kept: Box::new(()),
@@ -4316,6 +4317,7 @@ mod tests {
                         mask: 0x0FFF_0000,
                     },
                 },
+                rf: None,
             }),
             was_on: true,
             kept: Some(Box::new(())),
@@ -4362,6 +4364,7 @@ mod tests {
                 skipped: 0,
                 log: None,
             },
+            phy: None,
         };
         let address = Address {
             segment: 0,

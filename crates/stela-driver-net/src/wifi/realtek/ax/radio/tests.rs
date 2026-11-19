@@ -10,7 +10,13 @@ use crate::wifi::realtek::ax::pci::tests::{FWCMD, device_read, reclaim_at_once, 
 use crate::wifi::realtek::ax::pci::{FWCMD_SLOT_BYTES, Rings};
 use crate::wifi::realtek::ax::tests::model::{Op, RegisterModel};
 use crate::wifi::realtek::beacon::tests::Model;
-use alloc::{format, string::String, sync::Arc, vec::Vec};
+use alloc::{
+    boxed::Box,
+    format,
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 use std::sync::Mutex;
 
 /// A firmware file with RADIO_B in slot 0 holding `b` and RADIO_A in slot 1
@@ -239,11 +245,14 @@ fn no_radio_branch_fails_rf_init_before_any_write() {
     let r = run(slots(&f), 0, 1, true);
     assert_eq!(
         r.got,
-        Err(RfInitError::Table(AxError::PhyPackage {
-            table: "RADIO_B",
-            rfe: 0,
-            cv: 1,
-        }))
+        Err(RfInitError::Table {
+            path: RfPath::B,
+            error: AxError::PhyPackage {
+                table: "RADIO_B",
+                rfe: 0,
+                cv: 1,
+            },
+        })
     );
     assert_eq!(r.got.unwrap_err().step(), "rf init");
     assert!(r.io.rf_ops().is_empty(), "{:?}", r.io.rf_ops());
@@ -263,10 +272,13 @@ fn rf_write_failure_is_rf_init_and_sends_nothing() {
     let err = got.unwrap_err();
     assert_eq!(
         err,
-        RfInitError::Table(AxError::Timeout {
-            register: 0x1174C,
-            mask: 0x0300_0000,
-        })
+        RfInitError::Table {
+            path: RfPath::B,
+            error: AxError::Timeout {
+                register: 0x1174C,
+                mask: 0x0300_0000,
+            },
+        }
     );
     assert_eq!(err.step(), "rf init");
     assert!(kicks(&io).is_empty());
@@ -278,7 +290,14 @@ fn submit_failure_is_rf_h2c() {
     let r = run(slots(&f), 1, 1, false);
     let err = r.got.unwrap_err();
     assert!(
-        matches!(err, RfInitError::Submit(AxError::Timeout { .. })),
+        matches!(
+            err,
+            RfInitError::Submit {
+                path: RfPath::B,
+                page: 0,
+                error: AxError::Timeout { .. },
+            }
+        ),
         "{err:?}"
     );
     assert_eq!(err.step(), "rf h2c");
@@ -288,12 +307,69 @@ fn submit_failure_is_rf_h2c() {
 }
 
 #[test]
-fn errors_name_their_steps() {
+fn errors_name_their_steps_and_where_they_happened() {
     let e = AxError::Phy("x");
-    assert_eq!(RfInitError::Table(e).step(), "rf init");
-    assert_eq!(RfInitError::Submit(e).step(), "rf h2c");
-    assert_eq!(RfInitError::Table(e).error(), e);
-    assert_eq!(RfInitError::Submit(e).error(), e);
+    let table = RfInitError::Table {
+        path: RfPath::A,
+        error: e,
+    };
+    let submit = RfInitError::Submit {
+        path: RfPath::B,
+        page: 2,
+        error: e,
+    };
+    assert_eq!(table.step(), "rf init");
+    assert_eq!(submit.step(), "rf h2c");
+    assert_eq!(table.error(), e);
+    assert_eq!(submit.error(), e);
+    assert_eq!(
+        table.at(),
+        RfAt {
+            path: RfPath::A,
+            page: None
+        }
+    );
+    assert_eq!(
+        submit.at(),
+        RfAt {
+            path: RfPath::B,
+            page: Some(2)
+        }
+    );
+    assert_eq!(table.at().to_string(), "path A");
+    assert_eq!(submit.at().to_string(), "path B page 2");
+}
+
+#[test]
+fn a_failure_on_path_a_names_path_a() {
+    // Path B succeeds; path A's only entry, an SWSI write, finds SWSI busy.
+    let f = file(&[(0x10005, 1)], &[(0x05, 0)]);
+    let (_m, mut rings, mut io) = running();
+    io.emulate_rf();
+    reclaim_at_once(&mut io);
+    io.on_read(
+        0x1174C,
+        Box::new(
+            |m: &mut RegisterModel| {
+                if m.get32(0x1F014) != 0 { 1 << 24 } else { 0 }
+            },
+        ),
+    );
+    let mut h2c = H2c::after_download();
+    h2c.ofld_cfg();
+    let err = init(&mut io, &mut rings, &mut h2c, slots(&f), 1, 1).unwrap_err();
+    assert_eq!(
+        err,
+        RfInitError::Table {
+            path: RfPath::A,
+            error: AxError::Timeout {
+                register: 0x1174C,
+                mask: 0x0300_0000,
+            },
+        }
+    );
+    // Path B's page went out first.
+    assert_eq!(kicks(&io).len(), 1);
 }
 
 fn sha256(bytes: &[u8]) -> String {

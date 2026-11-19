@@ -228,5 +228,11 @@ pub fn gnt<I: AxIo + ?Sized>(io: &mut I) -> Result<u32, AxError> {
     io.read32(R_AX_GNT_VAL_V1)
 }
 
+/// `R_AX_GNT_SW_CTRL` (reg.h:3707) read back: [`GNT_WL_ONLY`] once [`init`]
+/// has run, unless the chip changed it.
+pub fn gnt_sw<I: AxIo + ?Sized>(io: &mut I) -> Result<u32, AxError> {
+    io.read32(R_AX_GNT_SW_CTRL)
+}
+
 #[cfg(test)]
 mod tests;

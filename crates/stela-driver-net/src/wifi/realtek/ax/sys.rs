@@ -11,7 +11,7 @@
 //! bits are from pinned rtw89 `reg.h` and `mac.h`. This module grants no
 //! band 1, no DLE, HFC or CMAC table setup, no BB or RF register tables and
 //! no calibration; the bring-up runs its enable and system init after the
-//! efuse step, and nothing calls the reset yet.
+//! efuse step, and the reset after OFLD_CFG (`phy::init_radio`).
 use super::io::{AxError, AxIo, clear8, clear32, field32, set8, set32};
 use super::power::xtal_si_write;
 
