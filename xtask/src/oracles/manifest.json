@@ -2294,6 +2294,16 @@
   },
   {
     "package": "stela-driver-net",
+    "test": "real_8852c_fw_2_txpwr_2g_ch1_us",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/txpwr/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_REALTEK_WIFI_IMAGES"
+    ],
+    "reason": "requires STELA_REALTEK_WIFI_IMAGES from pinned linux-firmware; rtw8852c_set_txpwr at rfe 1 (rfe 0 elements), US = FCC, 2.4 GHz channel 1, 20 MHz, from zeroed registers: 119 accesses, one line each ('R32 0x%08X' or 'W32 0x%08X 0x%08X'), SHA-256 82f54cc1bc88773b6ef8a6da68b2f5bc6078c47614e5797109ee13d153ad9772; the 43 MAC by-rate, limit and RU limit words, the zero offset field and TX shape CCK 1 (sharp DFIR) / OFDM 3 (HIGH bandedge) were recomputed from the raw element bytes by a script independent of the crate, which also reproduced the trace digest"
+  },
+  {
+    "package": "stela-driver-net",
     "test": "real_8852c_fw_2_tables_select_as_linux_does",
     "source": "crates/stela-driver-net/src/wifi/realtek/ax/phy_table/tests.rs",
     "kind": "oracle",

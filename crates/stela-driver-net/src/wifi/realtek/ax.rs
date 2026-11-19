@@ -82,6 +82,7 @@ pub mod sys;
 #[cfg(test)]
 pub(crate) mod tests;
 pub mod trx;
+pub mod txpwr;
 pub mod txpwr_tables;
 pub mod vif;
 
