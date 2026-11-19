@@ -30,14 +30,18 @@ use super::rx::RxDesc;
 
 /// `RTW89_MAX_PPDU_CNT` (`core.h:843`).
 pub const MAX_PPDU_CNT: u8 = 8;
-/// `enum nl80211_he_gi` (`include/uapi/linux/nl80211.h`), as Linux stores
-/// it in `rx_status->he_gi`, and the `U8_MAX` of an invalid PPDU-side GI.
+/// The GI and bandwidth values below are interface constants only: the
+/// numeric values of `enum nl80211_he_gi` (`include/uapi/linux/nl80211.h`)
+/// and `enum rate_info_bw` (`include/net/cfg80211.h`) that Linux stores in
+/// `rx_status`; no code is taken from those headers.
+///
+/// `enum nl80211_he_gi`, as Linux stores it in `rx_status->he_gi`, and the
+/// `U8_MAX` of an invalid PPDU-side GI.
 pub const GI_0_8: u8 = 0;
 pub const GI_1_6: u8 = 1;
 pub const GI_3_2: u8 = 2;
 pub const GI_NONE: u8 = 0xFF;
-/// `enum rate_info_bw` (`include/net/cfg80211.h`), as Linux stores it in
-/// `rx_status->bw`.
+/// `enum rate_info_bw`, as Linux stores it in `rx_status->bw`.
 pub const BW_20: u8 = 0;
 pub const BW_40: u8 = 3;
 pub const BW_80: u8 = 4;
@@ -142,7 +146,10 @@ fn mac_info_end(payload: &[u8]) -> Option<usize> {
     if w0 & RXINFO_W0_RX_CNT_VLD != 0 {
         at += MAC_RX_CNT_SIZE;
     }
-    at += ((w1 >> RXINFO_W1_PLCP_LEN_SHIFT) & 0xFF) as usize * 8;
+    // Linux's `plcp_size` is a `u8` assigned `PLCP_LEN << 3` (`core.c:1950`,
+    // `:1968`), so the offset is truncated to a byte: PLCP_LEN 0x21 adds 8.
+    let plcp_size = ((w1 >> RXINFO_W1_PLCP_LEN_SHIFT) as u8) << 3;
+    at += usize::from(plcp_size);
     (at <= payload.len()).then_some(at)
 }
 

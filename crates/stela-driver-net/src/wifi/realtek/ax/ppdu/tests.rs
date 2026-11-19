@@ -189,14 +189,35 @@ fn mac_info_past_the_end_stops() {
         mac_info_valid: true,
         ..ppdu_desc()
     };
-    // PLCP_LEN 0xFF puts the status 2040 bytes in.
+    // PLCP_LEN 0xFF: the u8 `0xFF << 3` is 0xF8, the status 256 bytes in.
     let b = with_mac_info(0, 0xFF << 16, 0, &good_status());
+    assert_eq!(b.len(), 48);
     assert_eq!(parse(&d, &b), PhyPpdu::default());
     // Shorter than the MAC info itself.
     assert_eq!(parse(&d, &[0u8; 7]), PhyPpdu::default());
     // The status exactly at the end: no header to read.
     let b = with_mac_info(0, 0, 0, &[]);
     assert_eq!(parse(&d, &b), PhyPpdu::default());
+}
+
+#[test]
+fn plcp_offset_truncates_to_a_byte_as_linux_u8_plcp_size() {
+    // `u8 plcp_size = PLCP_LEN << 3` (`core.c:1950`, `:1968`): PLCP_LEN
+    // 0x21 gives (0x108 & 0xFF) = 8, the same as PLCP_LEN 1.
+    let d = RxDesc {
+        mac_info_valid: true,
+        ..ppdu_desc()
+    };
+    for plcp_len in [1u32, 0x21, 0x41, 0xE1] {
+        let b = with_mac_info(0, plcp_len << 16, 8, &good_status());
+        assert_eq!(parse(&d, &b), GOOD, "PLCP_LEN {plcp_len:#x}");
+    }
+    // PLCP_LEN 0x20 truncates to 0: the status right after the MAC info.
+    let b = with_mac_info(0, 0x20 << 16, 0, &good_status());
+    assert_eq!(parse(&d, &b), GOOD);
+    // Without truncation 0x21 would be 264 bytes in, past this payload.
+    let b = with_mac_info(0, 0x21 << 16, 8, &good_status());
+    assert!(b.len() < 8 + 0x21 * 8);
 }
 
 #[test]
