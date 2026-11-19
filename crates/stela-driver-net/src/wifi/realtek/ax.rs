@@ -16,13 +16,15 @@
 //! ([`sys::reset_bb_rf`]), `rtw89_phy_init_bb_reg` ([`bb::init_bb_reg`])
 //! and `rtw89_phy_init_rf_reg` with its RF_REG H2C pages
 //! ([`radio::init_rf_reg`]) are ported, but the bring-up runs none of them
-//! yet. The bring-up writes no BB or RF register and grants no calibration,
+//! yet. The register end state of the coex start with BT off ([`coex`]) is
+//! ported too, and is run by nothing either. The bring-up writes no BB or RF register and grants no calibration,
 //! no station and no interrupts: the chip is powered off at the end, and
 //! nothing past that one H2C runs.
 pub mod bb;
 pub mod bringup;
 pub mod c2h;
 pub mod cmac;
+pub mod coex;
 pub mod command;
 pub mod dmac;
 pub mod efuse;
