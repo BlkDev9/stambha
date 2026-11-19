@@ -16,7 +16,10 @@
 //! (found by [`elements`], walked by RFE type and cut by [`phy_table`], BB
 //! and RF registers reached by [`bb`] and [`rf`]), then the register end
 //! state of the coex start with BT off ([`coex`]). [`bring_up`] puts these
-//! in Linux's order before powering the chip off again. It grants no
+//! in Linux's order before powering the chip off again. The non-RFK calls
+//! of `rtw89_phy_dm_init`'s first part (thermals, BB GPIO set-up, env
+//! monitor, PHY status bitmaps, DIG, crystal cap and EDCCA) are ported in
+//! [`dm`], but [`bring_up`] does not run them yet. It grants no
 //! `rtw89_phy_dm_init`, no calibration, no channel, no station and no
 //! interrupts: the chip is powered off at the end, and nothing past the
 //! coex init and its report reads runs.
@@ -26,6 +29,7 @@ pub mod c2h;
 pub mod cmac;
 pub mod coex;
 pub mod command;
+pub mod dm;
 pub mod dmac;
 pub mod efuse;
 pub mod elements;
