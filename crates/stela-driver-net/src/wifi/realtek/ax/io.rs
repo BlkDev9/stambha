@@ -54,6 +54,24 @@ pub enum AxError {
     /// taken as stopped: 2 (`MAC_AX_MAC_LPS`, its firmware alive) or 3
     /// (undefined).
     MacPowerState(u8),
+    /// A MAC-side setup step failed; the message says which.
+    Mac(&'static str),
+    /// The receive queue failed or returned a malformed frame; the message
+    /// says how.
+    Rx(&'static str),
+    /// The firmware did not acknowledge an H2C within 100 ms.
+    NoAck {
+        class: u8,
+        func: u8,
+        seq: u8,
+    },
+    /// The firmware acknowledged an H2C with a non-zero return code.
+    H2cRejected {
+        class: u8,
+        func: u8,
+        seq: u8,
+        ret: u8,
+    },
 }
 
 impl fmt::Display for AxError {
@@ -76,7 +94,23 @@ impl fmt::Display for AxError {
             | Self::FirmwareFile(what)
             | Self::Identity(what)
             | Self::Dma(what)
-            | Self::Efuse(what) => f.write_str(what),
+            | Self::Efuse(what)
+            | Self::Mac(what)
+            | Self::Rx(what) => f.write_str(what),
+            Self::NoAck { class, func, seq } => write!(
+                f,
+                "firmware sent no acknowledgement of H2C class {class} func {func:#x} seq {seq} \
+                 within 100 ms"
+            ),
+            Self::H2cRejected {
+                class,
+                func,
+                seq,
+                ret,
+            } => write!(
+                f,
+                "firmware refused H2C class {class} func {func:#x} seq {seq} (return {ret})"
+            ),
             Self::FirmwareStatus { what, fw_ctrl } => write!(f, "{what} (0x01E0={fw_ctrl:#010x})"),
             Self::SecureBootUnsupported => f.write_str("secure-boot firmware is unsupported"),
             Self::AlreadyPowered => f.write_str("MAC has already powered on"),

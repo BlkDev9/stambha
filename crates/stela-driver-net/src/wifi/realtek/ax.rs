@@ -16,6 +16,7 @@ pub mod io;
 pub mod pci;
 
 pub mod power;
+pub mod sys;
 #[cfg(test)]
 pub(crate) mod tests;
 
