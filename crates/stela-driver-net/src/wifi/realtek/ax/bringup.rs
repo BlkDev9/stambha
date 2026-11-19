@@ -78,6 +78,9 @@ pub struct Running {
     pub mac_init: bool,
     /// The post-init programmed the chip's LTR ([`Host::ltr`]).
     pub ltr: bool,
+    /// The CMAC's BA CAM reset (`rst_bacam`, `mac.c:2904`) never completed;
+    /// Linux only warns of it ("failed to reset BA CAM") and carries on.
+    pub bacam_reset_timed_out: bool,
     /// What the firmware answered to OFLD_CFG: from [`bring_up`], a REC_ACK,
     /// a DONE_ACK with return 0, or both.
     pub h2c: H2cAck,
@@ -128,6 +131,9 @@ impl fmt::Display for Running {
         }
         if let Some(log) = &self.h2c.log {
             write!(f, ", firmware log \"{}\"", log.as_str())?;
+        }
+        if self.bacam_reset_timed_out {
+            f.write_str(", BA CAM reset timed out")?;
         }
         Ok(())
     }
@@ -428,6 +434,8 @@ struct Started {
     cut: u8,
     firmware: (u8, u8, u8, u8),
     mac: [u8; 6],
+    /// `cmac::init`'s `rst_bacam` timed out.
+    bacam_reset_timed_out: bool,
     /// The H2C sequence state after the download.
     h2c: H2c,
 }
@@ -472,12 +480,14 @@ unsafe fn start<I: AxIo + ?Sized>(
     // nothing for an RTL8852C on PCIe (spec S1.2-S1.3).
     sys::enable_bb_rf(io).map_err(at("bb rf enable"))?;
     sys::sys_init(io).map_err(at("sys init"))?;
-    trx::init(io).map_err(|error| BringUpError::new(error.step, error.error))?;
+    let bacam_reset_timed_out =
+        trx::init(io).map_err(|error| BringUpError::new(error.step, error.error))?;
     pci::post_init(io, host.ltr).map_err(at("pci post-init"))?;
     Ok(Started {
         cut,
         firmware: image.version(),
         mac: efuse::mac_address(&logical),
+        bacam_reset_timed_out,
         h2c,
     })
 }
@@ -506,6 +516,7 @@ unsafe fn acknowledge<I: AxIo + ?Sized>(
         secure_boot: false,
         mac_init: true,
         ltr: host.ltr,
+        bacam_reset_timed_out: started.bacam_reset_timed_out,
         h2c: ack,
     })
 }

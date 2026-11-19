@@ -2,7 +2,7 @@ extern crate std;
 use super::*;
 use crate::wifi::realtek::ax::fwdl::tests::image_bytes;
 use crate::wifi::realtek::ax::pci::tests::{device_write, rxq_buffer};
-use crate::wifi::realtek::ax::tests::model::{Op, RegisterModel};
+use crate::wifi::realtek::ax::tests::model::{Op, READ_FAILED, RegisterModel};
 use crate::wifi::realtek::beacon::tests::{Domain, Model, Source};
 use crate::wifi::realtek::firmware::{Ce, Rtw89};
 use alloc::{boxed::Box, string::ToString, sync::Arc, vec, vec::Vec};
@@ -342,6 +342,7 @@ fn happy_path_reports_running() {
             secure_boot: false,
             mac_init: true,
             ltr: false,
+            bacam_reset_timed_out: false,
             h2c: acked(true, true),
         }
     );
@@ -573,11 +574,38 @@ fn mac_init_fails(
                 .any(|o| matches!(o, Op::W32(0x0074 | 0x1014 | 0x11C4 | 0x1200, _))),
             "{err}"
         );
-        // The DMA live since pci pre-init is stopped before the power-off.
+        // The DMA live since mac pre-init is stopped before the power-off.
         assert_dma_stopped_before_power_off(&c.io);
     }
     assert_ends_with_power_off(&c.io);
     err
+}
+
+#[test]
+fn sys_init_failure_names_step_and_powers_off() {
+    // sys_init_ax has no check of its own: its read of the CMAC clock enable
+    // (R_AX_CK_EN, 0xC004) fails.
+    let err = mac_init_fails(BOTH, NO_LTR, |io| io.fail_reads_of(0xC004));
+    assert_eq!(err, BringUpError::new("sys init", READ_FAILED));
+}
+
+#[test]
+fn imr_failure_names_step_and_powers_off() {
+    // dmac and cmac init finish, then ptcl_init's last read (0xC660) finds
+    // the DMAC disabled, which is the first check of enable_imr_ax.
+    let err = mac_init_fails(BOTH, NO_LTR, |io| {
+        io.on_read(
+            0xC660,
+            Box::new(|m: &mut RegisterModel| {
+                m.set32(0x8400, 0);
+                m.get32(0xC660)
+            }),
+        );
+    });
+    assert_eq!(
+        err,
+        BringUpError::new("imr", AxError::Dma("DMAC function is not enabled"))
+    );
 }
 
 #[test]
@@ -1091,6 +1119,7 @@ fn running_display_says_on_for_secure_boot() {
         secure_boot: true,
         mac_init: false,
         ltr: false,
+        bacam_reset_timed_out: false,
         h2c: acked(false, false),
     };
     // Without the MAC init no H2C was sent, so nothing is said of one.
@@ -1108,6 +1137,16 @@ fn running_display_says_on_for_secure_boot() {
         r.to_string(),
         "RTL8852CE firmware running: cut 0, firmware 0.27.97.0, MAC ff:ab:01:10:00:9c, \
          secure boot on, MAC init done, LTR on, H2C OFLD_CFG not acknowledged"
+    );
+    // A BA CAM reset that timed out is appended, and only then.
+    let r = Running {
+        bacam_reset_timed_out: true,
+        ..r
+    };
+    assert!(
+        r.to_string()
+            .ends_with("H2C OFLD_CFG not acknowledged, BA CAM reset timed out"),
+        "{r}"
     );
 }
 

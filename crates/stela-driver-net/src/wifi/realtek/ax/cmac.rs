@@ -297,9 +297,10 @@ fn trxptcl_init<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
 }
 
 /// `rst_bacam` (`mac.c:2904`): `read_poll_timeout_atomic`, 1 us over 1000 us.
-/// Linux only warns when the reset never completes, so a timeout is not an
-/// error here; a dead read still is.
-fn rst_bacam<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
+/// Linux only warns ("failed to reset BA CAM") when the reset never
+/// completes, so a timeout is not an error here; a dead read still is. The
+/// result is whether it timed out, which the bring-up reports in its line.
+fn rst_bacam<I: AxIo + ?Sized>(io: &mut I) -> Result<bool, AxError> {
     field32(
         io,
         R_AX_RESPBA_CAM_CTRL,
@@ -307,15 +308,17 @@ fn rst_bacam<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
         S_AX_BACAM_RST_ALL,
     )?;
     match poll32_atomic(io, R_AX_RESPBA_CAM_CTRL, B_AX_BACAM_RST_MASK, 0, 1, 1000) {
-        Err(AxError::Timeout { .. }) => Ok(()),
-        other => other,
+        Ok(_) => Ok(false),
+        Err(AxError::Timeout { .. }) => Ok(true),
+        Err(error) => Err(error),
     }
 }
 
-/// `rmac_init_ax` (`mac.c:2919`), band 0, 8852C.
-fn rmac_init<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
+/// `rmac_init_ax` (`mac.c:2919`), band 0, 8852C. The result is whether
+/// `rst_bacam` timed out.
+fn rmac_init<I: AxIo + ?Sized>(io: &mut I) -> Result<bool, AxError> {
     check_cmac_en(io)?;
-    rst_bacam(io)?;
+    let bacam_reset_timed_out = rst_bacam(io)?;
     set8(io, R_AX_RESPBA_CAM_CTRL, B_AX_SSN_SEL)?;
     // One read and one write: two `u16_replace_bits` on the same value.
     let mut value = io.read16(R_AX_DLK_PROTECT_CTL)?;
@@ -326,7 +329,8 @@ fn rmac_init<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
     let rx_qta = C0_RX_QTA.min(PLD_RLS_MAX_PG);
     let rx_max_len = (rx_qta * PLE_PG_SIZE).min(RX_SPEC_MAX_LEN) / RX_MAX_LEN_UNIT;
     field32(io, R_AX_RX_FLTR_OPT, B_AX_RX_MPDU_MAX_LEN_MASK, rx_max_len)?;
-    clear8(io, R_AX_PLCP_HDR_FLTR, B_AX_VHT_SU_SIGB_CRC_CHK)
+    clear8(io, R_AX_PLCP_HDR_FLTR, B_AX_VHT_SU_SIGB_CRC_CHK)?;
+    Ok(bacam_reset_timed_out)
 }
 
 /// `cmac_com_init_ax` (`mac.c:2983`); the RRSR1 step is for 8852A and 885xB.
@@ -360,8 +364,9 @@ fn ptcl_init<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
 /// `cmac_init_ax(rtwdev, RTW89_MAC_0)` (`mac.c:3093`) for an RTL8852C over
 /// PCIe: each step checks that the CMAC is enabled first, except
 /// `nav_ctrl_init_ax`, which has no check. `cmac_dma_init_ax` returns before
-/// any I/O for a chip that is not an RTL885xB, so it has no step here.
-pub fn init<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
+/// any I/O for a chip that is not an RTL885xB, so it has no step here. The
+/// result is whether the BA CAM reset timed out (Linux only warns of it).
+pub fn init<I: AxIo + ?Sized>(io: &mut I) -> Result<bool, AxError> {
     scheduler_init(io)?;
     addr_cam_init(io)?;
     rx_fltr_init(io)?;
@@ -370,9 +375,10 @@ pub fn init<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
     spatial_reuse_init(io)?;
     tmac_init(io)?;
     trxptcl_init(io)?;
-    rmac_init(io)?;
+    let bacam_reset_timed_out = rmac_init(io)?;
     cmac_com_init(io)?;
-    ptcl_init(io)
+    ptcl_init(io)?;
+    Ok(bacam_reset_timed_out)
 }
 
 #[cfg(test)]

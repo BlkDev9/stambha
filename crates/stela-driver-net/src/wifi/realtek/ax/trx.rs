@@ -254,10 +254,12 @@ fn imr_tail<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
 }
 
 /// `trx_init_ax` (`mac.c:4029`) for an RTL8852C on PCIe with the SCC layout.
-pub fn init<I: AxIo + ?Sized>(io: &mut I) -> Result<(), TrxError> {
+/// The result is whether the CMAC's BA CAM reset timed out (`cmac::init`).
+pub fn init<I: AxIo + ?Sized>(io: &mut I) -> Result<bool, TrxError> {
     dmac::init(io).map_err(at("dmac init"))?;
-    cmac::init(io).map_err(at("cmac init"))?;
-    imr_tail(io).map_err(at("imr"))
+    let bacam_reset_timed_out = cmac::init(io).map_err(at("cmac init"))?;
+    imr_tail(io).map_err(at("imr"))?;
+    Ok(bacam_reset_timed_out)
 }
 
 #[cfg(test)]

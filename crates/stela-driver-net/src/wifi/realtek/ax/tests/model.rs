@@ -26,7 +26,13 @@ pub struct RegisterModel {
     pub freeze_clock: bool,
     /// Microseconds each register read adds to the clock, as PCIe latency.
     pub read_cost_us: u64,
+    /// Registers whose reads fail with [`READ_FAILED`].
+    failing_reads: Vec<u32>,
 }
+
+/// What a read of a register named by [`RegisterModel::fail_reads_of`]
+/// returns, as a register window that errors would.
+pub const READ_FAILED: AxError = AxError::Mac("injected read failure");
 
 impl RegisterModel {
     pub fn new() -> Self {
@@ -37,7 +43,12 @@ impl RegisterModel {
             now: 1_000,
             freeze_clock: false,
             read_cost_us: 0,
+            failing_reads: Vec::new(),
         }
+    }
+    /// Make every read of `reg` (at any width) fail with [`READ_FAILED`].
+    pub fn fail_reads_of(&mut self, reg: u32) {
+        self.failing_reads.push(reg);
     }
     fn get(&self, reg: u32, width: u32) -> u32 {
         (0..width).fold(0, |v, i| {
@@ -86,14 +97,23 @@ impl RegisterModel {
 impl AxIo for RegisterModel {
     fn read8(&mut self, reg: u32) -> Result<u8, AxError> {
         self.trace.push(Op::R8(reg));
+        if self.failing_reads.contains(&reg) {
+            return Err(READ_FAILED);
+        }
         Ok(self.read(reg, 1) as u8)
     }
     fn read16(&mut self, reg: u32) -> Result<u16, AxError> {
         self.trace.push(Op::R16(reg));
+        if self.failing_reads.contains(&reg) {
+            return Err(READ_FAILED);
+        }
         Ok(self.read(reg, 2) as u16)
     }
     fn read32(&mut self, reg: u32) -> Result<u32, AxError> {
         self.trace.push(Op::R32(reg));
+        if self.failing_reads.contains(&reg) {
+            return Err(READ_FAILED);
+        }
         Ok(self.read(reg, 4))
     }
     fn write8(&mut self, reg: u32, v: u8) -> Result<(), AxError> {

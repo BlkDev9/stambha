@@ -4254,6 +4254,7 @@ mod tests {
                 secure_boot: false,
                 mac_init: true,
                 ltr: true,
+                bacam_reset_timed_out: false,
                 h2c: net::wifi::realtek::ax::H2cAck {
                     rec: true,
                     done: true,
@@ -4352,6 +4353,7 @@ mod tests {
             secure_boot: false,
             mac_init: true,
             ltr: false,
+            bacam_reset_timed_out: false,
             h2c: net::wifi::realtek::ax::H2cAck {
                 rec: true,
                 done: false,
