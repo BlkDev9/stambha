@@ -10,9 +10,10 @@
 //! IMR init, PCIe post-init); and one H2C, OFLD_CFG, whose acknowledgement
 //! is read from RXQ by polling. [`bring_up`] puts these in Linux's order
 //! before powering the chip off again. The PHY tables the firmware file
-//! carries are found ([`elements`]) but not yet written. It grants no BB or
-//! RF register writes, no calibration, no station and no interrupts: the
-//! chip is powered off at the end, and nothing past that one H2C runs.
+//! carries are found ([`elements`]) and can be walked by RFE type and cut
+//! ([`phy_table`]), but nothing writes them yet. It grants no BB or RF
+//! register writes, no calibration, no station and no interrupts: the chip
+//! is powered off at the end, and nothing past that one H2C runs.
 pub mod bringup;
 pub mod c2h;
 pub mod cmac;
@@ -24,7 +25,7 @@ pub mod fwdl;
 pub mod h2c;
 pub mod io;
 pub mod pci;
-
+pub mod phy_table;
 pub mod power;
 pub mod rx;
 pub mod sys;

@@ -227,4 +227,4 @@ const REG2_IDX: usize = 24;
 const PAIR: usize = 8;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

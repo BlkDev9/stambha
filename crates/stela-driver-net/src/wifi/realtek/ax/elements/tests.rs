@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 
 /// An MFW container with one entry at `shift` of `size` bytes, padded to
 /// where its elements begin (ALIGN(shift + size, 16), fw.c:1579-1580).
-fn container(shift: u32, size: u32) -> Vec<u8> {
+pub(crate) fn container(shift: u32, size: u32) -> Vec<u8> {
     let mut b = alloc::vec![0u8; 32];
     b[0] = 0xff;
     b[1] = 1;
@@ -19,7 +19,7 @@ fn container(shift: u32, size: u32) -> Vec<u8> {
 
 /// Append one element: id, size, ver, aid, the union's 8-byte head
 /// (`idx` first for reg2), then `body`, padded to the next element.
-fn element(b: &mut Vec<u8>, id: u32, ver: [u8; 4], aid: u16, idx: u8, body: &[u8]) {
+pub(crate) fn element(b: &mut Vec<u8>, id: u32, ver: [u8; 4], aid: u16, idx: u8, body: &[u8]) {
     assert_eq!(b.len() % 16, 0);
     b.extend_from_slice(&id.to_le_bytes());
     b.extend_from_slice(&(body.len() as u32).to_le_bytes());
@@ -33,7 +33,7 @@ fn element(b: &mut Vec<u8>, id: u32, ver: [u8; 4], aid: u16, idx: u8, body: &[u8
     b.resize(padded, 0);
 }
 
-fn pairs(regs: &[(u32, u32)]) -> Vec<u8> {
+pub(crate) fn pairs(regs: &[(u32, u32)]) -> Vec<u8> {
     regs.iter()
         .flat_map(|(a, d)| a.to_le_bytes().into_iter().chain(d.to_le_bytes()))
         .collect()
