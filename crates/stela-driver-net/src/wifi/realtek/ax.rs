@@ -28,12 +28,12 @@
 //! queueing them. [`receive`] routes each RXQ buffer as `rtw89_core_rx`
 //! does: C2Hs on, beacons and probe responses queued for their PPDU status,
 //! tagged with the channel the firmware reports and stripped of their FCS.
-//! [`channel`] runs the help, MAC and RF parts of `__rtw89_set_channel`:
+//! [`channel`] holds the help, MAC and RF parts of `__rtw89_set_channel`:
 //! the TX scheduler and PPDU status stopped and resumed around the change,
 //! the MAC rate checks, and RF 0x18's channel and bandwidth on both paths.
-//! The bring-up grants no BB channel setup, no IQK, DPK, TSSI or tracking,
-//! no station and no interrupts: the chip is powered off at the end, and
-//! nothing past `rtw89_phy_dm_init` runs.
+//! [`bring_up`] does not call it yet: the bring-up grants no channel, no
+//! IQK, DPK, TSSI or tracking, no station and no interrupts; the chip is
+//! powered off at the end, and nothing past `rtw89_phy_dm_init` runs.
 pub mod bb;
 pub mod bringup;
 pub mod c2h;

@@ -12,6 +12,9 @@ const RF18_RESET: u32 = 0x01001;
 /// MMIO of RF 0x18 in the direct window: BB `rf_base_addr[path] + 0x18 * 4`
 /// (0xE060, 0xF060) plus `CR_BASE`.
 const DIRECT_18: [u32; 2] = [0x1E060, 0x1F060];
+/// `enum rtw89_cv` (core.h:201-207): `CHIP_CAV` and `CHIP_CBV` (this chip).
+const CAV: u8 = 0;
+const CBV: u8 = 1;
 
 /// CMAC enabled and RF 0x18 at [`RF18_RESET`] everywhere.
 fn model() -> RegisterModel {
@@ -111,7 +114,7 @@ fn help_enter_returns_the_whole_register_and_keeps_its_high_bits() {
     assert_eq!(help_enter(&mut m, &g5(36)), Ok(0xA005_5555));
     // Only TXEN_ALL [17:0] is cleared.
     assert_eq!(m.get32(0xC398), 0xA004_0000);
-    // The 5 GHz enter disables RX CCA too: Linux's disable is band-blind.
+    // The 5 GHz enter disables CCK RX CCA too: Linux's disable is band-blind.
     assert!(m.trace.contains(&Op::W32(0x12320, 1)));
 }
 
@@ -176,7 +179,7 @@ fn help_exit_matches_linux_sequence() {
     want.extend(RESUME);
     assert_eq!(m.trace, want);
 
-    // 5 GHz leaves RX CCA disabled, as Linux's 2G-only re-enable does.
+    // 5 GHz leaves CCK RX CCA disabled, as Linux's 2G-only re-enable does.
     let mut m = entered();
     assert_eq!(help_exit(&mut m, &g5(36), 0x3FFFF), Ok(()));
     let mut want = exit_common();
@@ -300,7 +303,7 @@ fn ch_ops(p: u8, v: u32) -> Vec<Op> {
     ]
 }
 
-/// `_bw_setting(path, 20 MHz, DAV)` then `(path, DDV)` (:3820-3865): the
+/// `_bw_setting(path, 20 MHz, DAV)` then `(path, DDV)` (:3822-3865): the
 /// read, CFCH_BW0 [27:26] = 3 and CFCH_BW1 [8:5] = 0xF on the path's BB
 /// registers, the write.
 fn bw_ops(p: u8, v: u32) -> Vec<Op> {
@@ -358,7 +361,7 @@ fn assert_rf18_everywhere(m: &RegisterModel, v: u32) {
 #[test]
 fn set_channel_rf_2g_ch1_matches_linux_sequence() {
     let mut m = model();
-    assert_eq!(set_channel_rf(&mut m, &g2(1)), Ok(()));
+    assert_eq!(set_channel_rf(&mut m, &g2(1), CBV), Ok(()));
     assert_eq!(m.rf_ops(), rf_want(0x01001, 0x01C01));
     assert_rf18_everywhere(&m, 0x01C01);
     // Each direct-window access reads first: two in `_ch_setting`, two in
@@ -371,7 +374,7 @@ fn set_channel_rf_2g_ch1_matches_linux_sequence() {
 #[test]
 fn set_channel_rf_5g_ch36_sets_band_bits() {
     let mut m = model();
-    assert_eq!(set_channel_rf(&mut m, &g5(36)), Ok(()));
+    assert_eq!(set_channel_rf(&mut m, &g5(36), CBV), Ok(()));
     // BAND1 [17:16] = 1, BAND0 [9:8] = 1, CH [7:0] = 36, then BW [11:10] = 3.
     assert_eq!(m.rf_ops(), rf_want(0x11124, 0x11D24));
     assert_rf18_everywhere(&m, 0x11D24);
@@ -386,7 +389,7 @@ fn set_channel_rf_reads_each_window_on_its_own() {
     let mut m = model();
     m.set_rf(1, 0x18, 0x01000);
     m.set32(DIRECT_18[1], 0xFFF0_0000 | 0x8_3001);
-    set_channel_rf(&mut m, &g2(11)).unwrap();
+    set_channel_rf(&mut m, &g2(11), CBV).unwrap();
     assert_eq!(m.get_rf(0, 0x18), 0x01C0B);
     assert_eq!(m.get_rf(1, 0x18), 0x01C0B);
     assert_eq!(m.get32(DIRECT_18[0]), 0x01C0B);
@@ -397,9 +400,9 @@ fn set_channel_rf_reads_each_window_on_its_own() {
 #[test]
 fn set_channel_rf_moves_5g_back_to_2g() {
     let mut m = model();
-    set_channel_rf(&mut m, &g5(165)).unwrap();
+    set_channel_rf(&mut m, &g5(165), CBV).unwrap();
     assert_rf18_everywhere(&m, 0x11DA5);
-    set_channel_rf(&mut m, &g2(1)).unwrap();
+    set_channel_rf(&mut m, &g2(1), CBV).unwrap();
     assert_rf18_everywhere(&m, 0x01C01);
 }
 
@@ -414,7 +417,7 @@ fn set_channel_rf_skips_the_channel_outside_ctrl_ch_ranges() {
         freq: 0,
         subband: Subband::G2,
     };
-    set_channel_rf(&mut m, &chan).unwrap();
+    set_channel_rf(&mut m, &chan, CBV).unwrap();
     let mut want = Vec::new();
     for p in 0..2 {
         want.extend(bw_ops(p, 0x01C01));
@@ -435,8 +438,94 @@ fn set_channel_rf_refuses_6g_untouched() {
         subband: Subband::G2,
     };
     assert!(matches!(
-        set_channel_rf(&mut m, &chan),
+        set_channel_rf(&mut m, &chan, CBV),
         Err(AxError::Phy(_))
     ));
     assert!(m.trace.is_empty());
+}
+
+#[test]
+fn set_channel_rf_cav_copies_path_a_into_path_b() {
+    // Path B's SWSI RF 0x18 has bit 13 set, so its own result differs from
+    // path A's; on CAV `_ctrl_bw` then overwrites it with path A's
+    // (rtw8852c_rfk.c:3888-3895).
+    let mut m = model();
+    m.set_rf(1, 0x18, 0x03001);
+    m.set_rf(1, 0x05, 0xFFFFF);
+    m.set_rf(1, 0x19, 0);
+    assert_eq!(set_channel_rf(&mut m, &g2(1), CAV), Ok(()));
+
+    let mut want = ch_ops(0, 0x01001);
+    // Path B: SWSI from 0x03001, the direct window from 0x01001.
+    want.extend([
+        Op::RfR(1, 0x18),
+        Op::Delay(2),
+        Op::RfW(1, 0x18, RFREG_MASK, 0x03001),
+        Op::Delay(100),
+        Op::W32(DIRECT_18[1], 0x01001),
+        Op::Delay(1),
+        Op::Delay(100),
+    ]);
+    want.extend(bw_ops(0, 0x01C01));
+    let mut b_bw = bw_ops(1, 0x01C01);
+    b_bw[4] = Op::RfW(1, 0x18, RFREG_MASK, 0x03C01);
+    want.extend(b_bw);
+    want.extend([
+        // RR_RSV1 RR_RSV1_RST = 0.
+        Op::RfW(1, 0x05, 0x1, 0),
+        // tmp = path A's RF 0x18 over SWSI.
+        Op::RfR(0, 0x18),
+        Op::Delay(2),
+        // RR_APK RR_APK_MOD [5:4] = 3.
+        Op::RfW(1, 0x19, 0x30, 0x30),
+        // Path B's RF 0x18 over SWSI only = tmp.
+        Op::RfW(1, 0x18, RFREG_MASK, 0x01C01),
+        Op::Delay(100),
+        // RR_RSV1 RR_RSV1_RST = 1.
+        Op::RfW(1, 0x05, 0x1, 1),
+    ]);
+    for p in 0..2 {
+        want.extend(rxbb_ops(p));
+    }
+    assert_eq!(m.rf_ops(), want);
+
+    assert_eq!(m.get_rf(1, 0x18), 0x01C01);
+    assert_eq!(m.get_rf(1, 0x05), 0xFFFFF);
+    assert_eq!(m.get_rf(1, 0x19), 0x30);
+    // The direct window is not part of the copy.
+    assert_eq!(m.get32(DIRECT_18[1]), 0x01C01);
+    // Path A is only read.
+    assert!(
+        !m.rf_ops()
+            .iter()
+            .any(|op| matches!(op, Op::RfW(0, 0x05 | 0x19, ..)))
+    );
+}
+
+#[test]
+fn set_channel_rf_later_cuts_skip_the_cav_copy() {
+    for cut in [CBV, 2, 3, 4] {
+        let mut m = model();
+        m.set_rf(1, 0x18, 0x03001);
+        set_channel_rf(&mut m, &g2(1), cut).unwrap();
+        // Path B keeps its own bit 13; no RF 0x05 or 0x19 access at all.
+        assert_eq!(m.get_rf(1, 0x18), 0x03C01, "cut {cut}");
+        assert!(
+            !m.rf_ops()
+                .iter()
+                .any(|op| matches!(op, Op::RfW(_, 0x05 | 0x19, ..) | Op::RfR(_, 0x05 | 0x19))),
+            "cut {cut}"
+        );
+        // Path A's RF 0x18 is read exactly twice over SWSI (ch, bw).
+        let a_reads = m
+            .rf_ops()
+            .iter()
+            .filter(|op| **op == Op::RfR(0, 0x18))
+            .count();
+        assert_eq!(a_reads, 2, "cut {cut}");
+    }
+    // And cut 1 still gives the brief's exact sequence.
+    let mut m = model();
+    set_channel_rf(&mut m, &g2(1), CBV).unwrap();
+    assert_eq!(m.rf_ops(), rf_want(0x01001, 0x01C01));
 }

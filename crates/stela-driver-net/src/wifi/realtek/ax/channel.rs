@@ -31,9 +31,10 @@
 //! Where Linux ignores a failed CMAC check (`rtw8852c.c:1967-1969`,
 //! `:1976`, `:1981`), this fails, as a disabled CMAC is a broken MAC (spec
 //! S6.1). The TSSI DE write of `tssi_cont_en(true)` (`_tssi_set_efuse_to_de`)
-//! only sets TX power and is not ported (spec S1.6), nor is `_ctrl_bw`'s
-//! path-B workaround for the CAV cut (`:3888-3895`, `hal.cv == CHIP_CAV`;
-//! this chip is CBV). This module grants no BB channel setup, no TX power,
+//! only sets TX power and is not ported (spec S1.6). `_ctrl_bw`'s path-B
+//! workaround for the CAV cut (`:3888-3895`, `hal.cv == CHIP_CAV`) is
+//! ported and runs only when [`set_channel_rf`] is given cut 0; this
+//! laptop's chip is CBV (cut 1). This module grants no BB channel setup, no TX power,
 //! no 6 GHz and no 40, 80 or 160 MHz channel, and transmits nothing.
 use super::bb;
 use super::chan::{Chan, HwBand};
@@ -59,6 +60,9 @@ const R_UPD_P0: u32 = 0x0000;
 const B_UPD_P0_EN: u32 = 1 << 31;
 const R_ADC_FIFO: u32 = 0x20FC;
 const B_ADC_FIFO_RST: u32 = 0xFF00_0000; // GENMASK(31, 24)
+/// CCK RX CCA disable: `R_RXCCA_V1` / `B_RXCCA_DIS_V1` as
+/// `rtw8852c_bb_reset_en` names it, the same bit as `R_11B_RX_V1` /
+/// `B_11B_RXCCA_DIS_V1` (reg.h:9340-9347).
 const R_RXCCA_V1: u32 = 0x2320;
 const B_RXCCA_DIS_V1: u32 = 1 << 0;
 const R_PD_CTRL: u32 = 0x0C3C;
@@ -102,6 +106,13 @@ const RR_LUTWD0: u32 = 0x3F;
 const RR_LUTWD0_LB: u32 = 0x3F; // GENMASK(5, 0)
 const RR_RXBB2: u32 = 0x8F;
 const RR_RXBB2_EBW: u32 = 0x60; // GENMASK(6, 5)
+const RR_RSV1: u32 = 0x05;
+const RR_RSV1_RST: u32 = 1 << 0;
+const RR_APK: u32 = 0x19;
+const RR_APK_MOD: u32 = 0x30; // GENMASK(5, 4)
+
+/// `CHIP_CAV` of `enum rtw89_cv` (`core.h:201-202`).
+const CHIP_CAV: u8 = 0;
 
 /// `_kpath` without DBCC is `RF_AB` (`rtw8852c_rfk.c:80-92`).
 const KPATH: [RfPath; 2] = [RfPath::A, RfPath::B];
@@ -136,7 +147,9 @@ fn tssi_cont_en<I: AxIo + ?Sized>(io: &mut I, en: bool) -> Result<(), AxError> {
 /// ADC FIFO off, then hold the BB in reset. The result is `tx_en`, the
 /// whole of 0xC398 as `rtw89_mac_stop_sch_tx_v1` reads it before the CMAC
 /// check, for [`help_exit`]. Linux passes the channel, but nothing in the
-/// enter half reads it: `bb_reset_en(false)` disables RX CCA on every band.
+/// enter half reads it: `bb_reset_en(false)` disables CCK RX CCA (BB 0x2320
+/// b0, `R_RXCCA_V1`, also named `R_11B_RX_V1` / `B_11B_RXCCA_DIS_V1`) on
+/// every band.
 pub fn help_enter<I: AxIo + ?Sized>(io: &mut I, _chan: &Chan) -> Result<u32, AxError> {
     // rtw89_mac_stop_sch_tx_v1(MAC_0, SEL_ALL).
     let tx_en = io.read32(R_AX_CTN_DRV_TXEN)?;
@@ -160,7 +173,7 @@ pub fn help_enter<I: AxIo + ?Sized>(io: &mut I, _chan: &Chan) -> Result<u32, AxE
 
 /// `rtw8852c_set_channel_help(false, ..)` (`rtw8852c.c:1975-1982`): the
 /// PPDU status report, ADC FIFO, DFS and TSSI tracking back on, the BB out
-/// of reset (RX CCA re-enabled on 2.4 GHz only, as Linux does), then the TX
+/// of reset (CCK RX CCA re-enabled on 2.4 GHz only, as Linux does), then the TX
 /// scheduler resumed with `tx_en`'s TXEN field.
 pub fn help_exit<I: AxIo + ?Sized>(io: &mut I, chan: &Chan, tx_en: u32) -> Result<(), AxError> {
     cfg_ppdu_status(io, true)?;
@@ -237,11 +250,29 @@ fn bw_setting<I: AxIo + ?Sized>(io: &mut I, path: RfPath, addr: u32) -> Result<(
     write_rf(io, path, addr, RFREG_MASK, rf18)
 }
 
+/// `_ctrl_bw`'s path-B workaround for the CAV cut (`rtw8852c_rfk.c:
+/// 3888-3895`), after path B's two `_bw_setting`s: path B's RF reset bit
+/// (`RR_RSV1` b0) cleared, path A's RF 0x18 read over SWSI, path B's
+/// `RR_APK` [5:4] = 3, path A's value written to path B's RF 0x18 over
+/// SWSI (the direct window is not touched), 100 us, then the reset bit set
+/// again.
+fn cav_copy_path_b<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
+    write_rf(io, RfPath::B, RR_RSV1, RR_RSV1_RST, 0x0)?;
+    let tmp = read_rf(io, RfPath::A, RR_CFGCH, RFREG_MASK)?;
+    write_rf(io, RfPath::B, RR_APK, RR_APK_MOD, 0x3)?;
+    write_rf(io, RfPath::B, RR_CFGCH, RFREG_MASK, tmp)?;
+    io.delay_us(100);
+    write_rf(io, RfPath::B, RR_RSV1, RR_RSV1_RST, 0x1)
+}
+
 /// `rtw8852c_set_channel_rf(chan, PHY0)` (`rtw8852c_rfk.c:4078-4094`), that
-/// is `rtw8852c_ctrl_bw_ch` at 20 MHz with `kpath = RF_AB`:
+/// is `rtw8852c_ctrl_bw_ch` at 20 MHz with `kpath = RF_AB`, on chip cut
+/// `cut` (`hal.cv`, `enum rtw89_cv`: 0 is CAV):
 /// 1. `_ctrl_ch`: for path A then B, `_ch_setting` on DAV (0x18, SWSI) then
 ///    DDV (0x10018, the direct window);
-/// 2. `_ctrl_bw`: for path A then B, `_bw_setting` on DAV then DDV;
+/// 2. `_ctrl_bw`: for path A then B, `_bw_setting` on DAV then DDV, and on
+///    CAV only, after path B's, the copy of path A's RF 0x18 into path B's
+///    (`cav_copy_path_b`);
 /// 3. `_rxbb_bw`: for path A then B, the RX baseband LUT (0xEE, 0x33, 0x3F)
 ///    and the TIA bandwidth (RF 0x8F bits 6:5 = 2).
 ///
@@ -249,7 +280,7 @@ fn bw_setting<I: AxIo + ?Sized>(io: &mut I, path: RfPath, addr: u32) -> Result<(
 /// channel 36 leaves 0x11D24 on both paths and both windows. A 6 GHz
 /// channel is refused before any I/O; its band bits and channel ranges are
 /// not ported.
-pub fn set_channel_rf<I: AxIo + ?Sized>(io: &mut I, chan: &Chan) -> Result<(), AxError> {
+pub fn set_channel_rf<I: AxIo + ?Sized>(io: &mut I, chan: &Chan, cut: u8) -> Result<(), AxError> {
     if chan.band == HwBand::G6 {
         return Err(AxError::Phy("6 GHz channels are not ported"));
     }
@@ -262,7 +293,10 @@ pub fn set_channel_rf<I: AxIo + ?Sized>(io: &mut I, chan: &Chan) -> Result<(), A
     for path in KPATH {
         bw_setting(io, path, RR_CFGCH)?;
         bw_setting(io, path, RR_CFGCH_V1)?;
-        // The CAV cut's path-B workaround (`:3888-3895`) is not ported.
+        // Without DBCC (`:3885-3886` does not `continue`).
+        if path == RfPath::B && cut == CHIP_CAV {
+            cav_copy_path_b(io)?;
+        }
     }
     for path in KPATH {
         // _set_rxbb_bw(path, 20 MHz).
