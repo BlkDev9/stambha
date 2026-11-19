@@ -21,13 +21,16 @@
 //! (TX power reference, efuse trims, RX path) from [`dm`], the NCTL table
 //! ([`bb::init_rf_nctl`]), and `rtw8852c_rfk_init`'s RCK, DACK with its
 //! DRCK, ADDCK and coex notify, and RX DCK from [`rfk`]. [`bring_up`] puts
-//! these in Linux's order before powering the chip off again. It grants no
+//! these in Linux's order before powering the chip off again. [`chan`]
+//! describes a 20 MHz 2.4 or 5 GHz channel as `rtw89_chan_create` does,
+//! without programming it. It grants no
 //! channel, no IQK, DPK, TSSI or tracking, no station and no interrupts:
 //! the chip is powered off at the end, and nothing past
 //! `rtw89_phy_dm_init` runs.
 pub mod bb;
 pub mod bringup;
 pub mod c2h;
+pub mod chan;
 pub mod cmac;
 pub mod coex;
 pub mod command;
