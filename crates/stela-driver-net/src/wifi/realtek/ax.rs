@@ -13,9 +13,10 @@
 //! carries are found ([`elements`]) and can be walked by RFE type and cut
 //! ([`phy_table`]), and BB and RF registers can be reached ([`bb`], and
 //! [`rf`] through the direct window or SWSI). The BB/RF reset
-//! ([`sys::reset_bb_rf`]) and `rtw89_phy_init_bb_reg` ([`bb::init_bb_reg`])
-//! are ported, but the bring-up runs neither yet and no radio table is
-//! written. The bring-up writes no BB or RF register and grants no calibration,
+//! ([`sys::reset_bb_rf`]), `rtw89_phy_init_bb_reg` ([`bb::init_bb_reg`])
+//! and `rtw89_phy_init_rf_reg` with its RF_REG H2C pages
+//! ([`radio::init_rf_reg`]) are ported, but the bring-up runs none of them
+//! yet. The bring-up writes no BB or RF register and grants no calibration,
 //! no station and no interrupts: the chip is powered off at the end, and
 //! nothing past that one H2C runs.
 pub mod bb;
@@ -32,6 +33,7 @@ pub mod io;
 pub mod pci;
 pub mod phy_table;
 pub mod power;
+pub mod radio;
 pub mod rf;
 pub mod rx;
 pub mod sys;
