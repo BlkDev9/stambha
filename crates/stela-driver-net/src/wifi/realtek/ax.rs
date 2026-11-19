@@ -25,7 +25,10 @@
 //! describes a 20 MHz 2.4 or 5 GHz channel as `rtw89_chan_create` does,
 //! without programming it. [`ppdu`] reads a PPDU status's per-path RSSI
 //! and channel index and matches it to the frames of its PPDU, without
-//! queueing them. It grants no
+//! queueing them. [`receive`] routes each RXQ buffer as `rtw89_core_rx`
+//! does: C2Hs on, beacons and probe responses queued for their PPDU status,
+//! tagged with the channel the firmware reports and stripped of their FCS.
+//! It grants no
 //! channel, no IQK, DPK, TSSI or tracking, no station and no interrupts:
 //! the chip is powered off at the end, and nothing past
 //! `rtw89_phy_dm_init` runs.
@@ -49,6 +52,7 @@ pub mod phy_table;
 pub mod power;
 pub mod ppdu;
 pub mod radio;
+pub mod receive;
 pub mod rf;
 pub mod rfk;
 pub mod rx;
