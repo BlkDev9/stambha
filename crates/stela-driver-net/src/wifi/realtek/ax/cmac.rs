@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+// Copyright(c) 2019-2022  Realtek Corporation
 // Copyright(c) 2019-2020  Realtek Corporation
 //! RTL8852CE band 0 CMAC init, from `cmac_init_ax` (`mac.c:3093`) with its
 //! helpers `scheduler_init_ax` (`:2591`), `addr_cam_init_ax` (`:2564`),
@@ -7,9 +8,12 @@
 //! `spatial_reuse_init_ax` (`:2808`), `tmac_init_ax` (`:2830`),
 //! `trxptcl_init_ax` (`:2856`), `rmac_init_ax` (`:2919`, with `rst_bacam`
 //! `:2904`), `cmac_com_init_ax` (`:2983`), `ptcl_init_ax` (`:3021`) and
-//! `cmac_dma_init_ax` (`:3075`, which does nothing for an RTL8852C). Only the
-//! RTL8852C, PCIe, band 0 branches are ported; register addresses and bits
-//! are from pinned rtw89 `reg.h`. This module grants no band 1, no BB or RF
+//! `cmac_dma_init_ax` (`:3075`, which does nothing for an RTL8852C). The
+//! RTL8852C's response-rate values are `rtw8852c_rrsr_cfgs`
+//! (`rtw8852c.c:214`), and `rmac_init_ax`'s RX length limit uses the SCC
+//! layout's `c0_rx_qta` and `ple_pg_size` from `get_dle_mem_cfg`
+//! (`mac.c:1906`). Only the RTL8852C, PCIe, band 0 branches are ported;
+//! register addresses and bits are from pinned rtw89 `reg.h`. This module grants no band 1, no BB or RF
 //! setup, no MAC address or BSSID, no TX or RX path and no firmware command;
 //! `trx::init` runs it inside the bring-up.
 use super::io::{
