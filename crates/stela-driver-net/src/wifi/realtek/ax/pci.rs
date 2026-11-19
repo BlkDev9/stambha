@@ -12,14 +12,22 @@
 //! `rtw89_pci_init_rx_bd` (`pci.c:3512-3800`), and the FWCMD path of
 //! `rtw89_pci_fwcmd_submit` (`pci.c:1551`), `rtw89_pci_tx_bd_ring_update` /
 //! `__rtw89_pci_tx_kick_off` (`pci.c:1332-1358`) and the reclaim read of
-//! `rtw89_pci_txbd_recalc` (`pci.c:87`). Register addresses are from pinned
-//! rtw89 `pci.h` and `reg.h`.
+//! `rtw89_pci_txbd_recalc` (`pci.c:87`). The post-init is
+//! `rtw89_pci_ops_mac_post_init_ax` (`pci.c:3238`) with
+//! `rtw89_pci_ltr_set_v1` (`pci.c:3188`) and `rtw89_pci_ctrl_txdma_ch_ax`
+//! (`pci.c:249`); the RXQ consumer is the index arithmetic and buffer
+//! handover of `rtw89_pci_poll_rxq_dma` (`pci.c:436`),
+//! `rtw89_pci_rxbd_recalc` / `rtw89_pci_dma_recalc` (`pci.c:146`, `:61`)
+//! and `rtw89_pci_rxbd_deliver` (`pci.c:413-434`). Register addresses are
+//! from pinned rtw89 `pci.h` and `reg.h`.
 //!
 //! Only the RTL8852C branches are ported; the DMI-quirk BER fix
 //! (`rtw89_pci_ber`, Dell only) and the 8852A/885xB PHY steps are not. This
-//! module does not grant interrupts, RX processing, TX on any channel but
-//! CH12, LTR/ASPM/L1SS setup (`mac_post_init`) or firmware readiness: a
-//! consumed TXBD proves only that the DMA engine read the packet.
+//! module does not grant interrupts, NAPI, RPQ, RX parsing (RXQ buffers are
+//! handed over raw and whole), TX on any channel but CH12 (post-init enables
+//! every channel's DMA, but only CH12 is ever given a TXBD), ASPM/L1SS setup
+//! or firmware readiness: a consumed TXBD proves only that the DMA engine
+//! read the packet.
 use super::io::{AxError, AxIo, clear16, clear32, field32, poll32, poll32_atomic, set32};
 use crate::bus::dma::{
     mapping::{Direction, DmaDomain, DmaError},
@@ -109,6 +117,7 @@ const B_AX_TXHCI_EN_V1: u32 = 1 << 7;
 const B_AX_RST_BDRAM: u32 = 1 << 3;
 const B_AX_HAXI_MAX_TXDMA_MASK: u32 = 0x0003; // GENMASK(1, 0)
 const R_AX_HAXI_DMA_STOP1: u32 = 0x1010;
+const B_AX_STOP_PCIEIO: u32 = 1 << 20;
 const B_AX_STOP_WPDMA: u32 = 1 << 19;
 const B_AX_STOP_CH12: u32 = 1 << 18;
 /// `B_AX_TX_STOP1_MASK`: ACH0-7, CH8, CH9 and CH12 (bits 8-18).
@@ -141,6 +150,31 @@ const R_AX_TX_ADDRESS_INFO_MODE_SETTING: u32 = 0x8810;
 const B_AX_HOST_ADDR_INFO_8B_SEL: u32 = 1 << 0;
 const R_AX_PKTIN_SETTING: u32 = 0x9A00;
 const B_AX_WD_ADDR_INFO_LENGTH: u32 = 1 << 1;
+
+// LTR (reg.h:437-456, :594-619), as rtw89_pci_ltr_set_v1 uses them.
+const R_AX_LTR_DEC_CTRL: u32 = 0x1600;
+const B_AX_LTR_HW_DEC_EN: u32 = 1 << 2;
+const B_AX_LTR_SPACE_IDX_V1_MASK: u32 = 0x3; // GENMASK(1, 0)
+const R_AX_LTR_LATENCY_IDX0: u32 = 0x1604;
+const R_AX_LTR_LATENCY_IDX3: u32 = 0x1610;
+const R_AX_LTR_CTRL_0: u32 = 0x8410;
+const B_AX_LTR_IDLE_TIMER_IDX_MASK: u32 = 0x0700; // GENMASK(10, 8)
+const B_AX_LTR_WD_NOEMP_CHK_V1: u32 = 1 << 1;
+const B_AX_LTR_HW_EN: u32 = 1 << 0;
+const R_AX_LTR_CTRL_1: u32 = 0x8414;
+const B_AX_LTR_RX1_TH_MASK: u32 = 0x0FFF_0000; // GENMASK(27, 16)
+const B_AX_LTR_RX0_TH_MASK: u32 = 0x0FFF; // GENMASK(11, 0)
+/// `PCI_LTR_SPC_500US`.
+const LTR_SPC_500US: u32 = 2;
+/// `PCI_LTR_IDLE_TIMER_3_2MS`.
+const LTR_IDLE_TIMER_3_2MS: u32 = 7;
+/// The RX0 and RX1 thresholds `rtw89_pci_ltr_set_v1` writes.
+const LTR_RX_TH: u32 = 0x28;
+const LTR_IDX3_LATENCY: u32 = 0x9003_9003;
+const LTR_IDX0_LATENCY: u32 = 0x880B_880B;
+
+/// RXQ, ring 0 of `RX_TABLE`.
+const RXQ: usize = 0;
 
 // rtw8852c_pci_info (rtw8852ce.c:21-79) mode values (pci.h enums).
 /// `MAC_AX_TX_BURST_V1_256B`.
@@ -272,6 +306,10 @@ pub struct Rings {
     ch12_host: Cell<u16>,
     /// CH12 is started by `pre_init` and has no entry in flight.
     ch12_ready: Cell<bool>,
+    /// `bd_ring->wp` of RXQ: the next entry the host reads. Entries from it
+    /// up to the hardware index are filled and the host's; the rest are the
+    /// device's.
+    rxq_host: Cell<u16>,
 }
 
 impl Rings {
@@ -328,6 +366,7 @@ impl Rings {
             programmed: Cell::new(false),
             ch12_host: Cell::new(0),
             ch12_ready: Cell::new(false),
+            rxq_host: Cell::new(0),
         };
         zero(&rings.tx, TX_CHANNELS * TX_RING_BYTES)?;
         rings
@@ -355,6 +394,14 @@ impl Rings {
     /// The firmware command queue. `pre_init` must have succeeded first.
     pub fn ch12(&mut self) -> Ch12<'_> {
         Ch12 { rings: self }
+    }
+
+    /// The RXQ ring, read by polling. `pre_init` must have succeeded first.
+    pub fn rxq(&mut self) -> Rxq<'_> {
+        Rxq {
+            rings: self,
+            copy: Vec::new(),
+        }
     }
 
     /// CH12 refuses packets: `pre_init` has not succeeded yet, or a submit
@@ -479,6 +526,69 @@ pub unsafe fn pre_init<I: AxIo + ?Sized>(
     Ok(())
 }
 
+/// `rtw89_pci_ops_mac_post_init_ax` (`pci.c:3238-3268`) for an RTL8852C:
+/// `rtw89_pci_ltr_set_v1(true)` when `ltr`, then the TX DMA of every
+/// channel enabled (`rtw89_pci_ctrl_txdma_ch_ax(true)`) and PCI IO released
+/// (`B_AX_STOP_WPDMA`, which `pre_init` left set, and `B_AX_STOP_PCIEIO`).
+///
+/// `ltr` is the function's PCIe DEVCTL2 `LTR_EN`, which Linux reads at this
+/// point (`rtw89_pci_dev_ltr_enabled`, `pci.c:3042`); when it is false no
+/// LTR register is read or written. An LTR register that reads an error
+/// value refuses the step before anything is written. The 8852A LTR trigger
+/// and the 8852A/885xB address-info mode (`pci.c:3249-3258`) do not apply;
+/// `pre_init`'s `mode_op` already set the 8852C's.
+///
+/// Every TX ring but CH12 holds only zeroed TXBDs with its host index at 0,
+/// so releasing their DMA hands the device nothing to fetch.
+pub fn post_init<I: AxIo + ?Sized>(io: &mut I, ltr: bool) -> Result<(), AxError> {
+    if ltr {
+        ltr_set_v1(io)?;
+    }
+    // rtw89_pci_ctrl_txdma_ch_ax(true) (pci.c:249).
+    clear32(io, R_AX_HAXI_DMA_STOP1, B_AX_TX_STOP1_MASK)?;
+    clear32(io, R_AX_HAXI_DMA_STOP2, B_AX_TX_STOP2_ALL)?;
+    // Release PCI IO (pci.c:3263-3265).
+    clear32(io, R_AX_HAXI_DMA_STOP1, B_AX_STOP_WPDMA | B_AX_STOP_PCIEIO)
+}
+
+/// `rtw89_pci_ltr_set_v1(rtwdev, true)` (`pci.c:3188-3235`) once
+/// `rtw89_pci_dev_ltr_enabled` held: read and check all five LTR registers,
+/// then program them.
+fn ltr_set_v1<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
+    // rtw89_pci_ltr_is_err_reg_val (pci.h:1731).
+    let checked = |io: &mut I, reg: u32| -> Result<u32, AxError> {
+        let value = io.read32(reg)?;
+        if value == u32::MAX || value == 0xEAEA_EAEA {
+            return Err(AxError::Mac("LTR register reads an error value"));
+        }
+        Ok(value)
+    };
+    checked(io, R_AX_LTR_CTRL_0)?;
+    checked(io, R_AX_LTR_CTRL_1)?;
+    let mut dec_ctrl = checked(io, R_AX_LTR_DEC_CTRL)?;
+    checked(io, R_AX_LTR_LATENCY_IDX3)?;
+    checked(io, R_AX_LTR_LATENCY_IDX0)?;
+    dec_ctrl |= B_AX_LTR_HW_DEC_EN;
+    // B_AX_LTR_SPACE_IDX_V1_MASK starts at bit 0.
+    dec_ctrl = (dec_ctrl & !B_AX_LTR_SPACE_IDX_V1_MASK) | LTR_SPC_500US;
+    set32(
+        io,
+        R_AX_LTR_CTRL_0,
+        B_AX_LTR_WD_NOEMP_CHK_V1 | B_AX_LTR_HW_EN,
+    )?;
+    field32(
+        io,
+        R_AX_LTR_CTRL_0,
+        B_AX_LTR_IDLE_TIMER_IDX_MASK,
+        LTR_IDLE_TIMER_3_2MS,
+    )?;
+    field32(io, R_AX_LTR_CTRL_1, B_AX_LTR_RX0_TH_MASK, LTR_RX_TH)?;
+    field32(io, R_AX_LTR_CTRL_1, B_AX_LTR_RX1_TH_MASK, LTR_RX_TH)?;
+    io.write32(R_AX_LTR_DEC_CTRL, dec_ctrl)?;
+    io.write32(R_AX_LTR_LATENCY_IDX3, LTR_IDX3_LATENCY)?;
+    io.write32(R_AX_LTR_LATENCY_IDX0, LTR_IDX0_LATENCY)
+}
+
 /// Stop the PCIe side's DMA as `rtw89_pci_ops_mac_pre_init_ax` does first
 /// (`pci.c:3113-3116`): `B_AX_STOP_WPDMA` in `R_AX_HAXI_DMA_STOP1`, then
 /// `rtw89_pci_ctrl_dma_all(false)`: AXI master stopped and the TX/RX HCI
@@ -589,6 +699,9 @@ fn reset_trx_rings<I: AxIo + ?Sized>(io: &mut I, rings: &Rings) -> Result<(), Ax
     }
     let rx = [rings.rx_ring(0)?, rings.rx_ring(1)?];
     rings.ch12_host.set(0);
+    // RX `bd_ring->wp` restarts at 0, unwritten (`rx_ring_eq_is_full`
+    // false), as `clr_idx_all` restarted the hardware's.
+    rings.rxq_host.set(0);
     // The first ring address store publishes the rings.
     rings.programmed.set(true);
     for (channel, address) in TX_TABLE.iter().zip(tx) {
@@ -673,6 +786,157 @@ impl Ch12<'_> {
         unsafe { rings.tx.dma.sync_for_cpu(bd..bd + BD_BYTES) }?;
         rings.ch12_ready.set(true);
         Ok(())
+    }
+}
+
+/// The RXQ ring, read by polling as `rtw89_pci_poll_rxq_dma` reads it
+/// under NAPI. Buffers are delivered raw and whole; nothing is parsed.
+pub struct Rxq<'r> {
+    rings: &'r mut Rings,
+    /// The CPU's copy of the buffer being delivered, reused for every entry.
+    copy: Vec<u8>,
+}
+
+impl Rxq<'_> {
+    /// Deliver every RXQ entry the device has filled, as
+    /// `rtw89_pci_poll_rxq_dma` (`pci.c:436`) does with an unlimited budget:
+    /// read the hardware index (`IDX` [27:16], `rtw89_pci_rxbd_recalc`
+    /// `pci.c:146`), count the entries from the host index to it
+    /// (`rtw89_pci_dma_recalc` `pci.c:61`, `rx_ring_eq_is_full` false), and
+    /// for each one take its buffer for the CPU, copy the whole buffer
+    /// (`RX_BUFFER_BYTES`) out, call `each` with the copy, give the buffer
+    /// back to the device and advance. The host index is written once after
+    /// a batch that consumed anything (`pci.c:433`). Returns the number of
+    /// entries consumed.
+    ///
+    /// A hardware index past the ring, or all ones, is refused before any
+    /// buffer is touched. An error from `each` ends the batch: as Linux's
+    /// `err_sync_device` path (`pci.c:401-403`), that buffer is still given
+    /// back and consumed, the host index is written for every entry consumed,
+    /// and the error is returned. A failure to take or give back a buffer
+    /// leaves that entry unconsumed (the host's, and redelivered by the next
+    /// poll), with the host index still written for the entries before it.
+    ///
+    /// # Safety
+    /// `io` is the exclusive register window of the same RTL8852C requester
+    /// that `pre_init` programmed with these rings, and the `pre_init`
+    /// contract still holds: its DMA domain isolates that requester, the
+    /// rings are coherent WB RAM with NoSnoop and ATS disabled, and one
+    /// worker owns the device and this queue. The hardware index having
+    /// passed an entry is the proof that the device finished writing its
+    /// buffer.
+    pub unsafe fn poll<I: AxIo + ?Sized>(
+        &mut self,
+        io: &mut I,
+        each: &mut dyn FnMut(&[u8]) -> Result<(), AxError>,
+    ) -> Result<usize, AxError> {
+        let idx = RX_TABLE[RXQ].1;
+        let value = io.read32(idx)?;
+        if value == u32::MAX {
+            return Err(AxError::AllOnes { register: idx });
+        }
+        let hw = ((value & TXBD_HW_IDX_MASK) >> TXBD_HW_IDX_MASK.trailing_zeros()) as usize;
+        if hw >= RX_ENTRIES {
+            return Err(AxError::Rx("RXQ hardware index out of range"));
+        }
+        let rings = &mut *self.rings;
+        let start = usize::from(rings.rxq_host.get());
+        let count = if hw >= start {
+            hw - start
+        } else {
+            RX_ENTRIES - (start - hw)
+        };
+        if count == 0 {
+            return Ok(0);
+        }
+        // No buffer read may move before the index read that proved it full.
+        fence(Ordering::Acquire);
+        if self.copy.len() != RX_BUFFER_BYTES {
+            self.copy
+                .try_reserve_exact(RX_BUFFER_BYTES)
+                .map_err(|_| AxError::Rx("out of memory for the RX buffer copy"))?;
+            self.copy.resize(RX_BUFFER_BYTES, 0);
+        }
+        let mut consumed = 0;
+        let mut failed = None;
+        while consumed < count {
+            let entry = (start + consumed) % RX_ENTRIES;
+            let buffer = &rings.rx_buffers[RXQ * RX_ENTRIES + entry];
+            // SAFETY: `entry` lies in [host index, hardware index), which
+            // the hardware index has passed: the device finished writing its
+            // buffer and cannot write it again until the host index is
+            // written past it, which happens only below, after this buffer is
+            // given back. The `poll` contract holds.
+            match unsafe { deliver(buffer, &mut self.copy, each) } {
+                Ok(delivered) => {
+                    consumed += 1;
+                    rings.rxq_host.set(((entry + 1) % RX_ENTRIES) as u16);
+                    if let Err(error) = delivered {
+                        failed = Some(error);
+                        break;
+                    }
+                }
+                Err(error) => {
+                    failed = Some(error);
+                    break;
+                }
+            }
+        }
+        if consumed > 0 {
+            // Every CPU read of the buffers is done before the device may
+            // write them again.
+            fence(Ordering::Release);
+            let written = io.write16(idx, rings.rxq_host.get());
+            // The first cause wins; a refused write alone is the error.
+            if failed.is_none() {
+                written?;
+            }
+        }
+        match failed {
+            Some(error) => Err(error),
+            None => Ok(consumed),
+        }
+    }
+}
+
+/// One filled RXQ entry: `sync_for_cpu` its buffer, copy all of it into
+/// `copy`, call `each` with the copy, then `sync_for_device` the buffer.
+/// `Ok` carries `each`'s outcome once the buffer is back with the device;
+/// `Err` means the buffer could not be taken or given back, and `each` may
+/// not have run.
+///
+/// # Safety
+/// The device has finished writing `buffer` and cannot write it until the
+/// caller next writes the host index past it; the `Rxq::poll` contract
+/// holds.
+unsafe fn deliver(
+    buffer: &Allocation,
+    copy: &mut [u8],
+    each: &mut dyn FnMut(&[u8]) -> Result<(), AxError>,
+) -> Result<Result<(), AxError>, AxError> {
+    let whole = 0..RX_BUFFER_BYTES;
+    // SAFETY: the caller proves the device completed its writes and does not
+    // own the buffer until the host index passes it.
+    unsafe { buffer.dma.sync_for_cpu(whole.clone()) }?;
+    let from = buffer
+        .cpu
+        .address(0, RX_BUFFER_BYTES)
+        .map_err(beacon::Error::Memory)?;
+    let copy = &mut copy[..RX_BUFFER_BYTES];
+    // SAFETY: the read mirror of `Allocation::write`: `from` is the bounded
+    // CPU view of `RX_BUFFER_BYTES` of native WB RAM, now CPU-owned and
+    // synced, which no device write and no Rust reference aliases until the
+    // host index passes it; `copy` is a distinct heap buffer of that length.
+    unsafe {
+        from.as_ptr()
+            .copy_to_nonoverlapping(copy.as_mut_ptr(), RX_BUFFER_BYTES)
+    };
+    let delivered = each(copy);
+    match (delivered, buffer.dma.sync_for_device(whole)) {
+        (delivered, Ok(())) => Ok(delivered),
+        // The first cause wins.
+        (Err(error), Err(_)) => Err(error),
+        (Ok(()), Err(error)) => Err(error.into()),
     }
 }
 

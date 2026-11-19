@@ -65,6 +65,18 @@ fn device_read(m: &Model, iova: u64, len: usize) -> Vec<u8> {
     unsafe { core::slice::from_raw_parts(at as *const u8, len) }.to_vec()
 }
 
+/// Put `bytes` at `iova` as the device would write them, through the
+/// model's mapping: the mirror of `device_read`.
+fn device_write(m: &Model, iova: u64, bytes: &[u8]) {
+    let (base, (pages, cpu)) = m.mappings.range(..=iova).next_back().unwrap();
+    assert!(iova + bytes.len() as u64 <= base + pages.bytes() as u64);
+    let at = cpu + (iova - base) as usize;
+    // SAFETY: the range lies inside a live pinned allocation this test's
+    // model holds, the test buffer cannot overlap it, and nothing reads or
+    // writes the range concurrently.
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len()) };
+}
+
 fn running() -> (Arc<Mutex<Model>>, Rings, RegisterModel) {
     let m = Arc::new(Mutex::new(Model::default()));
     let rings = install(&m);
@@ -521,4 +533,279 @@ fn bdram_reset_poll_spends_the_linux_iteration_budget() {
         .count();
     // One read for the set32, then the poll samples.
     assert_eq!(reads, 1 + 101);
+}
+
+/// The registers `post_init` reads and writes, preset so every set, clear
+/// and field shows: LTR off in hardware, every TX channel stopped, and
+/// pre-init's `B_AX_STOP_WPDMA` plus `B_AX_STOP_PCIEIO` still set.
+fn post_init_model() -> RegisterModel {
+    let mut io = RegisterModel::new();
+    io.set32(0x8410, 0);
+    io.set32(0x8414, 0);
+    io.set32(0x1600, 0x0000_0010);
+    io.set32(0x1010, 0x001F_FF00);
+    io.set32(0x11C0, 0x3);
+    io
+}
+
+/// `rtw89_pci_ctrl_txdma_ch_ax(true)` (`pci.c:249`), then the PCI IO
+/// release (`pci.c:3260-3265`).
+const RELEASE_DMA: [Op; 3] = [
+    Op::W32(0x1010, 0x0018_0000),
+    Op::W32(0x11C0, 0),
+    Op::W32(0x1010, 0),
+];
+
+#[test]
+fn post_init_with_ltr_matches_linux_sequence() {
+    let mut io = post_init_model();
+    post_init(&mut io, true).unwrap();
+    let mut want = vec![
+        // rtw89_pci_ltr_set_v1(true) (pci.c:3188): set LTR_WD_NOEMP_CHK_V1 |
+        // LTR_HW_EN, idle timer 3.2 ms, RX0/RX1 thresholds 0x28,
+        Op::W32(0x8410, 0x3),
+        Op::W32(0x8410, 0x703),
+        Op::W32(0x8414, 0x28),
+        Op::W32(0x8414, 0x0028_0028),
+        // dec_ctrl | LTR_HW_DEC_EN with SPACE_IDX_V1 = 500 us, the latencies.
+        Op::W32(0x1600, 0x16),
+        Op::W32(0x1610, 0x9003_9003),
+        Op::W32(0x1604, 0x880B_880B),
+    ];
+    want.extend(RELEASE_DMA);
+    assert_eq!(io.writes(), want);
+    // Every LTR register is read and checked before anything is written.
+    assert_eq!(
+        io.trace[..5],
+        [
+            Op::R32(0x8410),
+            Op::R32(0x8414),
+            Op::R32(0x1600),
+            Op::R32(0x1610),
+            Op::R32(0x1604)
+        ]
+    );
+}
+
+#[test]
+fn post_init_without_ltr_only_releases_dma() {
+    let mut io = post_init_model();
+    post_init(&mut io, false).unwrap();
+    assert!(
+        !io.trace
+            .iter()
+            .any(|op| matches!(op, Op::R32(0x8410 | 0x8414 | 0x1600 | 0x1610 | 0x1604)))
+    );
+    assert_eq!(io.writes(), RELEASE_DMA);
+}
+
+#[test]
+fn post_init_refuses_ltr_error_value() {
+    let refused = Err(AxError::Mac("LTR register reads an error value"));
+    let mut io = post_init_model();
+    io.set32(0x1600, 0xEAEA_EAEA);
+    assert_eq!(post_init(&mut io, true), refused);
+    assert!(io.writes().is_empty());
+    // rtw89_pci_ltr_set_v1 returns at the first error value.
+    assert_eq!(
+        io.trace,
+        [Op::R32(0x8410), Op::R32(0x8414), Op::R32(0x1600)]
+    );
+    // All ones (pci.h:1731) is refused the same way, on the last register too.
+    let mut io = post_init_model();
+    io.set32(0x1604, 0xFFFF_FFFF);
+    assert_eq!(post_init(&mut io, true), refused);
+    assert!(io.writes().is_empty());
+}
+
+/// Every later read of RXQ's IDX (0x1218) reports hardware index `hw`.
+fn hardware_index(io: &mut RegisterModel, hw: u32) {
+    io.on_read(0x1218, Box::new(move |_m: &mut RegisterModel| hw << 16));
+}
+
+/// RXQ entry `entry`'s buffer, as the device sees it.
+fn rxq_buffer(entry: usize) -> u64 {
+    u64::from(RX_BUFFER0) + 0x10000 * entry as u64
+}
+
+/// Poll RXQ once, keeping a copy of every buffer delivered.
+fn drain(
+    rings: &mut Rings,
+    io: &mut RegisterModel,
+    seen: &mut Vec<Vec<u8>>,
+) -> Result<usize, AxError> {
+    // SAFETY: every test polls the same `RegisterModel` that `start`
+    // programmed with these rings, under the same model-only contract.
+    unsafe {
+        rings.rxq().poll(io, &mut |buffer| {
+            seen.push(buffer.to_vec());
+            Ok(())
+        })
+    }
+}
+
+fn syncs(m: &Arc<Mutex<Model>>) -> (usize, usize) {
+    let s = m.lock().unwrap();
+    (s.syncs, s.cpu_syncs)
+}
+
+#[test]
+fn rxq_consumer_delivers_filled_entries() {
+    let (m, mut rings, mut io) = running();
+    let first: Vec<u8> = (0..RX_BUFFER_BYTES).map(|i| (i * 7) as u8).collect();
+    let second: Vec<u8> = (0..RX_BUFFER_BYTES).map(|i| (i * 13 + 1) as u8).collect();
+    {
+        let state = m.lock().unwrap();
+        device_write(&state, rxq_buffer(0), &first);
+        device_write(&state, rxq_buffer(1), &second);
+    }
+    hardware_index(&mut io, 2);
+    let (before, cpu_before) = syncs(&m);
+    let mut seen = Vec::new();
+    assert_eq!(drain(&mut rings, &mut io, &mut seen), Ok(2));
+    assert_eq!(seen.len(), 2);
+    assert!(seen[0] == first && seen[1] == second);
+    assert_eq!(io.trace, [Op::R32(0x1218), Op::W16(0x1218, 2)]);
+    // Each buffer is taken for the CPU once and handed back once.
+    let (after, cpu_after) = syncs(&m);
+    assert_eq!((after - before, cpu_after - cpu_before), (2, 2));
+}
+
+#[test]
+fn rxq_consumer_wraps_and_writes_back_host_index() {
+    let (m, mut rings, mut io) = running();
+    {
+        let state = m.lock().unwrap();
+        for entry in 0..RX_ENTRIES {
+            device_write(&state, rxq_buffer(entry), &[entry as u8 + 1; 16]);
+        }
+    }
+    let mut counts = Vec::new();
+    let mut seen = Vec::new();
+    for hw in [6, 1, 1] {
+        hardware_index(&mut io, hw);
+        counts.push(drain(&mut rings, &mut io, &mut seen).unwrap());
+    }
+    assert_eq!(counts, [6, 3, 0]);
+    // Entries 0-5, then 6, 7 and (wrapped) 0.
+    let order: Vec<u8> = seen.iter().map(|buffer| buffer[0]).collect();
+    assert_eq!(order, [1, 2, 3, 4, 5, 6, 7, 8, 1]);
+    assert_eq!(io.writes(), [Op::W16(0x1218, 6), Op::W16(0x1218, 1)]);
+    // The third poll only read the index.
+    assert_eq!(io.trace[io.trace.len() - 1], Op::R32(0x1218));
+}
+
+#[test]
+fn rxq_index_past_ring_is_refused() {
+    let (m, mut rings, mut io) = running();
+    hardware_index(&mut io, 8);
+    let before = syncs(&m);
+    let mut seen = Vec::new();
+    assert_eq!(
+        drain(&mut rings, &mut io, &mut seen),
+        Err(AxError::Rx("RXQ hardware index out of range"))
+    );
+    assert!(seen.is_empty());
+    assert_eq!(io.trace, [Op::R32(0x1218)]);
+    assert_eq!(syncs(&m), before);
+    // A dead function's all-ones read is refused as such (spec S9 step 3).
+    io.on_read(0x1218, Box::new(|_m: &mut RegisterModel| u32::MAX));
+    assert_eq!(
+        drain(&mut rings, &mut io, &mut seen),
+        Err(AxError::AllOnes { register: 0x1218 })
+    );
+    assert!(io.writes().is_empty());
+}
+
+#[test]
+fn rxq_consumer_error_ends_the_batch_after_writing_back() {
+    let (m, mut rings, mut io) = running();
+    {
+        let state = m.lock().unwrap();
+        for entry in 0..3 {
+            device_write(&state, rxq_buffer(entry), &[entry as u8 + 1; 4]);
+        }
+    }
+    hardware_index(&mut io, 3);
+    let (before, _) = syncs(&m);
+    let mut seen = Vec::new();
+    // SAFETY: as `drain`.
+    let polled = unsafe {
+        rings.rxq().poll(&mut io, &mut |buffer| {
+            seen.push(buffer[0]);
+            if seen.len() == 2 {
+                Err(AxError::Rx("malformed"))
+            } else {
+                Ok(())
+            }
+        })
+    };
+    assert_eq!(polled, Err(AxError::Rx("malformed")));
+    assert_eq!(seen, [1, 2]);
+    // As `rtw89_pci_rxbd_deliver_skbs`' err_sync_device path (pci.c:401-403),
+    // the refused buffer is handed back and consumed with the ones before it.
+    assert_eq!(io.trace, [Op::R32(0x1218), Op::W16(0x1218, 2)]);
+    assert_eq!(syncs(&m).0 - before, 2);
+    // The next poll starts at the entry after the refused one.
+    let mut seen = Vec::new();
+    assert_eq!(drain(&mut rings, &mut io, &mut seen), Ok(1));
+    assert_eq!(seen[0][0], 3);
+    assert_eq!(io.writes().last(), Some(&Op::W16(0x1218, 3)));
+}
+
+#[test]
+fn rxq_buffer_that_cannot_be_taken_stays_unconsumed() {
+    let (m, mut rings, mut io) = running();
+    {
+        let state = m.lock().unwrap();
+        for entry in 0..3 {
+            device_write(&state, rxq_buffer(entry), &[entry as u8 + 1; 4]);
+        }
+    }
+    hardware_index(&mut io, 3);
+    {
+        let mut state = m.lock().unwrap();
+        state.fail_cpu_sync_at = Some(state.cpu_syncs + 2);
+    }
+    let (before, _) = syncs(&m);
+    let mut seen = Vec::new();
+    assert_eq!(
+        drain(&mut rings, &mut io, &mut seen),
+        Err(AxError::Dma("ring memory visibility failed"))
+    );
+    // Entry 1 was never read nor given back: only entry 0 is returned.
+    assert_eq!(seen.len(), 1);
+    assert_eq!(syncs(&m).0 - before, 1);
+    assert_eq!(io.trace, [Op::R32(0x1218), Op::W16(0x1218, 1)]);
+    // It is still the host's, so the next poll delivers it.
+    m.lock().unwrap().fail_cpu_sync_at = None;
+    seen.clear();
+    assert_eq!(drain(&mut rings, &mut io, &mut seen), Ok(2));
+    let order: Vec<u8> = seen.iter().map(|buffer| buffer[0]).collect();
+    assert_eq!(order, [2, 3]);
+    assert_eq!(io.writes().last(), Some(&Op::W16(0x1218, 3)));
+}
+
+#[test]
+fn pre_init_restarts_rxq_at_entry_0() {
+    let (m, mut rings, mut io) = running();
+    {
+        let state = m.lock().unwrap();
+        for entry in 0..RX_ENTRIES {
+            device_write(&state, rxq_buffer(entry), &[entry as u8 + 1; 4]);
+        }
+    }
+    let mut seen = Vec::new();
+    hardware_index(&mut io, 3);
+    assert_eq!(drain(&mut rings, &mut io, &mut seen), Ok(3));
+    // pre_init clears the hardware indices (rtw89_pci_clr_idx_all_ax), and
+    // rtw89_pci_reset_trx_rings the host's.
+    start(&mut io, 2, &rings).unwrap();
+    io.trace.clear();
+    seen.clear();
+    hardware_index(&mut io, 2);
+    assert_eq!(drain(&mut rings, &mut io, &mut seen), Ok(2));
+    let order: Vec<u8> = seen.iter().map(|buffer| buffer[0]).collect();
+    assert_eq!(order, [1, 2]);
+    assert_eq!(io.writes(), [Op::W16(0x1218, 2)]);
 }
