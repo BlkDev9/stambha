@@ -9,14 +9,17 @@
 //! chip off again. It grants no station, no RF or baseband setup, and no
 //! interrupts: nothing past the firmware's ready status runs.
 pub mod bringup;
+pub mod c2h;
 pub mod cmac;
 pub mod dmac;
 pub mod efuse;
 pub mod fwdl;
+pub mod h2c;
 pub mod io;
 pub mod pci;
 
 pub mod power;
+pub mod rx;
 pub mod sys;
 #[cfg(test)]
 pub(crate) mod tests;

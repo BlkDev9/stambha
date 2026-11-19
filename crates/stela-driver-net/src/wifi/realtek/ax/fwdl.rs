@@ -45,7 +45,7 @@ const RPKT_LEN_MASK: u32 = 0x3FFF;
 const RPKT_TYPE_SHIFT: u32 = 24;
 const RPKT_TYPE_MASK: u32 = 0xF;
 /// `RTW89_CORE_RX_TYPE_H2C` and `RTW89_CORE_RX_TYPE_FWDL` (`core.h:239`).
-const RX_TYPE_H2C: u32 = 13;
+pub(super) const RX_TYPE_H2C: u32 = 13;
 const RX_TYPE_FWDL: u32 = 14;
 
 /// `fw.h:4673-4741`: `H2C_HDR_CAT` [1:0], `H2C_HDR_CLASS` [7:2],
@@ -110,7 +110,7 @@ const READY_DELAY_US: u64 = 5_000;
 /// dword0 = `pkt_size` [13:0] | RX type [27:24], the rest zeroed by
 /// `rtw89_pci_fwcmd_submit`'s memset. `pkt_size` is the skb length before
 /// the descriptor is pushed (`core.c:1278`).
-fn descriptor(pkt_size: usize, rx_type: u32) -> [u8; TXDESC_BYTES] {
+pub(super) fn descriptor(pkt_size: usize, rx_type: u32) -> [u8; TXDESC_BYTES] {
     let dword0 = (pkt_size as u32 & RPKT_LEN_MASK) | (rx_type & RPKT_TYPE_MASK) << RPKT_TYPE_SHIFT;
     let mut d = [0; TXDESC_BYTES];
     d[..4].copy_from_slice(&dword0.to_le_bytes());
