@@ -387,3 +387,209 @@ fn cck_pd_lower_bound_follows_linux_arithmetic() {
     // A linked RSSI above the floor: min(80, 60) - 23 = 37, less 110.
     assert_eq!(cck_pd_lower_bound(80, 60), (-73i32) as u32);
 }
+
+/// `rtw8852c_bb_cal_txpwr_ref` (rtw8852c.c:2041-2066) as Linux computes it,
+/// to check the constant [`set_txpwr_ctrl`] writes.
+fn linux_cal_txpwr_ref(r#ref: i16, pwr_ofst_decrease: u16) -> u32 {
+    let pwr_s10_3 = (r#ref << 1) + ((0x27u16 << 3) as i16) - pwr_ofst_decrease as i16;
+    let bb_pwr_cw = (pwr_s10_3 as u32) & 0x7;
+    let rf_pwr_cw = (((pwr_s10_3 as u32) >> 3) & 0x3F).clamp(15, 63);
+    let pwr_cw = (rf_pwr_cw << 3) | bb_pwr_cw;
+    let tssi_ofst_cw =
+        ((0x12C_i16 + (r#ref << 1) - (16 << 3)) as u32).wrapping_sub(u32::from(pwr_ofst_decrease));
+    (tssi_ofst_cw << 18) | (pwr_cw << 9) | ((r#ref as u32) & 0x1FF)
+}
+
+#[test]
+fn txpwr_ref_is_linux_cal_txpwr_ref_at_zero() {
+    assert_eq!(linux_cal_txpwr_ref(0, 0), 0x02B2_7000);
+    assert_eq!(TXPWR_REF_0DBM, linux_cal_txpwr_ref(0, 0));
+}
+
+#[test]
+fn set_txpwr_ctrl_matches_linux_sequence() {
+    let mut m = RegisterModel::new();
+    set_txpwr_ctrl(&mut m).unwrap();
+    let mut want = Vec::new();
+    // `rtw89_mac_txpwr_write32_mask`: a MAC read-modify-write of 0xD200.
+    want.extend(rmw(0xD200, 0));
+    // OFDM for A then B, then CCK for A then B.
+    for reg in [0x15804, 0x17804, 0x15808, 0x17808] {
+        want.extend(rmw(reg, 0x02B2_7000));
+    }
+    assert_eq!(m.trace, want);
+}
+
+#[test]
+fn set_txpwr_ctrl_keeps_the_bits_outside_each_field() {
+    let mut m = RegisterModel::new();
+    for reg in [0xD200, 0x15804, 0x17804, 0x15808, 0x17808] {
+        m.set32(reg, 0xFFFF_FFFF);
+    }
+    set_txpwr_ctrl(&mut m).unwrap();
+    // [27:10] of 0xD200 cleared.
+    assert_eq!(m.get32(0xD200), 0xF000_03FF);
+    // [26:0] of each BB word replaced.
+    for reg in [0x15804, 0x17804, 0x15808, 0x17808] {
+        assert_eq!(m.get32(reg), 0xF800_0000 | 0x02B2_7000);
+    }
+}
+
+fn phy_efuse(thermal: Option<[u8; 2]>, pa_bias: Option<[u8; 2]>) -> PhyEfuse {
+    PhyEfuse {
+        rfe_type: 1,
+        xtal_cap: 0,
+        thermal_trim: thermal,
+        pa_bias_trim: pa_bias,
+    }
+}
+
+#[test]
+fn power_trim_writes_both_paths_when_either_is_programmed() {
+    let mut m = rf_model(0, 0);
+    power_trim(&mut m, &phy_efuse(Some([0x07, 0xFF]), Some([0x5A, 0xFF]))).unwrap();
+    assert_eq!(
+        m.rf_ops(),
+        [
+            // `__thm_setting(0x07)` = 0xB; the 0xFF path is still written,
+            // as `__thm_setting(0xFF)` = 0xF.
+            Op::RfW(0, 0x43, 0xF0000, 0xB0000),
+            Op::RfW(1, 0x43, 0xF0000, 0xF0000),
+            // PA bias: 2G [15:12] = low nibble, then 5G [19:16] = high
+            // nibble; the 0xFF path is written as-is.
+            Op::RfW(0, 0x60, 0xF000, 0xA000),
+            Op::RfW(0, 0x60, 0xF0000, 0x50000),
+            Op::RfW(1, 0x60, 0xF000, 0xF000),
+            Op::RfW(1, 0x60, 0xF0000, 0xF0000),
+        ]
+    );
+    assert_eq!(m.get_rf(0, 0x43), 0xB0000);
+    assert_eq!(m.get_rf(1, 0x43), 0xF0000);
+    assert_eq!(m.get_rf(0, 0x60), 0x5A000);
+    assert_eq!(m.get_rf(1, 0x60), 0xFF000);
+}
+
+#[test]
+fn power_trim_decodes_the_thermal_sign_bit_to_bit_3() {
+    // (raw & 1) << 3 | (raw & 0xE) >> 1; b4 (VAL8) and above are dropped.
+    let mut m = rf_model(0, 0);
+    power_trim(&mut m, &phy_efuse(Some([0x01, 0x1E]), None)).unwrap();
+    assert_eq!(
+        m.rf_ops(),
+        [
+            Op::RfW(0, 0x43, 0xF0000, 0x80000),
+            Op::RfW(1, 0x43, 0xF0000, 0x70000),
+        ]
+    );
+}
+
+#[test]
+fn power_trim_applies_each_trim_on_its_own_flag() {
+    let mut m = rf_model(0, 0);
+    power_trim(&mut m, &phy_efuse(None, Some([0xFF, 0x12]))).unwrap();
+    assert_eq!(
+        m.rf_ops(),
+        [
+            Op::RfW(0, 0x60, 0xF000, 0xF000),
+            Op::RfW(0, 0x60, 0xF0000, 0xF0000),
+            Op::RfW(1, 0x60, 0xF000, 0x2000),
+            Op::RfW(1, 0x60, 0xF0000, 0x10000),
+        ]
+    );
+}
+
+#[test]
+fn power_trim_writes_nothing_when_unprogrammed() {
+    let mut m = rf_model(0, 0);
+    power_trim(&mut m, &phy_efuse(None, None)).unwrap();
+    assert!(m.rf_ops().is_empty());
+    assert!(m.trace.is_empty());
+}
+
+#[test]
+fn power_trim_swsi_stuck_fails() {
+    let mut m = rf_model(0, 0);
+    m.swsi_status = 1 << 24;
+    assert!(matches!(
+        power_trim(&mut m, &phy_efuse(Some([0x07, 0xFF]), None)),
+        Err(AxError::Timeout {
+            register: 0x1174C,
+            ..
+        })
+    ));
+    assert!(m.rf_ops().iter().all(|op| !matches!(op, Op::RfW(..))));
+}
+
+/// `rtw8852c_bb_cfg_txrx_path` from zero: every write a
+/// `rtw89_phy_write32_mask`, so a read-modify-write.
+const CFG_TXRX_PATH_FROM_ZERO: [(u32, u32); 27] = [
+    // `bb_cfg_rx_path(RF_PATH_AB)`: both antennas on segment 0 and 1RCCA.
+    (0x14978, 3),
+    (0x14974, 0xC000),
+    (0x14974, 0xC_C000),
+    (0x10D18, 0x100),
+    (0x10D18, 0x20_0100),
+    (0x10D80, 0x4000),
+    (0x10D80, 0x80_4000),
+    // `ctrl_btg_bt_rx(true)` at the zeroed channel's 2G band.
+    (0x14738, 0x8_0000),
+    (0x14738, 0x8_0000),
+    (0x1476C, 0x2000_0000),
+    (0x14778, 0x30),
+    (0x14AA4, 0x8_0000),
+    (0x14AA4, 0x48_0000),
+    (0x10980, 0),
+    (0x14978, 0x4003),
+    (0x14974, 0x8C_C000),
+    (0x1441C, 0x8000_0000),
+    (0x10C6C, 0x20_0000),
+    // TX power reset of path A then B: MANON|TSSI to 1, then 3.
+    (0x158DC, 0x4000_0000),
+    (0x158DC, 0xC000_0000),
+    (0x178DC, 0x4000_0000),
+    (0x178DC, 0xC000_0000),
+    // `B_RXHE_USER_MAX` = 8.
+    (0x10D80, 0x80_4200),
+    // `rx_nss` 2.
+    (0x10D18, 0x20_0100),
+    (0x10D18, 0x20_0100),
+    (0x10D80, 0x80_4200),
+    (0x10D80, 0x80_4200),
+];
+
+#[test]
+fn cfg_txrx_path_matches_linux_sequence() {
+    let mut m = RegisterModel::new();
+    cfg_txrx_path(&mut m).unwrap();
+    let want: Vec<Op> = CFG_TXRX_PATH_FROM_ZERO
+        .into_iter()
+        .flat_map(|(reg, v)| rmw(reg, v))
+        .collect();
+    assert_eq!(m.trace, want);
+}
+
+#[test]
+fn cfg_txrx_path_keeps_the_bits_outside_each_field() {
+    let mut m = RegisterModel::new();
+    for (reg, _) in CFG_TXRX_PATH_FROM_ZERO {
+        m.set32(reg, 0xFFFF_FFFF);
+    }
+    cfg_txrx_path(&mut m).unwrap();
+    // Segment 0 = 3, BT share b14 kept set.
+    assert_eq!(m.get32(0x14978), 0xFFFF_FFF3);
+    // 1RCCA [17:14] and [21:18] = 3, BT segment [25:22] = 2.
+    assert_eq!(m.get32(0x14974), 0xFC8C_FFFF);
+    // HT [9:8] and VHT [22:21] = 1.
+    assert_eq!(m.get32(0x10D18), 0xFFBF_FDFF);
+    // HE NSS [16:14] = 1, HE TB NSS [25:23] = 1, user max [13:6] = 8.
+    assert_eq!(m.get32(0x10D80), 0xFCFE_423F);
+    // Path 0 BTG b22 cleared, path 1 BTG b22 set.
+    assert_eq!(m.get32(0x14738), 0xFFBF_FFFF);
+    assert_eq!(m.get32(0x14AA4), 0xFFFF_FFFF);
+    assert_eq!(m.get32(0x1476C), 0x20FF_FFFF);
+    assert_eq!(m.get32(0x14778), 0xFFFF_FF30);
+    // PMAC GNT P1 [20:17] cleared.
+    assert_eq!(m.get32(0x10980), 0xFFE1_FFFF);
+    assert_eq!(m.get32(0x158DC), 0xFFFF_FFFF);
+    assert_eq!(m.get32(0x178DC), 0xFFFF_FFFF);
+}

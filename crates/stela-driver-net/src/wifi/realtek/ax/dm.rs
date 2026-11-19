@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 // Copyright(c) 2019-2020  Realtek Corporation
 // Copyright(c) 2019-2022  Realtek Corporation
-//! The first part of `rtw89_phy_dm_init` (pinned rtw89/phy.c:8235-8253)
-//! for an RTL8852C on PHY 0 without DBCC, each call a function in Linux's
+//! `rtw89_phy_dm_init` (pinned rtw89/phy.c:8235-8261) for an RTL8852C on
+//! PHY 0 without DBCC, each call a function, its first part in Linux's
 //! order:
 //! 1. [`stat_init`] is `rtw89_phy_stat_init` (phy.c:5895-5917), whose only
 //!    I/O is `rtw89_phy_stat_thermal_update` (phy.c:5812-5831) reading
@@ -29,6 +29,15 @@
 //!    (rtw8852c.c:3274);
 //! 7. [`edcca_init`] is `rtw89_phy_edcca_init` (phy.c:8201-8233).
 //!
+//! After `rtw89_phy_init_rf_nctl` ([`super::bb::init_rf_nctl`]) and
+//! `rtw8852c_rfk_init` ([`super::rfk`]), its tail (phy.c:8258-8260):
+//! 8. [`set_txpwr_ctrl`] is `rtw8852c_set_txpwr_ctrl` (rtw8852c.c:2261-2265),
+//!    `rtw8852c_set_txpwr_ref(PHY0, 0)` (:2103-2135);
+//! 9. [`power_trim`] is `rtw8852c_power_trim` (rtw8852c.c:816-820), the
+//!    efuse thermal and PA bias trims;
+//! 10. [`cfg_txrx_path`] is `rtw8852c_bb_cfg_txrx_path`
+//!     (rtw8852c.c:2556-2583) for both RX paths, two streams and 2G.
+//!
 //! `rtw89_phy_diag_init`, `nhm_setting_init` (`support_noise = false`),
 //! `bb_wrap_init` and `ch_info_init` (NULL on AX), `ul_tb_info_init`,
 //! `antdiv_init`, `rfe_gpio` (NULL), `antdiv_set_ant` and `rfk_hw_init`
@@ -41,9 +50,12 @@
 //! fails, as a timed-out XTAL SI is an I/O fault (spec S12.7); an RF
 //! access that SWSI never serves fails as [`super::rf`] says. This module
 //! grants no tracking loop (thermal, DIG, CFO, EDCCA or env monitor), no
-//! PHY 1, no channel, no NCTL and no calibration: it only leaves the
-//! registers as the first `rtw89_phy_dm_init` after probe does.
+//! PHY 1, no channel, no TX power by rate, limit or TSSI beyond the 0 dBm
+//! reference, no single-path or 5G/6G RX configuration, no NCTL and no
+//! calibration: it only leaves the registers as the first
+//! `rtw89_phy_dm_init` after probe does.
 use super::bb;
+use super::efuse::PhyEfuse;
 use super::elements::RfPath;
 use super::io::{self, AxError, AxIo};
 use super::power::{xtal_si_read, xtal_si_write};
@@ -490,6 +502,211 @@ const B_TX_COLLISION_T2R_ST_M: u32 = 0x03F0_0000;
 /// apply.
 pub fn edcca_init<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
     bb::field32(io, R_TX_COLLISION_T2R_ST, B_TX_COLLISION_T2R_ST_M, 0x29)
+}
+
+/// `R_AX_PWR_RATE_CTRL` (reg.h:3493), a MAC word inside the TX power window
+/// `rtw89_mac_get_txpwr_cr_ax` accepts for PHY 0 (mac.c:6258-6287), and
+/// the [27:10] field `rtw8852c_set_txpwr_ref` clears.
+const R_AX_PWR_RATE_CTRL: u32 = 0xD200;
+const PWR_RATE_CTRL_REF_MASK: u32 = 0x0FFF_FC00;
+/// `rtw8852c_set_txpwr_ref`'s per-path BB bases, OFDM and CCK offsets and
+/// mask (rtw8852c.c:2106-2110).
+const TXPWR_REF_BASE: [u32; 2] = [0x5800, 0x7800];
+const TXPWR_REF_OFST_OFDM: u32 = 0x4;
+const TXPWR_REF_OFST_CCK: u32 = 0x8;
+const TXPWR_REF_MASK: u32 = 0x07FF_FFFF;
+/// `rtw8852c_bb_cal_txpwr_ref(ref = 0, pwr_ofst_decrease = 0)`
+/// (rtw8852c.c:2041-2066), the word every path gets for OFDM and CCK when
+/// `rtw8852c_set_txpwr_ctrl` passes `pwr_ofst = 0` (so both paths'
+/// `ofst_dec` are 0, :2121-2122) and both references are 0:
+/// - `pwr_s10_3 = (0 << 1) + (0x27 << 3) - 0 = 0x138`;
+/// - `bb_pwr_cw = pwr_s10_3[2:0] = 0`, `rf_pwr_cw = pwr_s10_3[8:3] = 0x27`
+///   (inside the 15..=63 clamp), so `pwr_cw = 0x27 << 3 | 0 = 0x138`;
+/// - `tssi_ofst_cw = 0x12C + 0 - (16 << 3) - 0 = 0xAC`;
+/// - the word is `0xAC << 18 | 0x138 << 9 | (0 & 0x1FF)`.
+const TXPWR_REF_0DBM: u32 = (0xAC << 18) | (0x138 << 9);
+
+/// `rtw8852c_set_txpwr_ctrl(PHY0)` (rtw8852c.c:2261-2265), which is
+/// `rtw8852c_set_txpwr_ref(PHY0, 0)` (:2103-2135): clear [27:10] of the MAC
+/// rate control word (`rtw89_mac_txpwr_write32_mask`, a read-modify-write,
+/// mac.h:1602-1614), then write the 0 dBm reference to [26:0] of the OFDM
+/// word of path A then B, then of the CCK word of path A then B. Each BB
+/// write is `rtw89_phy_write32_idx` on PHY 0, so a read-modify-write
+/// (phy.c:2111-2117).
+pub fn set_txpwr_ctrl<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
+    io::field32(io, R_AX_PWR_RATE_CTRL, PWR_RATE_CTRL_REF_MASK, 0)?;
+    for ofst in [TXPWR_REF_OFST_OFDM, TXPWR_REF_OFST_CCK] {
+        for base in TXPWR_REF_BASE {
+            bb::field32(io, base + ofst, TXPWR_REF_MASK, TXPWR_REF_0DBM)?;
+        }
+    }
+    Ok(())
+}
+
+/// `RR_TM2` with `RR_TM2_OFF` [19:16] (reg.h:8640-8641).
+const RR_TM2: u32 = 0x43;
+const RR_TM2_OFF: u32 = 0xF_0000;
+/// `RR_BIASA` with `RR_BIASA_TXG` [15:12] and `RR_BIASA_TXA` [19:16]
+/// (reg.h:8671-8673).
+const RR_BIASA: u32 = 0x60;
+const RR_BIASA_TXG: u32 = 0xF000;
+const RR_BIASA_TXA: u32 = 0xF_0000;
+/// `__THM_MASK_3BITS` [3:1] (rtw8852c.c:730).
+const THM_MASK_3BITS: u8 = 0xE;
+
+/// `__thm_setting(raw)` (rtw8852c.c:735-739): the sign bit moves to b3 and
+/// [3:1] down to [2:0]; VAL8 and the high bits are dropped. 0xFF gives 0xF.
+fn thm_setting(raw: u8) -> u8 {
+    ((raw & THM_MASK_SIGN) << 3) | ((raw & THM_MASK_3BITS) >> 1)
+}
+
+/// `rtw8852c_power_trim` (rtw8852c.c:816-820) with the efuse trims of
+/// `efuse`:
+/// - `rtw8852c_thermal_trim` (:733-759): when `thermal_trim` is `Some`
+///   (Linux's `pg_thermal_trim`: either byte != 0xFF), RF 0x43 [19:16] of
+///   path A then B becomes `__thm_setting` of the path's byte;
+/// - `rtw8852c_pa_bias_trim` (:781-805): when `pa_bias_trim` is `Some`, for
+///   path A then B, RF 0x60 [15:12] becomes the byte's low nibble (2G),
+///   then [19:16] its high nibble (5G).
+///
+/// Each trim's flag covers both paths, so a path whose byte is 0xFF inside
+/// a programmed pair is written too (0xF for thermal, 0xF and 0xF for PA
+/// bias), as Linux does. `None` writes nothing.
+pub fn power_trim<I: AxIo + ?Sized>(io: &mut I, efuse: &PhyEfuse) -> Result<(), AxError> {
+    if let Some(trim) = efuse.thermal_trim {
+        for (path, raw) in [RfPath::A, RfPath::B].into_iter().zip(trim) {
+            rf::write_rf(io, path, RR_TM2, RR_TM2_OFF, u32::from(thm_setting(raw)))?;
+        }
+    }
+    if let Some(trim) = efuse.pa_bias_trim {
+        for (path, raw) in [RfPath::A, RfPath::B].into_iter().zip(trim) {
+            rf::write_rf(io, path, RR_BIASA, RR_BIASA_TXG, u32::from(raw & 0xF))?;
+            rf::write_rf(io, path, RR_BIASA, RR_BIASA_TXA, u32::from(raw >> 4))?;
+        }
+    }
+    Ok(())
+}
+
+// rtw8852c_bb_cfg_rx_path and rtw8852c_ctrl_btg_bt_rx over reg.h, BB
+// offsets.
+/// `R_CHBW_MOD` with `B_BT_SHARE` b14 and `B_ANT_RX_SEG0` [3:0]
+/// (reg.h:9711-9716).
+const R_CHBW_MOD: u32 = 0x4978;
+const B_BT_SHARE: u32 = 1 << 14;
+const B_ANT_RX_SEG0: u32 = 0xF;
+/// `R_FC0_BW` with `B_ANT_RX_BT_SEG0` [25:22], `B_ANT_RX_1RCCA_SEG1`
+/// [21:18] and `B_ANT_RX_1RCCA_SEG0` [17:14] (reg.h:9701-9706).
+const R_FC0_BW: u32 = 0x4974;
+const B_ANT_RX_BT_SEG0: u32 = 0x03C0_0000;
+const B_ANT_RX_1RCCA_SEG1: u32 = 0x003C_0000;
+const B_ANT_RX_1RCCA_SEG0: u32 = 0x0003_C000;
+/// `R_RXHT_MCS_LIMIT` [9:8] and `R_RXVHT_MCS_LIMIT` [22:21], one word
+/// (reg.h:9051-9054).
+const R_RXHT_MCS_LIMIT: u32 = 0x0D18;
+const B_RXHT_MCS_LIMIT: u32 = 0x300;
+const R_RXVHT_MCS_LIMIT: u32 = 0x0D18;
+const B_RXVHT_MCS_LIMIT: u32 = 0x0060_0000;
+/// `R_RXHE` with `B_RXHETB_MAX_NSS` [25:23], `B_RXHE_MAX_NSS` [16:14] and
+/// `B_RXHE_USER_MAX` [13:6] (reg.h:9059-9062).
+const R_RXHE: u32 = 0x0D80;
+const B_RXHETB_MAX_NSS: u32 = 0x0380_0000;
+const B_RXHE_MAX_NSS: u32 = 0x0001_C000;
+const B_RXHE_USER_MAX: u32 = 0x3FC0;
+/// `R_P0_TXPW_RSTB` and `R_P1_TXPW_RSTB`, each `rst_mask` the `_MANON` b30
+/// and `_TSSI` b31 bits (reg.h:9936-9938, 10097-10099; rtw8852c.c:
+/// 2322-2323).
+const R_P0_TXPW_RSTB: u32 = 0x58DC;
+const R_P1_TXPW_RSTB: u32 = 0x78DC;
+const B_TXPW_RSTB_MANON_TSSI: u32 = 0xC000_0000;
+/// `R_PATH0_BT_SHARE_V1` b19 and `R_PATH0_BTG_PATH_V1` b22, one word
+/// (reg.h:9630-9633).
+const R_PATH0_BT_SHARE_V1: u32 = 0x4738;
+const B_PATH0_BT_SHARE_V1: u32 = 1 << 19;
+const R_PATH0_BTG_PATH_V1: u32 = 0x4738;
+const B_PATH0_BTG_PATH_V1: u32 = 1 << 22;
+/// `R_PATH1_G_LNA6_OP1DB_V1` [31:24] and `R_PATH1_G_TIA0_LNA6_OP1DB_V1`
+/// [7:0] (reg.h:9655-9670).
+const R_PATH1_G_LNA6_OP1DB_V1: u32 = 0x476C;
+const B_PATH1_G_LNA6_OP1DB_V1: u32 = 0xFF00_0000;
+const R_PATH1_G_TIA0_LNA6_OP1DB_V1: u32 = 0x4778;
+const B_PATH1_G_TIA0_LNA6_OP1DB_V1: u32 = 0xFF;
+/// `R_PATH1_BT_SHARE_V1` b19 and `R_PATH1_BTG_PATH_V1` b22, one word
+/// (reg.h:9676-9679).
+const R_PATH1_BT_SHARE_V1: u32 = 0x4AA4;
+const B_PATH1_BT_SHARE_V1: u32 = 1 << 19;
+const R_PATH1_BTG_PATH_V1: u32 = 0x4AA4;
+const B_PATH1_BTG_PATH_V1: u32 = 1 << 22;
+/// `R_PMAC_GNT` with `B_PMAC_GNT_P1` [20:17] (reg.h:8935-8938).
+const R_PMAC_GNT: u32 = 0x0980;
+const B_PMAC_GNT_P1: u32 = 0x001E_0000;
+/// `R_BT_DYN_DC_EST_EN` b31 (reg.h:9501, 9503) and `R_GNT_BT_WGT_EN` b21
+/// (reg.h:9024-9025).
+const R_BT_DYN_DC_EST_EN: u32 = 0x441C;
+const B_BT_DYN_DC_EST_EN_MSK: u32 = 1 << 31;
+const R_GNT_BT_WGT_EN: u32 = 0x0C6C;
+const B_GNT_BT_WGT_EN: u32 = 1 << 21;
+/// `chip->rx_nss` (rtw8852c.c:3217), which `hal.rx_nss` keeps when the
+/// PHY_CAP reply is not read (spec S1.6).
+const RX_NSS: u32 = 2;
+
+/// `rtw8852c_ctrl_btg_bt_rx(en = true, PHY0)` (rtw8852c.c:2637-2659): let
+/// BT share path 0's and path 1's 2G front ends.
+fn ctrl_btg_bt_rx<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
+    bb::field32(io, R_PATH0_BT_SHARE_V1, B_PATH0_BT_SHARE_V1, 1)?;
+    bb::field32(io, R_PATH0_BTG_PATH_V1, B_PATH0_BTG_PATH_V1, 0)?;
+    bb::field32(io, R_PATH1_G_LNA6_OP1DB_V1, B_PATH1_G_LNA6_OP1DB_V1, 0x20)?;
+    bb::field32(
+        io,
+        R_PATH1_G_TIA0_LNA6_OP1DB_V1,
+        B_PATH1_G_TIA0_LNA6_OP1DB_V1,
+        0x30,
+    )?;
+    bb::field32(io, R_PATH1_BT_SHARE_V1, B_PATH1_BT_SHARE_V1, 1)?;
+    bb::field32(io, R_PATH1_BTG_PATH_V1, B_PATH1_BTG_PATH_V1, 1)?;
+    bb::field32(io, R_PMAC_GNT, B_PMAC_GNT_P1, 0)?;
+    bb::field32(io, R_CHBW_MOD, B_BT_SHARE, 1)?;
+    bb::field32(io, R_FC0_BW, B_ANT_RX_BT_SEG0, 2)?;
+    bb::field32(io, R_BT_DYN_DC_EST_EN, B_BT_DYN_DC_EST_EN_MSK, 1)?;
+    bb::field32(io, R_GNT_BT_WGT_EN, B_GNT_BT_WGT_EN, 1)
+}
+
+/// The HT, VHT, HE and HE TB stream limits for `rx_nss` streams, as
+/// `rtw8852c_bb_cfg_txrx_path` and `bb_cfg_rx_path` write them: each field
+/// holds `rx_nss - 1`.
+fn rx_nss_limits<I: AxIo + ?Sized>(io: &mut I, rx_nss: u32) -> Result<(), AxError> {
+    let v = rx_nss - 1;
+    bb::field32(io, R_RXHT_MCS_LIMIT, B_RXHT_MCS_LIMIT, v)?;
+    bb::field32(io, R_RXVHT_MCS_LIMIT, B_RXVHT_MCS_LIMIT, v)?;
+    bb::field32(io, R_RXHE, B_RXHE_MAX_NSS, v)?;
+    bb::field32(io, R_RXHE, B_RXHETB_MAX_NSS, v)
+}
+
+/// `rtw8852c_bb_cfg_txrx_path` (rtw8852c.c:2556-2583) with Linux's
+/// no-reply defaults, `antenna_rx = 0` and `rx_nss = 2` (spec S1.6), so
+/// `rtw8852c_bb_cfg_rx_path(RF_PATH_AB)` (:2318-2427) without DBCC at the
+/// zeroed channel's 2G band (spec S1.7):
+/// 1. both antennas on segment 0 and the 1RCCA segments, the stream limits
+///    for two streams, `ctrl_btg_bt_rx(true)`, then the TX power reset of
+///    path A and of path B (MANON|TSSI to 1, then 3);
+/// 2. `B_RXHE_USER_MAX` = 8;
+/// 3. the stream limits for `rx_nss` 2 again.
+///
+/// Every write is `rtw89_phy_write32_mask`, a read-modify-write. The
+/// single-path (A or B, `rx_nss` 1), DBCC and 5G/6G branches are not
+/// ported.
+pub fn cfg_txrx_path<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
+    bb::field32(io, R_CHBW_MOD, B_ANT_RX_SEG0, 3)?;
+    bb::field32(io, R_FC0_BW, B_ANT_RX_1RCCA_SEG0, 3)?;
+    bb::field32(io, R_FC0_BW, B_ANT_RX_1RCCA_SEG1, 3)?;
+    // The RF_PATH_AB branch writes two-stream limits whatever `rx_nss` is.
+    rx_nss_limits(io, 2)?;
+    ctrl_btg_bt_rx(io)?;
+    for reg in [R_P0_TXPW_RSTB, R_P1_TXPW_RSTB] {
+        bb::field32(io, reg, B_TXPW_RSTB_MANON_TSSI, 1)?;
+        bb::field32(io, reg, B_TXPW_RSTB_MANON_TSSI, 3)?;
+    }
+    bb::field32(io, R_RXHE, B_RXHE_USER_MAX, 8)?;
+    rx_nss_limits(io, RX_NSS)
 }
 
 #[cfg(test)]
