@@ -10,8 +10,8 @@
 //! `cmac_dma_init_ax` (`:3075`, which does nothing for an RTL8852C). Only the
 //! RTL8852C, PCIe, band 0 branches are ported; register addresses and bits
 //! are from pinned rtw89 `reg.h`. This module grants no band 1, no BB or RF
-//! setup, no MAC address or BSSID, no TX or RX path and no firmware command,
-//! and nothing calls it until the bring-up wires it in.
+//! setup, no MAC address or BSSID, no TX or RX path and no firmware command;
+//! `trx::init` runs it inside the bring-up.
 use super::io::{
     AxError, AxIo, Polled, clear8, clear32, field8, field32, poll_sample, poll32_atomic, set8,
     set32,

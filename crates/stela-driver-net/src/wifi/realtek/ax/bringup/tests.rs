@@ -1,6 +1,7 @@
 extern crate std;
 use super::*;
 use crate::wifi::realtek::ax::fwdl::tests::image_bytes;
+use crate::wifi::realtek::ax::pci::tests::{device_write, rxq_buffer};
 use crate::wifi::realtek::ax::tests::model::{Op, RegisterModel};
 use crate::wifi::realtek::beacon::tests::{Domain, Model, Source};
 use crate::wifi::realtek::firmware::{Ce, Rtw89};
@@ -10,6 +11,33 @@ use std::sync::Mutex;
 
 /// A MAC whose bytes need lower-case hex and a leading zero.
 const MAC: [u8; 6] = [0x00, 0xE0, 0x4C, 0x88, 0x52, 0x0C];
+
+/// Spec S10's crafted RXQ buffer: the REC_ACK of OFLD_CFG at seq 0 (RX BD
+/// info FS | LS | WRITE_SIZE 32, a short RX descriptor with RPKT_LEN 12 and
+/// type 10, C2H cat 1 class 0 func 0 of length 12, then w2 = cat 1, class
+/// 9, func 0x14, seq 0).
+const REC_ACK: [u8; 32] = [
+    0x20, 0xC0, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x0A, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x00,
+    0x00, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x25, 0x14, 0x00, 0x00,
+];
+/// The same as a DONE_ACK (func 1) with return 0.
+const DONE_ACK: [u8; 32] = [
+    0x20, 0xC0, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x0A, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x01,
+    0x00, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x25, 0x14, 0x00, 0x00,
+];
+/// A DONE_ACK whose `H2C_RETURN` ([23:16] of w2) is 3.
+const DONE_ACK_REFUSED: [u8; 32] = [
+    0x20, 0xC0, 0x00, 0x00, 0x0C, 0x00, 0x00, 0x0A, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x01,
+    0x00, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x25, 0x14, 0x03, 0x00,
+];
+/// A plain firmware log C2H (class 0 func 2) of 13 bytes, whose text is
+/// `fw up`: WRITE_SIZE 33, RPKT_LEN 13.
+const LOG: [u8; 33] = [
+    0x21, 0xC0, 0x00, 0x00, 0x0D, 0x00, 0x00, 0x0A, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x02,
+    0x00, 0x00, 0x0D, 0x00, 0x00, 0x00, b'f', b'w', b' ', b'u', b'p',
+];
+/// Both acks, as the firmware may send them.
+const BOTH: &[&[u8]] = &[&REC_ACK, &DONE_ACK];
 
 /// A 2048-byte physical efuse (0xFF = blank) whose logical map holds `MAC`
 /// at 0x400: one block header at physical 4 (block 0x80, words 0-2), then
@@ -30,15 +58,29 @@ fn efuse_with_mac() -> Vec<u8> {
 ///   (0x1000 bit3) self-clears; the CH12 engine (0x1080) consumes every
 ///   kicked entry at once, unless `ch12_holds` says to hold it;
 /// - WCPU: once the WCPU is enabled (0x0088 bit1), 0x01E0 reports both path
-///   ready bits and download status `status` in [7:5].
+///   ready bits and download status `status` in [7:5];
+/// - MAC init: the STA scheduler reports init done (0x9E10 bit31), the
+///   ADDR CAM clear (0xCE34 bit8) and BA CAM reset (0xCE3C [1:0])
+///   self-clear, and the public page count (0x179C) reads 0x0C9C, which
+///   matches the SCC `pub_max`;
+/// - RXQ: at its first index read, which only the OFLD_CFG wait makes, after
+///   the kick, the device fills entries 0.. with `acks` and its index
+///   (0x1218 [27:16]) reports them.
 ///
-/// `pre_inits` counts PCI pre-inits by their read of TXBD_RWPTR_CLR1.
+/// `pre_inits` counts PCI pre-inits by their read of TXBD_RWPTR_CLR1. `m`
+/// is the DMA model the RXQ buffers live in.
 struct Chip {
     io: RegisterModel,
     pre_inits: Arc<AtomicUsize>,
+    m: Arc<Mutex<Model>>,
 }
 
-fn chip(phys: Vec<u8>, status: u32, ch12_holds: fn(usize) -> bool) -> Chip {
+fn chip(
+    phys: Vec<u8>,
+    status: u32,
+    ch12_holds: fn(usize) -> bool,
+    acks: &'static [&'static [u8]],
+) -> Chip {
     let mut io = RegisterModel::new();
     io.on_read(
         0x0004,
@@ -94,20 +136,82 @@ fn chip(phys: Vec<u8>, status: u32, ch12_holds: fn(usize) -> bool) -> Chip {
             }
         }),
     );
-    Chip { io, pre_inits }
+    io.on_read(
+        0x9E10,
+        Box::new(|m: &mut RegisterModel| m.get32(0x9E10) | 0x8000_0000),
+    );
+    io.on_read(
+        0xCE34,
+        Box::new(|m: &mut RegisterModel| m.get32(0xCE34) & !0x100),
+    );
+    io.on_read(
+        0xCE3C,
+        Box::new(|m: &mut RegisterModel| m.get32(0xCE3C) & !0x3),
+    );
+    io.set32(0x179C, 0x0C9C);
+    let m = Arc::new(Mutex::new(Model::default()));
+    let model = m.clone();
+    let mut sent = false;
+    io.on_read(
+        0x1218,
+        Box::new(move |_: &mut RegisterModel| {
+            if !sent {
+                let state = model.lock().unwrap();
+                for (entry, buffer) in acks.iter().enumerate() {
+                    device_write(&state, rxq_buffer(entry), buffer);
+                }
+                sent = true;
+            }
+            (acks.len() as u32) << 16
+        }),
+    );
+    Chip { io, pre_inits, m }
 }
 
 fn never(_: usize) -> bool {
     false
 }
 
+/// The host this bring-up runs on: LTR off unless a test says otherwise.
+const NO_LTR: Host = Host { ltr: false };
+
 fn run(io: &mut RegisterModel, m: &Arc<Mutex<Model>>) -> Result<(Running, Rings), BringUpError> {
+    run_on(io, m, NO_LTR)
+}
+
+fn run_on(
+    io: &mut RegisterModel,
+    m: &Arc<Mutex<Model>>,
+    host: Host,
+) -> Result<(Running, Rings), BringUpError> {
     let bytes = image_bytes();
     let fw = Rtw89::parse(&bytes, 2, Ce::Never).unwrap();
     // SAFETY: the model domain isolates only the modeled requester behind
     // this test's `RegisterModel`; its pages are plain kept test RAM that no
     // real device can reach, and this test is the only worker.
-    unsafe { bring_up(io, &Source, Arc::new(Domain(m.clone())), 2, &fw.image) }
+    unsafe { bring_up(io, &Source, Arc::new(Domain(m.clone())), 2, &fw.image, host) }
+}
+
+/// Bring up a chip as [`chip`] models it with `acks`, on `host`.
+fn ran(
+    acks: &'static [&'static [u8]],
+    host: Host,
+) -> (Chip, Result<(Running, Rings), BringUpError>) {
+    let mut c = chip(efuse_with_mac(), 7, never, acks);
+    let m = c.m.clone();
+    let result = run_on(&mut c.io, &m, host);
+    (c, result)
+}
+
+/// What a full bring-up reports when the firmware sent `rec` and `done`.
+fn acked(rec: bool, done: bool) -> H2cAck {
+    H2cAck {
+        rec,
+        done,
+        other_c2h: 0,
+        skipped: 0,
+        log: None,
+    }
 }
 
 /// The error of a bring-up that must fail (`Rings` has no `Debug`).
@@ -184,9 +288,8 @@ fn assert_ends_with_power_off(io: &RegisterModel) {
 
 #[test]
 fn happy_path_reports_running() {
-    let m = Arc::new(Mutex::new(Model::default()));
-    let mut c = chip(efuse_with_mac(), 7, never);
-    let (running, rings) = run(&mut c.io, &m).unwrap();
+    let (c, result) = ran(BOTH, NO_LTR);
+    let (running, rings) = result.unwrap();
     assert_eq!(
         running,
         Running {
@@ -194,30 +297,41 @@ fn happy_path_reports_running() {
             firmware: (0, 27, 66, 1),
             mac: MAC,
             secure_boot: false,
+            mac_init: true,
+            h2c: acked(true, true),
         }
     );
     assert_eq!(
         running.to_string(),
         "RTL8852CE firmware running: cut 2, firmware 0.27.66.1, MAC 00:e0:4c:88:52:0c, \
-         secure boot off"
+         secure boot off, MAC init done, H2C OFLD_CFG acknowledged (receive and done)"
     );
     // One download attempt, one PCI pre-init.
     assert_eq!(count(&c.io, ATTEMPT), 1);
     assert_eq!(c.pre_inits.load(Ordering::Relaxed), 1);
+    // RXQ's two entries were consumed and its host index written back once.
+    assert_eq!(count(&c.io, Op::W16(0x1218, 2)), 1);
     // rtw89_chip_info_setup ends in rtw89_mac_pwr_off on success too.
     assert_ends_with_power_off(&c.io);
     // The rings were programmed: the caller keeps them.
-    assert!(!m.lock().unwrap().mappings.is_empty());
+    assert!(!c.m.lock().unwrap().mappings.is_empty());
     drop(rings);
 }
 
 #[test]
 fn happy_path_runs_the_steps_in_linux_order() {
-    let m = Arc::new(Mutex::new(Model::default()));
-    let mut c = chip(efuse_with_mac(), 7, never);
-    run(&mut c.io, &m).unwrap();
+    let (c, result) = ran(BOTH, NO_LTR);
+    result.unwrap();
     let t = &c.io.trace;
     let first = |op: Op| t.iter().position(|o| *o == op).unwrap();
+    // The first trace entry after `from` that `want` accepts.
+    let after = |from: usize, want: fn(&Op) -> bool| {
+        from + 1
+            + t[from + 1..]
+                .iter()
+                .position(want)
+                .unwrap_or_else(|| panic!("nothing after trace entry {from}"))
+    };
     // power on: the last write of rtw8852c_pwr_on_func.
     let power_on = first(Op::W32(0x02DC, 0x0100_0000));
     // secure boot: efuse 0x5EC, then the TP_MAJOR scoreboard (mac.c:1569).
@@ -230,6 +344,25 @@ fn happy_path_runs_the_steps_in_linux_order() {
     let download = first(ATTEMPT);
     // efuse: the full physical dump starts at address 0.
     let efuse = first(Op::W32(0x0030, 0));
+    // bb rf enable: rtw8852c_mac_enable_bb_rf's first write, the BB resets
+    // in R_AX_SYS_FUNC_EN (only the power-off writes 0x0002 otherwise).
+    let bb_rf = first_of(t, |o| matches!(o, Op::W8(0x0002, _)));
+    // sys init: dmac_func_en_ax's word.
+    let sys = first(Op::W32(0x8400, 0xFB7D_4000));
+    // dmac init: the SCC DLE public quota of dle_mix_cfg.
+    let dmac = first(Op::W32(0x8C40, 0x0C9C_0C9C));
+    // cmac init: the first CMAC register only cmac_init_ax writes.
+    let cmac = first_of(t, |o| matches!(o, Op::W32(0xC33C, _)));
+    // imr: rtw89_wdrls_imr_enable, enable_imr_ax's first.
+    let imr = first_of(t, |o| matches!(o, Op::W32(0x9430, _)));
+    // pci post-init: rtw89_pci_ctrl_txdma_ch_ax(true) on 0x1010.
+    let post_init = after(imr, |o| matches!(o, Op::W32(0x1010, _)));
+    // h2c: the OFLD_CFG kick on CH12.
+    let kick = after(post_init, |o| matches!(o, Op::W16(0x1080, _)));
+    // c2h: the RXQ host index written back after the acks.
+    let c2h = first_of(t, |o| matches!(o, Op::W16(0x1218, _)));
+    // power off: rtw8852c_pwr_off_func's first XTAL SI command.
+    let power_off = after(c2h, |o| *o == xtal(0x90, 0x10, 0x10));
     let order = [
         power_on,
         secure,
@@ -238,11 +371,203 @@ fn happy_path_runs_the_steps_in_linux_order() {
         pci_pre_init,
         download,
         efuse,
+        bb_rf,
+        sys,
+        dmac,
+        cmac,
+        imr,
+        post_init,
+        kick,
+        c2h,
+        power_off,
     ];
     assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
     // Exactly one TP_MAJOR and one PWR_MAJOR scoreboard write.
     assert_eq!(count(&c.io, Op::W8(0x00AF, 0x81)), 1);
     assert_eq!(count(&c.io, Op::W8(0x00AF, 0x80)), 1);
+    // The PCI IO release (STOP_WPDMA | STOP_PCIEIO, bits 19-20) is the
+    // post-init's last write, before the kick.
+    assert!(matches!(
+        t[..kick]
+            .iter()
+            .rev()
+            .find(|o| matches!(o, Op::W32(0x1010, _))),
+        Some(Op::W32(0x1010, v)) if v & 0x0018_0000 == 0
+    ));
+}
+
+/// The first trace entry `want` accepts.
+fn first_of(t: &[Op], want: fn(&Op) -> bool) -> usize {
+    t.iter().position(want).unwrap()
+}
+
+#[test]
+fn running_reports_which_acks_arrived_and_the_first_firmware_log() {
+    for (acks, h2c, line) in [
+        (
+            &[&REC_ACK as &[u8]] as &'static [&'static [u8]],
+            acked(true, false),
+            "receive only",
+        ),
+        (&[&DONE_ACK as &[u8]], acked(false, true), "done only"),
+    ] {
+        let (_, result) = ran(acks, NO_LTR);
+        let (running, _rings) = result.unwrap();
+        assert_eq!(running.h2c, h2c);
+        assert_eq!(
+            running.to_string(),
+            alloc::format!(
+                "RTL8852CE firmware running: cut 2, firmware 0.27.66.1, MAC 00:e0:4c:88:52:0c, \
+                 secure boot off, MAC init done, H2C OFLD_CFG acknowledged ({line})"
+            )
+        );
+    }
+    let (_, result) = ran(&[&LOG, &REC_ACK, &DONE_ACK], NO_LTR);
+    let (running, _rings) = result.unwrap();
+    assert_eq!(
+        running.h2c.log.map(|log| log.as_str() == "fw up"),
+        Some(true)
+    );
+    assert_eq!(
+        running.to_string(),
+        "RTL8852CE firmware running: cut 2, firmware 0.27.66.1, MAC 00:e0:4c:88:52:0c, \
+         secure boot off, MAC init done, H2C OFLD_CFG acknowledged (receive and done), \
+         firmware log \"fw up\""
+    );
+}
+
+/// Run a full bring-up of [`chip`] with `acks` on `host`, changed by
+/// `fault`, which must fail: its error, after checking the chip ended
+/// powered off.
+fn mac_init_fails(
+    acks: &'static [&'static [u8]],
+    host: Host,
+    fault: impl FnOnce(&mut RegisterModel),
+) -> BringUpError {
+    let mut c = chip(efuse_with_mac(), 7, never, acks);
+    fault(&mut c.io);
+    let m = c.m.clone();
+    let err = failed(run_on(&mut c.io, &m, host));
+    // The efuse ran: every failure here is past milestone 1's steps.
+    assert!(c.io.trace.contains(&Op::W32(0x0030, 0)), "{err}");
+    // Linux's mac_init failure path is rtw89_mac_pwr_off (mac.c:4397).
+    assert_ends_with_power_off(&c.io);
+    err
+}
+
+#[test]
+fn mac_init_failure_names_step_and_powers_off() {
+    // bb rf enable: the XTAL SI command after the efuse dump never
+    // completes; the power-off's own commands do.
+    let err = mac_init_fails(BOTH, NO_LTR, |io| {
+        io.on_read(
+            0x0270,
+            Box::new(|m: &mut RegisterModel| {
+                let v = m.get32(0x0270);
+                let last = m.trace.iter().rev().find_map(|o| match o {
+                    Op::W32(0x0270, v) => Some(*v),
+                    _ => None,
+                });
+                if m.trace.contains(&Op::W32(0x0030, 0)) && last == Some(0x80FF_0700) {
+                    v
+                } else {
+                    v & 0x7FFF_FFFF
+                }
+            }),
+        );
+    });
+    assert_eq!(err.step, "bb rf enable");
+    assert!(
+        matches!(
+            err.error,
+            AxError::Timeout {
+                register: 0x0270,
+                ..
+            }
+        ),
+        "{err}"
+    );
+
+    // dmac init: the public pages read back one short of pub_max.
+    let err = mac_init_fails(BOTH, NO_LTR, |io| io.set32(0x179C, 0x0C9B));
+    assert_eq!(err.step, "dmac init");
+    assert!(matches!(err.error, AxError::Mac(_)), "{err}");
+
+    // cmac init: the security engine's last read finds the CMAC disabled.
+    let err = mac_init_fails(BOTH, NO_LTR, |io| {
+        io.on_read(
+            0x9D1C,
+            Box::new(|m: &mut RegisterModel| {
+                m.set32(0xC000, 0);
+                m.get32(0x9D1C)
+            }),
+        );
+    });
+    assert_eq!(
+        err,
+        BringUpError::new("cmac init", AxError::Mac("CMAC function is not enabled"))
+    );
+
+    // pci post-init: an LTR register reads rtw89_pci_ltr_is_err_reg_val's
+    // 0xEAEAEAEA.
+    let err = mac_init_fails(BOTH, Host { ltr: true }, |io| io.set32(0x1600, 0xEAEA_EAEA));
+    assert_eq!(
+        err,
+        BringUpError::new(
+            "pci post-init",
+            AxError::Mac("LTR register reads an error value")
+        )
+    );
+
+    // c2h: the firmware never answers.
+    let err = mac_init_fails(&[], NO_LTR, |_| ());
+    assert_eq!(
+        err,
+        BringUpError::new(
+            "c2h",
+            AxError::NoAck {
+                class: 9,
+                func: 0x14,
+                seq: 0
+            }
+        )
+    );
+    assert_eq!(
+        err.to_string(),
+        alloc::format!("RTL8852CE bring-up: c2h: {}", err.error)
+    );
+
+    // h2c: the firmware refuses OFLD_CFG with return 3.
+    let err = mac_init_fails(&[&DONE_ACK_REFUSED], NO_LTR, |_| ());
+    assert_eq!(
+        err,
+        BringUpError::new(
+            "h2c",
+            AxError::H2cRejected {
+                class: 9,
+                func: 0x14,
+                seq: 0,
+                ret: 3
+            }
+        )
+    );
+}
+
+#[test]
+fn ltr_host_flag_controls_ltr_writes() {
+    let ltr_writes = |io: &RegisterModel| {
+        io.writes()
+            .iter()
+            .filter(|o| matches!(o, Op::W32(0x1600, _)))
+            .count()
+    };
+    let (c, result) = ran(BOTH, Host { ltr: false });
+    result.unwrap();
+    assert_eq!(ltr_writes(&c.io), 0);
+    assert!(!c.io.trace.contains(&Op::R32(0x1600)));
+    let (c, result) = ran(BOTH, Host { ltr: true });
+    result.unwrap();
+    assert_eq!(ltr_writes(&c.io), 1);
 }
 
 #[test]
@@ -251,8 +576,8 @@ fn secure_boot_on_refuses_and_powers_off() {
     let mut phys = efuse_with_mac();
     phys[0x5EC] = 0xFF;
     phys[0x5ED] = 0x7F;
-    let m = Arc::new(Mutex::new(Model::default()));
-    let mut c = chip(phys, 7, never);
+    let mut c = chip(phys, 7, never, BOTH);
+    let m = c.m.clone();
     let err = failed(run(&mut c.io, &m));
     assert_eq!(
         err,
@@ -271,8 +596,8 @@ fn secure_boot_on_refuses_and_powers_off() {
 #[test]
 fn download_retries_five_times_then_fails() {
     // The firmware never reports WCPU_FW_INIT_RDY (status stays 0).
-    let m = Arc::new(Mutex::new(Model::default()));
-    let mut c = chip(efuse_with_mac(), 0, never);
+    let mut c = chip(efuse_with_mac(), 0, never, BOTH);
+    let m = c.m.clone();
     let err = failed(run(&mut c.io, &m));
     // Every attempt failed the same way, so only the last is named, with
     // the whole 0x01E0 read after its wait: path bits 1 and 2, FWDL_EN, and
@@ -316,8 +641,8 @@ fn ch12_failure_reruns_pci_pre_init_before_the_retry() {
     fn first_pre_init(pre_inits: usize) -> bool {
         pre_inits < 2
     }
-    let m = Arc::new(Mutex::new(Model::default()));
-    let mut c = chip(efuse_with_mac(), 7, first_pre_init);
+    let mut c = chip(efuse_with_mac(), 7, first_pre_init, BOTH);
+    let m = c.m.clone();
     let (running, _rings) = run(&mut c.io, &m).unwrap();
     assert_eq!(running.mac, MAC);
     assert_eq!(count(&c.io, ATTEMPT), 2);
@@ -347,8 +672,8 @@ fn download_failure_names_the_first_attempt_when_it_differs() {
     fn first_pre_init(pre_inits: usize) -> bool {
         pre_inits < 2
     }
-    let m = Arc::new(Mutex::new(Model::default()));
-    let mut c = chip(efuse_with_mac(), 0, first_pre_init);
+    let mut c = chip(efuse_with_mac(), 0, first_pre_init, BOTH);
+    let m = c.m.clone();
     let err = failed(run(&mut c.io, &m));
     assert_eq!(
         err,
@@ -385,8 +710,8 @@ fn a_failed_pci_re_init_keeps_the_download_error_that_stopped_ch12() {
     fn always(_: usize) -> bool {
         true
     }
-    let m = Arc::new(Mutex::new(Model::default()));
-    let mut c = chip(efuse_with_mac(), 7, always);
+    let mut c = chip(efuse_with_mac(), 7, always, BOTH);
+    let m = c.m.clone();
     let mut busy_reads = 0;
     c.io.on_read(
         0x101C,
@@ -536,8 +861,8 @@ fn efuse_failure_powers_off() {
     }
     phys[1210] = 0x00;
     phys[1211] = 0x0E;
-    let m = Arc::new(Mutex::new(Model::default()));
-    let mut c = chip(phys, 7, never);
+    let mut c = chip(phys, 7, never, BOTH);
+    let m = c.m.clone();
     let err = failed(run(&mut c.io, &m));
     assert_eq!(err.step, "efuse");
     assert!(matches!(err.error, AxError::Efuse(_)));
@@ -551,11 +876,23 @@ fn running_display_says_on_for_secure_boot() {
         firmware: (0, 27, 97, 0),
         mac: [0xFF, 0xAB, 0x01, 0x10, 0x00, 0x9C],
         secure_boot: true,
+        mac_init: false,
+        h2c: acked(false, false),
     };
+    // Without the MAC init no H2C was sent, so nothing is said of one.
     assert_eq!(
         r.to_string(),
         "RTL8852CE firmware running: cut 0, firmware 0.27.97.0, MAC ff:ab:01:10:00:9c, \
          secure boot on"
+    );
+    let r = Running {
+        mac_init: true,
+        ..r
+    };
+    assert_eq!(
+        r.to_string(),
+        "RTL8852CE firmware running: cut 0, firmware 0.27.97.0, MAC ff:ab:01:10:00:9c, \
+         secure boot on, MAC init done, H2C OFLD_CFG not acknowledged"
     );
 }
 

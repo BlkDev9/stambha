@@ -281,6 +281,19 @@ fn malformed_rx_buffer_fails_the_wait() {
 }
 
 #[test]
+fn a_malformed_buffer_after_the_done_ack_in_one_batch_still_fails_the_wait() {
+    let mut short = rec_ack();
+    short[..4].copy_from_slice(&(0xC000u32 | 10).to_le_bytes());
+    let r = ran(vec![done_ack(0), short]);
+    assert_eq!(
+        r.got,
+        Err(CommandError::Wait(AxError::Rx(
+            "RX buffer shorter than its descriptor"
+        )))
+    );
+}
+
+#[test]
 fn unreclaimed_ofld_cfg_fails_the_submit() {
     let r = ran_with(vec![done_ack(0)], false);
     assert_eq!(

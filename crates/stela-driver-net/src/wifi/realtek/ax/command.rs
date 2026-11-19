@@ -139,8 +139,10 @@ impl Seen {
 /// every `ACK_POLL_US` until its DONE_ACK arrives or `ACK_WAIT_US` passes
 /// (spec S1.9-S1.10). A REC_ACK alone succeeds once the wait expires; a
 /// DONE_ACK with a non-zero return is `Submit(H2cRejected)`; no matching ack
-/// is `Wait(NoAck)`; an RXQ or clock failure is `Wait`. A failed submit
-/// leaves RXQ untouched.
+/// is `Wait(NoAck)`; an RXQ or clock failure is `Wait`. A malformed RXQ
+/// buffer wins over any ack already seen, in the same batch or an earlier
+/// one: a DONE_ACK followed by a buffer shorter than its descriptor is
+/// `Wait(Rx)`, not success. A failed submit leaves RXQ untouched.
 ///
 /// # Safety
 /// The contract of `Ch12::submit` and `Rxq::poll`: `io` is the exclusive

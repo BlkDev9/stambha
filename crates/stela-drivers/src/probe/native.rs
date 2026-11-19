@@ -27,7 +27,10 @@ use crate::{
             mediatek,
             realtek::{
                 self as realtek_wifi,
-                ax::{AxError, AxIo, BringUpError, NativeAxIo, Rings, Running, bring_up, quiesce},
+                ax::{
+                    AxError, AxIo, BringUpError, Host, NativeAxIo, Rings, Running, bring_up,
+                    quiesce,
+                },
             },
         },
     },
@@ -709,9 +712,9 @@ pub struct Rtw89Up {
     pub kept: Box<dyn Any>,
 }
 
-/// Bring an RTL8852CE up to running firmware and power it off again, as
-/// Linux's probe leaves it (`rtw89_pci_probe` through
-/// `rtw89_chip_info_setup`); `rtw89_pci_setup_mapping` finds its registers
+/// Bring an RTL8852CE up to running firmware, initialize its MAC and have
+/// its firmware acknowledge one H2C, then power it off again
+/// ([`bring_up`]); `rtw89_pci_setup_mapping` finds its registers
 /// in BAR2. The requester is taken through the mount's cold preparation and
 /// brought to D0 there ([`rtw89_wake`]), so
 /// Bus Master stays sealed off until the chip is quiesced and its own
@@ -757,7 +760,7 @@ pub(super) unsafe fn rtw89_wifi(
             .into());
         }
     };
-    let (subsystem_vendor, subsystem_device, pci_revision) =
+    let (subsystem_vendor, subsystem_device, pci_revision, host) =
         match rtw89_decode(preparing.function_mut()) {
             Ok(identity) => identity,
             Err(error) => return Err(keep_error(error, (preparing, registers)).into()),
@@ -802,6 +805,7 @@ pub(super) unsafe fn rtw89_wifi(
     let mut device = Rtw89Native {
         claim: Rtw89Claim::Preparing(preparing),
         io,
+        host,
     };
     // SAFETY: `rtw89_attach`'s contract: `device.io` is the exclusive UC BAR2
     // window of the original requester `device.claim` prepares, which the
@@ -844,22 +848,48 @@ fn rtw89_wake<C: ConfigSpace>(
     Ok(function.bars()?)
 }
 
-/// The RTL8852CE's subsystem IDs and revision, then memory decode on with
-/// MSI, MSI-X and INTx off and Bus Master left clear: what reading BAR2
-/// during preparation needs, and nothing the preparation's seal refuses.
+/// The RTL8852CE's subsystem IDs and revision, and the [`Host`] its
+/// bring-up runs under, then memory decode on with MSI, MSI-X and INTx off
+/// and Bus Master left clear: what reading BAR2 during preparation needs,
+/// and nothing the preparation's seal refuses.
+///
+/// `Host::ltr` is `rtw89_pci_dev_ltr_enabled` (`pci.c:3042`): DEVCTL2
+/// `PCI_EXP_DEVCTL2_LTR_EN` (bit 10 of PCIe capability + 0x28). Linux's
+/// `pcie_capability_read_word` gives 0 for a function with no PCIe
+/// capability, or with a version 1 one, which has no DEVCTL2
+/// (`pcie_capability_reg_implemented`, `drivers/pci/access.c`); so does
+/// this. Nothing in Stela writes DEVCTL2 between this read and the
+/// bring-up's post-init, where Linux reads it (spec S1.8).
 #[expect(
     clippy::result_large_err,
     reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
 )]
-fn rtw89_decode<C: ConfigSpace>(function: &mut Function<C>) -> Result<(u16, u16, u8), Error> {
+fn rtw89_decode<C: ConfigSpace>(function: &mut Function<C>) -> Result<(u16, u16, u8, Host), Error> {
+    /// `PCI_CAP_ID_EXP`, `PCI_EXP_FLAGS_VERS`, `PCI_EXP_DEVCTL2` and
+    /// `PCI_EXP_DEVCTL2_LTR_EN` (`include/uapi/linux/pci_regs.h`).
+    const CAP_ID_EXP: u8 = 0x10;
+    const EXP_FLAGS_VERS: u16 = 0x000f;
+    const EXP_DEVCTL2: u16 = 0x28;
+    const EXP_DEVCTL2_LTR_EN: u16 = 1 << 10;
+    let express = function
+        .capabilities()?
+        .into_iter()
+        .find(|&(_, id)| id == CAP_ID_EXP)
+        .map(|(offset, _)| u16::from(offset));
     let config = function.config();
     let identity = (
         config.read16(0x2c)?,
         config.read16(0x2e)?,
         config.read8(0x08)?,
     );
+    let ltr = match express {
+        Some(cap) if config.read16(cap + 2)? & EXP_FLAGS_VERS > 1 => {
+            config.read16(cap + EXP_DEVCTL2)? & EXP_DEVCTL2_LTR_EN != 0
+        }
+        _ => false,
+    };
     function.enable_polled_decode()?;
-    Ok(identity)
+    Ok((identity.0, identity.1, identity.2, Host { ltr }))
 }
 
 /// Bus Master on for the bound requester, with MSI, MSI-X and INTx still
@@ -885,6 +915,9 @@ pub(super) trait Rtw89Device {
     /// The register window over BAR2: memory decode on, Bus Master clear
     /// until [`Self::master`].
     fn io(&mut self) -> &mut Self::Io;
+    /// What the bring-up needs of the PCIe host: the function's DEVCTL2
+    /// `LTR_EN`, read while it was prepared.
+    fn host(&self) -> Host;
     /// `PreparingRequester::acknowledge_quiescence`, then
     /// `QuiescenceReceipt::finalize`: the domain the original root binds for
     /// this requester.
@@ -897,10 +930,12 @@ pub(super) trait Rtw89Device {
 }
 
 /// One RTL8852CE through its attach: its requester as preparation hands it
-/// on, and the register window over its BAR2. Every outcome keeps it whole.
+/// on, the register window over its BAR2, and the host input
+/// [`rtw89_decode`] read. Every outcome keeps it whole.
 struct Rtw89Native {
     claim: Rtw89Claim,
     io: NativeAxIo,
+    host: Host,
 }
 
 enum Rtw89Claim {
@@ -921,6 +956,9 @@ impl Rtw89Device for Rtw89Native {
     type Io = NativeAxIo;
     fn io(&mut self) -> &mut NativeAxIo {
         &mut self.io
+    }
+    fn host(&self) -> Host {
+        self.host
     }
     unsafe fn finalize(&mut self) -> Result<Arc<dyn DmaDomain>, Error> {
         let preparing = match core::mem::replace(&mut self.claim, Rtw89Claim::Finalizing) {
@@ -1056,6 +1094,8 @@ unsafe fn rtw89_take_over<D: Rtw89Device + ?Sized>(
     //   Stela DMA backing before this point.
     let domain = unsafe { device.finalize() }?;
     device.master()?;
+    // The DEVCTL2 LTR_EN read while the function was prepared.
+    let host = device.host();
     // SAFETY: `bring_up`'s contract:
     // - `device.io()` is the exclusive register window of exactly the
     //   requester whose own domain `finalize` just bound: the receipt
@@ -1067,7 +1107,9 @@ unsafe fn rtw89_take_over<D: Rtw89Device + ?Sized>(
     //   Bus Master, memory decode and INTx Disable).
     // - One worker: the probe drives this function alone, with no
     //   interrupt handler, reset or other engine reaching it.
-    unsafe { bring_up(device.io(), pages, domain, cut, image) }.map_err(Error::Rtw89Wifi)
+    // `host` is no part of that contract: it only decides whether the chip's
+    // own LTR registers are programmed.
+    unsafe { bring_up(device.io(), pages, domain, cut, image, host) }.map_err(Error::Rtw89Wifi)
 }
 
 /// The RTL8852C profile of `observed`, and its firmware staged from
@@ -2247,6 +2289,9 @@ mod tests {
         fn io(&mut self) -> &mut Chip {
             &mut self.chip
         }
+        fn host(&self) -> Host {
+            Host { ltr: false }
+        }
         unsafe fn finalize(&mut self) -> Result<Arc<dyn DmaDomain>, Error> {
             self.chip.events.push(Event::Finalize);
             if self.refuse {
@@ -2649,7 +2694,10 @@ mod tests {
         let Ok(mut function) = Function::new(address(), Config::new()) else {
             panic!("the configuration fixture is a function")
         };
-        assert_eq!(rtw89_decode(&mut function).unwrap(), (0x1043, 0x1b0d, 0));
+        assert_eq!(
+            rtw89_decode(&mut function).unwrap(),
+            (0x1043, 0x1b0d, 0, Host { ltr: false })
+        );
         let command = function.config().command();
         assert_eq!(command & 0x0406, 0x0402, "{command:#x}");
         assert!(!function.config().msi_enabled());
@@ -2657,6 +2705,37 @@ mod tests {
         let command = function.config().command();
         assert_eq!(command & 0x0406, 0x0406, "{command:#x}");
         assert!(!function.config().msi_enabled());
+    }
+
+    /// `rtw89_pci_dev_ltr_enabled` (`pci.c:3042`): bit 10 of DEVCTL2, at
+    /// 0x28 into the PCIe capability, `PCI_EXP_DEVCTL2_LTR_EN`. A function
+    /// without a PCIe capability, or with a version 1 one (which has no
+    /// DEVCTL2), reads false, as `pcie_capability_read_word` gives Linux 0
+    /// for both.
+    #[test]
+    fn rtw89_decode_reads_ltr_from_devctl2() {
+        // The PCIe capability at 0x70, after MSI: ID 0x10, last, version
+        // `version` in its flags; DEVCTL2 at 0x98 reads `devctl2`.
+        let express = |version: u32, devctl2: u32| {
+            let mut config = Config::new();
+            config.0[0x50 / 4] |= 0x70 << 8;
+            config.0[0x70 / 4] = version << 16 | 0x10;
+            config.0[0x98 / 4] = devctl2;
+            config
+        };
+        for (config, ltr) in [
+            (express(2, 0x0400), true),
+            (express(2, 0x0000), false),
+            (express(2, 0xFBFF), false),
+            (express(1, 0x0400), false),
+            (Config::new(), false),
+        ] {
+            let Ok(mut function) = Function::new(address(), config) else {
+                panic!("the configuration fixture is a function")
+            };
+            let (_, _, _, host) = rtw89_decode(&mut function).unwrap();
+            assert_eq!(host, Host { ltr });
+        }
     }
 
     /// `rtw8852ce_id_table`'s one device, as a Wi-Fi function, goes to the

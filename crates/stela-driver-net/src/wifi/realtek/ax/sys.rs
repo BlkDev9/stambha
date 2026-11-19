@@ -8,8 +8,7 @@
 //! `chip_func_en_ax` (`:1690`, which does nothing for an RTL8852C). Register
 //! addresses and bits are from pinned rtw89 `reg.h` and `mac.h`. This module
 //! grants no band 1, no DLE, HFC or CMAC table setup, no BB or RF register
-//! tables and no calibration, and nothing calls it until the bring-up wires
-//! it in.
+//! tables and no calibration; the bring-up runs it after the efuse step.
 use super::io::{AxError, AxIo, clear32, field32, set8, set32};
 use super::power::xtal_si_write;
 

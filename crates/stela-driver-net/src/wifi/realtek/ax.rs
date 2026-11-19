@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 // Copyright(c) 2019-2020  Realtek Corporation
-//! RTL8852CE (rtw89, the "AX" generation) bring-up to running firmware: its
-//! register access, with masked and polling helpers that mirror rtw89's
-//! `rtw89_read*`/`rtw89_write*`, `rtw89_write*_set`/`_clr`/`_mask` and
-//! `read_poll_timeout` uses from pinned rtw89/core.h; MAC power on and off;
-//! the efuse; the DMAC and PCIe pre-init with its rings; and the firmware
-//! download, which [`bring_up`] puts in Linux's order before powering the
-//! chip off again. It grants no station, no RF or baseband setup, and no
-//! interrupts: nothing past the firmware's ready status runs.
+//! RTL8852CE (rtw89, the "AX" generation) bring-up to running firmware and
+//! an initialized MAC: its register access, with masked and polling helpers
+//! that mirror rtw89's `rtw89_read*`/`rtw89_write*`,
+//! `rtw89_write*_set`/`_clr`/`_mask` and `read_poll_timeout` uses from
+//! pinned rtw89/core.h; MAC power on and off; the efuse; the DMAC and PCIe
+//! pre-init with its rings; the firmware download; the MAC init of
+//! `rtw89_mac_init` (BB/RF function enable, system, DMAC, CMAC band 0 and
+//! IMR init, PCIe post-init); and one H2C, OFLD_CFG, whose acknowledgement
+//! is read from RXQ by polling. [`bring_up`] puts these in Linux's order
+//! before powering the chip off again. It grants no BB or RF register
+//! tables, no calibration, no station and no interrupts: the chip is
+//! powered off at the end, and nothing past that one H2C runs.
 pub mod bringup;
 pub mod c2h;
 pub mod cmac;
@@ -26,7 +30,8 @@ pub mod sys;
 pub(crate) mod tests;
 pub mod trx;
 
-pub use bringup::{BringUpError, Earlier, Running, bring_up, quiesce};
+pub use bringup::{BringUpError, Earlier, Host, Running, bring_up, quiesce};
+pub use command::H2cAck;
 pub use fwdl::download;
 pub use io::{
     AxError, AxIo, NativeAxIo, Polled, clear8, clear16, clear32, field8, field16, field32,

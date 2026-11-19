@@ -12,8 +12,8 @@
 //! `dbcc_enable_ax` branch is skipped as the SCC layout is not DBCC, and
 //! `err_imr_ctrl_ax` skips the C1 error IMR because `c1_rx_qta` is 0. This
 //! module grants no band 1, no interrupt delivery (`R_AX_HIMR` and the PCI
-//! interrupt masks stay untouched), no TX or RX path and no firmware command,
-//! and nothing calls it until the bring-up wires it in.
+//! interrupt masks stay untouched), no TX or RX path and no firmware command;
+//! the bring-up runs it after `sys::sys_init`.
 use super::cmac::{self, check_cmac_en};
 use super::dmac::{self, check_dmac_en};
 use super::io::{AxError, AxIo, clear32, field32, set32};
