@@ -5,6 +5,7 @@ use alloc::{sync::Arc, vec::Vec};
 use core::{ptr::NonNull, sync::atomic::AtomicU32};
 use model::{Op, RegisterModel};
 
+pub(crate) mod firmware;
 pub(crate) mod model;
 
 #[test]

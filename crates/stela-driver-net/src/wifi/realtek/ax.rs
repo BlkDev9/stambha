@@ -32,9 +32,14 @@
 //! scheduler and PPDU status stopped and resumed around the change, the MAC
 //! rate checks, the baseband (gain tables, efuse RX gain offsets, CCK
 //! filters, spur notches, TX path table), and RF 0x18's channel and
-//! bandwidth on both paths. [`bring_up`] does not call it yet: the bring-up
-//! grants no channel, no IQK, DPK, TSSI or tracking, no station and no
-//! interrupts; the chip is powered off at the end, and nothing past
+//! bandwidth on both paths. [`core_tail`] is the rest of
+//! `rtw89_core_start` (PPDU status reports, the RTS threshold, and the
+//! firmware log and BA CAM H2Cs), sent through a [`command::Session`],
+//! which submits every H2C after `rtw89_phy_dm_init` on CH12 and drains RXQ
+//! through one [`receive::Receiver`], waiting for a scan command's DONE_ACK
+//! and recording any other refusal. [`bring_up`] calls none of these yet:
+//! the bring-up grants no channel, no IQK, DPK, TSSI or tracking, no station
+//! and no interrupts; the chip is powered off at the end, and nothing past
 //! `rtw89_phy_dm_init` runs.
 pub mod bb;
 pub mod bringup;
@@ -44,6 +49,7 @@ pub mod channel;
 pub mod cmac;
 pub mod coex;
 pub mod command;
+pub mod core_tail;
 pub mod dm;
 pub mod dmac;
 pub mod efuse;
