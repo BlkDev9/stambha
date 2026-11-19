@@ -8,8 +8,10 @@ use crate::{Clock, bus::mmio::Mmio};
 use alloc::sync::Arc;
 use core::{any::Any, fmt, ptr::NonNull};
 
-/// Smallest window: the S8 indirect watchdog registers sit at 0x40000.
-pub const MIN_WINDOW_BYTES: usize = 0x4_0004;
+/// Smallest window: the S8 indirect watchdog registers sit at 0x40000, and
+/// the highest register written is the CMAC table entry at 0x4001C
+/// (`rtw89_mac_cmac_tbl_init`, M2c spec S7.2).
+pub const MIN_WINDOW_BYTES: usize = 0x4_0020;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AxError {

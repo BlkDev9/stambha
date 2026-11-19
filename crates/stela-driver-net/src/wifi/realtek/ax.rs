@@ -37,7 +37,10 @@
 //! firmware log and BA CAM H2Cs), sent through a [`command::Session`],
 //! which submits every H2C after `rtw89_phy_dm_init` on CH12 and drains RXQ
 //! through one [`receive::Receiver`], waiting for a scan command's DONE_ACK
-//! and recording any other refusal. [`bring_up`] calls none of these yet:
+//! and recording any other refusal. [`vif`] is `rtw89_mac_vif_init` for one
+//! unassociated station on port 0 and macid 0: the port registers, the DMAC
+//! and CMAC tables, then the macid unpause, role, join, address CAM and CMAC
+//! table H2Cs through the same session. [`bring_up`] calls none of these yet:
 //! the bring-up grants no channel, no IQK, DPK, TSSI or tracking, no station
 //! and no interrupts; the chip is powered off at the end, and nothing past
 //! `rtw89_phy_dm_init` runs.
@@ -71,6 +74,7 @@ pub mod sys;
 #[cfg(test)]
 pub(crate) mod tests;
 pub mod trx;
+pub mod vif;
 
 pub use bringup::{BringUpError, Earlier, Host, Running, bring_up, quiesce};
 pub use command::H2cAck;
