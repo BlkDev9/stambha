@@ -100,6 +100,9 @@ pub enum AxError {
         table: &'static str,
         index: u16,
     },
+    /// The firmware scan offload could not be built, started or finished;
+    /// the message says why.
+    Scan(&'static str),
 }
 
 impl fmt::Display for AxError {
@@ -155,6 +158,7 @@ impl fmt::Display for AxError {
                 f,
                 "firmware refused H2C class {class} func {func:#x} seq {seq} (return {ret})"
             ),
+            Self::Scan(what) => write!(f, "scan: {what}"),
             Self::FirmwareStatus { what, fw_ctrl } => write!(f, "{what} (0x01E0={fw_ctrl:#010x})"),
             Self::SecureBootUnsupported => f.write_str("secure-boot firmware is unsupported"),
             Self::AlreadyPowered => f.write_str("MAC has already powered on"),
