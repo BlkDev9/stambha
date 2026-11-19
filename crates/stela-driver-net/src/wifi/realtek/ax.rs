@@ -19,7 +19,8 @@
 //! in Linux's order before powering the chip off again. The non-RFK calls
 //! of `rtw89_phy_dm_init`'s first part (thermals, BB GPIO set-up, env
 //! monitor, PHY status bitmaps, DIG, crystal cap and EDCCA) are ported in
-//! [`dm`], but [`bring_up`] does not run them yet. It grants no
+//! [`dm`], and the first calibrations of `rtw8852c_rfk_init` (RCK, DRCK,
+//! ADDCK) in [`rfk`], but [`bring_up`] does not run them yet. It grants no
 //! `rtw89_phy_dm_init`, no calibration, no channel, no station and no
 //! interrupts: the chip is powered off at the end, and nothing past the
 //! coex init and its report reads runs.
@@ -42,6 +43,7 @@ pub mod phy_table;
 pub mod power;
 pub mod radio;
 pub mod rf;
+pub mod rfk;
 pub mod rx;
 pub mod sys;
 #[cfg(test)]
