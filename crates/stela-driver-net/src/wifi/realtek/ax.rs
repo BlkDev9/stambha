@@ -23,7 +23,9 @@
 //! DRCK, ADDCK and coex notify, and RX DCK from [`rfk`]. [`bring_up`] puts
 //! these in Linux's order before powering the chip off again. [`chan`]
 //! describes a 20 MHz 2.4 or 5 GHz channel as `rtw89_chan_create` does,
-//! without programming it. It grants no
+//! without programming it. [`ppdu`] reads a PPDU status's per-path RSSI
+//! and channel index and matches it to the frames of its PPDU, without
+//! queueing them. It grants no
 //! channel, no IQK, DPK, TSSI or tracking, no station and no interrupts:
 //! the chip is powered off at the end, and nothing past
 //! `rtw89_phy_dm_init` runs.
@@ -45,6 +47,7 @@ pub mod pci;
 pub mod phy;
 pub mod phy_table;
 pub mod power;
+pub mod ppdu;
 pub mod radio;
 pub mod rf;
 pub mod rfk;

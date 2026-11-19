@@ -105,17 +105,73 @@ fn long_descriptor_fields_decode() {
     assert_eq!(f.payload[0], 0xAB);
 }
 
+/// A long descriptor with d0-d3 all ones and the given d4. d0's DRV_INFO 7
+/// puts the payload at 4 + 32 + 56 = 92.
+fn all_ones_long(d4: u32) -> Vec<u8> {
+    let mut b = buf(FS_LS | 100, 0xFFFF_FFFF, 100);
+    for at in [8, 12, 16] {
+        put(&mut b, at, 0xFFFF_FFFF);
+    }
+    put(&mut b, 20, d4);
+    b
+}
+
+#[test]
+fn all_ones_long_descriptor_reads_every_field_at_its_maximum() {
+    let b = all_ones_long(0xFFFF_FFFF);
+    let Ok(RxBuffer::Frame(f)) = parse(&b) else {
+        panic!()
+    };
+    assert_eq!(
+        f.desc,
+        RxDesc {
+            pkt_type: 15,
+            pkt_len: 0x3FFF,
+            long: true,
+            mac_info_valid: true,
+            ppdu_type: 15,
+            ppdu_cnt: 7,
+            data_rate: 0x1FF,
+            gi_ltf: 7,
+            bw: 7,
+            free_run: 0xFFFF_FFFF,
+            a1_match: true,
+            sw_dec: true,
+            hw_dec: true,
+            ampdu: true,
+            crc32_err: true,
+            icv_err: true,
+            frame_type: Some(3),
+        }
+    );
+    assert_eq!(f.pkt_type, 15);
+    assert_eq!(f.payload.as_ptr(), b[92..].as_ptr());
+    assert_eq!(f.payload.len(), 8);
+}
+
+#[test]
+fn long_descriptor_frame_type_is_d4_bits_1_0() {
+    let b = all_ones_long(0xFFFF_FFFE);
+    let Ok(RxBuffer::Frame(f)) = parse(&b) else {
+        panic!()
+    };
+    assert_eq!(f.desc.frame_type, Some(2));
+    assert_eq!(f.desc.frame_type, Some(FRAME_DATA));
+}
+
 #[test]
 fn short_descriptor_has_no_frame_type() {
     let mut b = buf(FS_LS | 40, 0x0080_0010 | 1 << 24, 40);
     put(&mut b, 8, 0xE000_0000);
     put(&mut b, 16, 0x0000_0402);
-    // A long descriptor's d4 position must not be read.
-    put(&mut b, 24, 2);
+    // A long descriptor's d4 position (buffer byte 4 + 16) is this short
+    // descriptor's payload and must not be read as a frame type.
+    put(&mut b, 20, 2);
     let Ok(RxBuffer::Frame(f)) = parse(&b) else {
         panic!()
     };
     assert_eq!(f.desc.frame_type, None);
+    assert_eq!(f.payload[0], 2);
     assert!(!f.desc.long && f.desc.mac_info_valid);
     assert_eq!((f.desc.pkt_type, f.desc.bw), (1, 7));
     assert!(f.desc.sw_dec && !f.desc.hw_dec && f.desc.icv_err);
