@@ -6,11 +6,14 @@
 //! `read_poll_timeout` uses from pinned rtw89/core.h; MAC power on and off;
 //! the efuse; the DMAC and PCIe pre-init with its rings; and the firmware
 //! download, which [`bring_up`] puts in Linux's order before powering the
-//! chip off again. It grants no station, no RF or baseband setup, and no
-//! interrupts: nothing past the firmware's ready status runs.
+//! chip off again; and the PHY tables the firmware file carries
+//! ([`elements`]), found but not yet written. It grants no station, no RF
+//! or baseband setup, and no interrupts: nothing past the firmware's ready
+//! status runs.
 pub mod bringup;
 pub mod dmac;
 pub mod efuse;
+pub mod elements;
 pub mod fwdl;
 pub mod io;
 pub mod pci;
