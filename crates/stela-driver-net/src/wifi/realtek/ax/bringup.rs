@@ -151,8 +151,8 @@ pub struct Rf18Line {
 
 impl Rf18 {
     /// Path A's line, then path B's.
-    pub fn lines(&self) -> impl Iterator<Item = Rf18Line> {
-        let Self { dav, ddv } = *self;
+    pub fn lines(self) -> impl Iterator<Item = Rf18Line> {
+        let Self { dav, ddv } = self;
         [('A', 0), ('B', 1)]
             .into_iter()
             .map(move |(path, i)| Rf18Line {
@@ -173,7 +173,11 @@ impl fmt::Display for Rf18Line {
     }
 }
 
-/// [`Rf18`]: path A's DAV then DDV, then path B's.
+/// [`Rf18`]: path A's DAV then DDV, then path B's. The DAV reads repeat the
+/// SWSI reads of [`PhyReport::rf18`] on purpose, a few register accesses
+/// later: each window is paired with a reading of the other taken back to
+/// back, and two SWSI reads that disagree show the serial interface itself
+/// misreading.
 fn read_rf18<I: AxIo + ?Sized>(io: &mut I) -> Result<Rf18, AxError> {
     let mut rf18 = Rf18 {
         dav: [0; 2],
@@ -184,6 +188,13 @@ fn read_rf18<I: AxIo + ?Sized>(io: &mut I) -> Result<Rf18, AxError> {
         rf18.ddv[i] = read_rf(io, path, RR_CFGCH_V1, RFREG_MASK)?;
     }
     Ok(rf18)
+}
+
+impl Running {
+    /// The `WIFI RF18` lines of [`Running::rf18`], path A then B.
+    pub fn rf18_lines(&self) -> impl Iterator<Item = Rf18Line> {
+        self.rf18.into_iter().flat_map(|rf18| rf18.lines())
+    }
 }
 
 impl fmt::Display for Running {
@@ -271,6 +282,10 @@ pub struct BringUpError {
     /// For `"rf init"` and `"rf h2c"`, the RF path, and for a page its
     /// index, the step failed on; printed between the step and the error.
     pub rf: Option<RfAt>,
+    /// RF 0x18 through both windows, when the failure came after it was read
+    /// (any calibration or scan step): as [`Running::rf18`], printed on
+    /// lines of its own ([`BringUpError::rf18_lines`]), not on this one.
+    pub rf18: Option<Rf18>,
 }
 
 /// What a retried bring-up step ran into before the error it reports.
@@ -315,7 +330,14 @@ impl BringUpError {
             error,
             earlier: Earlier::Nothing,
             rf: None,
+            rf18: None,
         }
+    }
+
+    /// The `WIFI RF18` lines of [`BringUpError::rf18`], path A then B; none
+    /// when the failure came before RF 0x18 was read.
+    pub fn rf18_lines(&self) -> impl Iterator<Item = Rf18Line> {
+        self.rf18.into_iter().flat_map(|rf18| rf18.lines())
     }
 }
 
@@ -495,6 +517,7 @@ pub unsafe fn bring_up<I: AxIo + ?Sized>(
             error: error.retry,
             earlier: Earlier::first_of(POWER_ON_TRIES, error.first, error.retry),
             rf: None,
+            rf18: None,
         });
     }
     // SAFETY: the caller's `Rings::install` contract, forwarded unchanged.
@@ -737,10 +760,16 @@ unsafe fn acknowledge<I: AxIo + ?Sized>(
         Ok(rf18) => rf18,
         Err(error) => return (Err(BringUpError::new("phy report", error)), true),
     };
+    // A failure after the reads keeps them: a failed run is the one most
+    // likely to need them.
+    let after_rf18 = |step: &'static str, error: AxError| BringUpError {
+        rf18: Some(rf18),
+        ..BringUpError::new(step, error)
+    };
     // rtw89_phy_dm_init (core.c:6697).
     let (rfk, offset_base) = match phy::calibrate(io, tables, &started.efuse, started.cut) {
         Ok(done) => done,
-        Err(error) => return (Err(BringUpError::new(error.step, error.error)), true),
+        Err(error) => return (Err(after_rf18(error.step, error.error)), true),
     };
     // rtw89_ops_hw_scan from idle (mac80211.c:1279-1320; spec S2). The BB
     // gain table is memory only on AX (bb.rs); it, the efuse RX gain
@@ -762,7 +791,7 @@ unsafe fn acknowledge<I: AxIo + ?Sized>(
     // and submitted on the same rings since.
     let scan = match unsafe { scan::run(io, rings, &mut h2c, &inputs) } {
         Ok(report) => report,
-        Err(error) => return (Err(BringUpError::new(error.step, error.error)), true),
+        Err(error) => return (Err(after_rf18(error.step, error.error)), true),
     };
     let running = Running {
         cut: started.cut,
@@ -815,6 +844,7 @@ unsafe fn download<I: AxIo + ?Sized>(
                         first: (attempt > 2 && first != last).then_some(first),
                     },
                     rf: None,
+                    rf18: None,
                 });
             }
         }
@@ -830,6 +860,7 @@ unsafe fn download<I: AxIo + ?Sized>(
         error: last,
         earlier: Earlier::first_of(FWDL_TRIES, first, last),
         rf: None,
+        rf18: None,
     })
 }
 

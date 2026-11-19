@@ -364,6 +364,17 @@ fn run_with(
     host: Host,
     tables: &PhyTables<'_>,
 ) -> Result<(Running, Rings), BringUpError> {
+    run_at_cut(io, m, host, tables, 2)
+}
+
+/// [`run_with`] for a chip of cut `cut` (the image stays cut 2's).
+fn run_at_cut(
+    io: &mut RegisterModel,
+    m: &Arc<Mutex<Model>>,
+    host: Host,
+    tables: &PhyTables<'_>,
+    cut: u8,
+) -> Result<(Running, Rings), BringUpError> {
     let bytes = image_bytes();
     let fw = Rtw89::parse(&bytes, 2, Ce::Never).unwrap();
     // SAFETY: the model domain isolates only the modeled requester behind
@@ -374,7 +385,7 @@ fn run_with(
             io,
             &Source,
             Arc::new(Domain(m.clone())),
-            2,
+            cut,
             &fw.image,
             host,
             tables,
@@ -765,6 +776,39 @@ fn scan_steps_run_after_calibration_in_linux_order() {
 }
 
 #[test]
+fn set_channel_takes_the_chip_cut() {
+    // `_ctrl_bw`'s CAV workaround (`cav_copy_path_b`, `rtw8852c_rfk.c:
+    // 3888-3895`) writes path B's RR_APK [5:4] = 3 during set channel on cut
+    // 0 only.
+    let apk = |o: &Op| matches!(o, Op::RfW(1, 0x19, 0x30, 0x30));
+    let file = tables_file();
+    for (cut, copies) in [(0, true), (2, false)] {
+        let mut c = chip(efuse_with_mac(), 7, never, BOTH);
+        let m = c.m.clone();
+        let (running, rings) =
+            run_at_cut(&mut c.io, &m, NO_LTR, &phy_tables(&file, 0).unwrap(), cut).unwrap();
+        assert_eq!(running.cut, cut);
+        let t = &c.io.trace;
+        // help_enter's TX scheduler stop, the first after the calibration,
+        // through the end of set channel (vif init's beacon interval).
+        let dm_tail = first_of(t, |o| *o == Op::W32(0x14978, 3));
+        let set_channel = dm_tail
+            + t[dm_tail..]
+                .iter()
+                .position(|o| matches!(o, Op::W32(0xC398, _)))
+                .unwrap();
+        let vif = set_channel
+            + t[set_channel..]
+                .iter()
+                .position(|o| *o == Op::W32(0xC414, 0x64))
+                .unwrap();
+        let copied = t[set_channel..vif].iter().any(apk);
+        assert_eq!(copied, copies, "cut {cut}");
+        drop(rings);
+    }
+}
+
+#[test]
 fn set_channel_takes_the_efuse_rx_gain_and_phy_0_rpl_bias() {
     // Logical 0x2D6 (2.4 GHz CCK) holds path A +2, path B +3: block 0x5A
     // word 3 alone (word enable 0x7). PHY 0's RPL bias reads 16 and PHY 1's
@@ -828,7 +872,7 @@ fn scan_failure_names_step_and_powers_off() {
     let (err, c) = fails_hearing(&|fw| fw.refuse(9, 0x16, 1), |_| ());
     assert_eq!(
         err,
-        BringUpError::new(
+        after_rf18(
             "scan start",
             AxError::H2cRejected {
                 class: 9,
@@ -837,6 +881,15 @@ fn scan_failure_names_step_and_powers_off() {
                 ret: 1
             }
         )
+    );
+    // RF 0x18 survives the failure, for the host check's own lines.
+    let rf18: Vec<alloc::string::String> = err.rf18_lines().map(|l| l.to_string()).collect();
+    assert_eq!(
+        rf18,
+        [
+            "WIFI RF18 A: DAV 0x18 over SWSI 0x01001, DDV 0x10018 direct 0x01001",
+            "WIFI RF18 B: DAV 0x18 over SWSI 0x01001, DDV 0x10018 direct 0x01001",
+        ]
     );
     assert_eq!(
         err.to_string(),
@@ -853,17 +906,23 @@ fn scan_failure_names_step_and_powers_off() {
     let (err, _) = fails_hearing(&home, |io| cmac_off_after(io, Op::W32(0x14978, 3)));
     assert_eq!(
         err,
-        BringUpError::new("core start", AxError::Mac("CMAC function is not enabled"))
+        after_rf18("core start", AxError::Mac("CMAC function is not enabled"))
     );
 
     // set channel: the CMAC reads off once help_enter read its scheduler.
     let (err, _) = fails_hearing(&home, |io| cmac_off_after(io, Op::R32(0xC398)));
-    assert_eq!(err.step, "set channel");
+    assert_eq!(
+        err,
+        after_rf18("set channel", AxError::Mac("CMAC function is not enabled"))
+    );
 
     // vif init: the CMAC reads off once port 0's beacon interval is set, so
     // the macid pause's check refuses.
     let (err, _) = fails_hearing(&home, |io| cmac_off_after(io, Op::W32(0xC414, 0x64)));
-    assert_eq!(err.step, "vif init");
+    assert_eq!(
+        err,
+        after_rf18("vif init", AxError::Mac("CMAC function is not enabled"))
+    );
 
     // scan: a malformed RXQ buffer (WRITE_SIZE 4, no room for its RX
     // descriptor) on channel 6, while the scan waits for END_SCAN.
@@ -876,6 +935,16 @@ fn scan_failure_names_step_and_powers_off() {
         |_| (),
     );
     assert_eq!(err.step, "scan");
+    assert_eq!(err.rf18, Some(RF18));
+}
+
+/// A failure of `step` with `error` after RF 0x18 was read, so it carries
+/// [`chip`]'s [`RF18`].
+fn after_rf18(step: &'static str, error: AxError) -> BringUpError {
+    BringUpError {
+        rf18: Some(RF18),
+        ..BringUpError::new(step, error)
+    }
 }
 
 /// A full bring-up of [`chip_hearing`] with BOTH acks and `script`,
@@ -891,6 +960,7 @@ fn fails_hearing(
     let m = c.m.clone();
     let err = failed(run_on(&mut c.io, &m, NO_LTR));
     assert!(SCAN_STEPS.contains(&err.step), "{err}");
+    assert_eq!(err.rf18, Some(RF18), "{err}");
     // The scan ran after the whole calibration.
     assert!(c.io.trace.contains(&Op::W32(0x14978, 3)), "{err}");
     assert_radio_off_before_deinit(&c.io);
@@ -1224,6 +1294,9 @@ fn fails_traced(
             "{err}"
         );
     }
+    // RF 0x18 is kept exactly when it was read before the failure.
+    let read = CALIBRATION_STEPS.contains(&err.step) || SCAN_STEPS.contains(&err.step);
+    assert_eq!(err.rf18, read.then_some(RF18), "{err}");
     assert_ends_with_power_off(&c.io);
     (err, c.io)
 }
@@ -1611,6 +1684,7 @@ fn download_failure_names_the_first_attempt_when_it_differs() {
                 },
             },
             rf: None,
+            rf18: None,
         }
     );
     assert_eq!(
@@ -1659,6 +1733,7 @@ fn a_failed_pci_re_init_keeps_the_download_error_that_stopped_ch12() {
                 first: None,
             },
             rf: None,
+            rf18: None,
         }
     );
     assert_eq!(
@@ -1686,6 +1761,7 @@ fn a_ch12_stop_after_a_different_first_failure_names_both() {
             }),
         },
         rf: None,
+        rf18: None,
     };
     assert_eq!(
         err.to_string(),
@@ -1731,6 +1807,7 @@ fn power_on_failure_keeps_both_errors_and_ends_powered_off() {
                 error: AxError::AlreadyPowered,
             },
             rf: None,
+            rf18: None,
         }
     );
     assert_eq!(
@@ -2136,6 +2213,7 @@ fn phy_failure_names_step_and_powers_off() {
                 path: RfPath::B,
                 page: None
             }),
+            rf18: None,
         }
     );
     assert_eq!(
@@ -2195,6 +2273,7 @@ fn phy_failure_names_step_and_powers_off() {
                 path: RfPath::B,
                 page: Some(0)
             }),
+            rf18: None,
         }
     );
     assert!(
@@ -2435,7 +2514,7 @@ fn calibration_failure_names_step_and_powers_off() {
 
     // nctl init: the NCTL poll register cannot be read.
     let err = mac_init_fails(BOTH, NO_LTR, |io| io.fail_reads_of(0x18080));
-    assert_eq!(err, BringUpError::new("nctl init", READ_FAILED));
+    assert_eq!(err, after_rf18("nctl init", READ_FAILED));
 
     // rfk init: SWSI stays write-busy once the NCTL poll has run, so RCK's
     // first RF access fails.
@@ -2466,7 +2545,7 @@ fn calibration_failure_names_step_and_powers_off() {
     let (err, io) = fails_traced(efuse_with_mac(), BOTH, NO_LTR, |io| {
         io.fail_reads_of(0x1C0C8)
     });
-    assert_eq!(err, BringUpError::new("rfk init", READ_FAILED));
+    assert_eq!(err, after_rf18("rfk init", READ_FAILED));
     let t = &io.trace;
     let start = t
         .iter()
@@ -2504,7 +2583,7 @@ fn calibration_failure_names_step_and_powers_off() {
 
     // dm tail: the TX power rate control word cannot be read.
     let err = mac_init_fails(BOTH, NO_LTR, |io| io.fail_reads_of(0xD200));
-    assert_eq!(err, BringUpError::new("dm tail", READ_FAILED));
+    assert_eq!(err, after_rf18("dm tail", READ_FAILED));
 }
 
 #[test]
