@@ -73,6 +73,7 @@ pub mod power;
 pub mod ppdu;
 pub mod radio;
 pub mod receive;
+pub mod regd;
 pub mod rf;
 pub mod rfk;
 pub mod rx;

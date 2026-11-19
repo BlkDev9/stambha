@@ -2284,6 +2284,16 @@
   },
   {
     "package": "stela-driver-net",
+    "test": "real_8852c_fw_2_regd_map_selects_as_linux_does",
+    "source": "crates/stela-driver-net/src/wifi/realtek/ax/regd/tests.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_REALTEK_WIFI_IMAGES"
+    ],
+    "reason": "requires STELA_REALTEK_WIFI_IMAGES from pinned linux-firmware; the REGD element of SHA-256 cd9a0310c638c4d1cdb483aebbe5fbd6a62583404f0d94b8fa67f2d8a9611886 gives US FCC, DE and IN ETSI, GB UK (ETSI for TX power), and an unknown country or none WW"
+  },
+  {
+    "package": "stela-driver-net",
     "test": "real_8852c_fw_2_tables_select_as_linux_does",
     "source": "crates/stela-driver-net/src/wifi/realtek/ax/phy_table/tests.rs",
     "kind": "oracle",
