@@ -449,7 +449,8 @@ impl<'r> Session<'r> {
     }
 
     /// One `Rxq::poll`: every filled RXQ entry goes through the receiver,
-    /// then the ledger, then `sink` (spec S9.1). A malformed buffer ends the
+    /// then the ledger, then `sink` (spec S9.1). Returns the number of RXQ
+    /// entries consumed, 0 when RXQ held none. A malformed buffer ends the
     /// drain with its error after the buffers before it were handled.
     ///
     /// # Safety
@@ -459,7 +460,7 @@ impl<'r> Session<'r> {
         &mut self,
         io: &mut I,
         sink: &mut dyn FnMut(Event<'_>),
-    ) -> Result<(), AxError> {
+    ) -> Result<usize, AxError> {
         let Self {
             rings,
             rx,
@@ -476,7 +477,7 @@ impl<'r> Session<'r> {
             })
         };
         *rxq_hw = rxq.hardware_index();
-        polled.map(|_| ())
+        polled
     }
 
     /// Drain RXQ every `ACK_POLL_US` until `done` accepts an event handed to

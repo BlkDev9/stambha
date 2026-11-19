@@ -40,7 +40,10 @@
 //! and recording any other refusal. [`vif`] is `rtw89_mac_vif_init` for one
 //! unassociated station on port 0 and macid 0: the port registers, the DMAC
 //! and CMAC tables, then the macid unpause, role, join, address CAM and CMAC
-//! table H2Cs through the same session. [`bring_up`] calls none of these yet:
+//! table H2Cs through the same session. [`scan`] runs these in Linux's order
+//! (core start, channel 1, vif init), then the firmware's passive scan
+//! offload over 38 channels, and keeps the beacons and probe responses it
+//! hears as networks by BSSID. [`bring_up`] calls none of these yet:
 //! the bring-up grants no channel, no IQK, DPK, TSSI or tracking, no station
 //! and no interrupts; the chip is powered off at the end, and nothing past
 //! `rtw89_phy_dm_init` runs.
@@ -70,6 +73,7 @@ pub mod receive;
 pub mod rf;
 pub mod rfk;
 pub mod rx;
+pub mod scan;
 pub mod sys;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -88,3 +92,4 @@ pub use phy::{PhyReport, RfkReport};
 // `pci::pre_init` and `dmac::pre_init` are reached by their module only.
 pub use pci::{Ch12, Rings, encode_txbd};
 pub use power::{power_on, xtal_si_read, xtal_si_write};
+pub use scan::{Listed, ScanReport};

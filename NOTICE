@@ -718,6 +718,7 @@ crates/stela-driver-net/src/wifi/realtek/ax/: Realtek RTL8852C (rtw89) native
     drivers/net/wireless/realtek/rtw89/fw.h,
     drivers/net/wireless/realtek/rtw89/mac.c,
     drivers/net/wireless/realtek/rtw89/mac.h,
+    drivers/net/wireless/realtek/rtw89/mac80211.c,
     drivers/net/wireless/realtek/rtw89/pci.c,
     drivers/net/wireless/realtek/rtw89/pci.h,
     drivers/net/wireless/realtek/rtw89/phy.c,

@@ -8,8 +8,10 @@
 //!   nothing at all for one [`Firmware::silent`] names). ADD_SCANOFLD_CH
 //!   stores the channel list, the address CAM the local MAC, and SCANOFLD
 //!   start queues the scan: per listed channel ENTER_CH, that channel's
-//!   scripted frames each followed by its PPDU_STAT, LEAVE_CH; then
-//!   END_SCAN.
+//!   scripted frames each followed by its PPDU_STAT, its raw
+//!   [`Firmware::buffers`] batches, LEAVE_CH; then END_SCAN and the
+//!   [`Firmware::after_end`] batches. [`Firmware::after`] adds a batch after
+//!   one H2C's acks.
 //! - RXQ's index (0x1218): each read releases at most one queued batch (an
 //!   H2C's acks, one scan report, or one frame with its status) into the
 //!   free entries, as many buffers as fit while one entry stays empty, and
@@ -124,6 +126,22 @@ pub fn frame_with_status(
     ppdu_cnt: u8,
     rssi: u8,
 ) -> [Vec<u8>; 2] {
+    [
+        mgnt_frame(fc0, da, bssid, ssid, ds, ppdu_cnt),
+        ppdu_status(ppdu_cnt, rssi, 0),
+    ]
+}
+
+/// The WIFI buffer of [`frame_with_status`]: a long MGNT descriptor at
+/// `ppdu_cnt` and the frame with its FCS.
+pub fn mgnt_frame(
+    fc0: u8,
+    da: [u8; 6],
+    bssid: [u8; 6],
+    ssid: &[u8],
+    ds: Option<u8>,
+    ppdu_cnt: u8,
+) -> Vec<u8> {
     let mut f = vec![fc0, 0, 0, 0];
     f.extend_from_slice(&da);
     f.extend_from_slice(&bssid);
@@ -139,18 +157,21 @@ pub fn frame_with_status(
         f.extend_from_slice(&[3, 1, ch]);
     }
     f.extend_from_slice(&FCS);
-    // The PPDU status header: VALID, LEN 5 (40 bytes), IE map 12; RSSI A
-    // and B; then a 32-byte IE01 with no channel index.
+    rx_buffer(0, true, 0, ppdu_cnt, &f)
+}
+
+/// A PPDU status buffer at `ppdu_cnt`: the header (VALID, LEN 5 so 40
+/// bytes, IE map 12), `rssi` on paths A and B, then a 32-byte IE01 whose
+/// channel index (w0 [23:16]) is `chan_idx`, 0 meaning none.
+pub fn ppdu_status(ppdu_cnt: u8, rssi: u8, chan_idx: u8) -> Vec<u8> {
     let mut p = Vec::new();
     p.extend_from_slice(&0x8000_058Cu32.to_le_bytes());
     p.extend_from_slice(&(u32::from(rssi) << 8 | u32::from(rssi)).to_le_bytes());
     let mut ie01 = vec![0u8; 32];
     ie01[0] = 1;
+    ie01[2] = chan_idx;
     p.extend_from_slice(&ie01);
-    [
-        rx_buffer(0, true, 0, ppdu_cnt, &f),
-        rx_buffer(1, false, 0, ppdu_cnt, &p),
-    ]
+    rx_buffer(1, false, 0, ppdu_cnt, &p)
 }
 
 #[derive(Clone)]
@@ -174,6 +195,12 @@ pub struct Firmware {
     no_end: bool,
     end_on_stop: bool,
     burst: usize,
+    /// Batches released after the acks of H2C cat 1 / class / func.
+    after: Vec<(u8, u8, Vec<Vec<u8>>)>,
+    /// Raw batches released after a listed channel's ENTER_CH.
+    raw: Vec<(usize, Vec<Vec<u8>>)>,
+    /// Batches released after END_SCAN.
+    after_end: Vec<Vec<Vec<u8>>>,
 }
 
 impl Firmware {
@@ -189,7 +216,29 @@ impl Firmware {
             no_end: false,
             end_on_stop: false,
             burst: 0,
+            after: Vec::new(),
+            raw: Vec::new(),
+            after_end: Vec::new(),
         }
+    }
+
+    /// Each time H2C cat 1 / `class` / `func` is answered, `batch` follows
+    /// its acks as one more batch.
+    pub fn after(&mut self, class: u8, func: u8, batch: Vec<Vec<u8>>) {
+        self.after.push((class, func, batch));
+    }
+
+    /// `batch`, raw RXQ buffers, arrives as one batch on listed channel
+    /// `channel_index`, after its scripted frames and before its LEAVE_CH.
+    /// The buffers carry their own PPDU counts.
+    pub fn buffers(&mut self, channel_index: usize, batch: Vec<Vec<u8>>) {
+        self.raw.push((channel_index, batch));
+    }
+
+    /// `batch` arrives as one batch after END_SCAN, whether the scan or a
+    /// stop ended it.
+    pub fn after_end(&mut self, batch: Vec<Vec<u8>>) {
+        self.after_end.push(batch);
     }
 
     /// DONE_ACKs for H2C cat 1 / `class` / `func` return `ret`.
@@ -351,6 +400,9 @@ impl State {
         if !acks.is_empty() {
             self.batches.push_back(acks);
         }
+        for (_, _, batch) in self.fw.after.iter().filter(|a| (a.0, a.1) == (class, func)) {
+            self.batches.push_back(batch.clone());
+        }
         match (class, func) {
             (CL_ADDR_CAM, 0) => self.local.copy_from_slice(&payload[16..22]),
             (CL_FW_OFLD, FUNC_ADD_SCANOFLD_CH) => {
@@ -368,9 +420,7 @@ impl State {
                 if (w0 >> 20) & 0x3 != 0 {
                     self.scan();
                 } else if self.fw.end_on_stop {
-                    let status = self.fw.end_status;
-                    self.batches
-                        .push_back(vec![scanofld(END_SCAN, status, 0, 0, 0)]);
+                    self.end_scan();
                 }
             }
             _ => {}
@@ -411,12 +461,21 @@ impl State {
                 let pair = frame_with_status(f.fc0, da, f.bssid, &f.ssid, ds, cnt, f.rssi);
                 self.batches.push_back(pair.to_vec());
             }
+            for (_, batch) in self.fw.raw.iter().filter(|r| r.0 == i) {
+                self.batches.push_back(batch.clone());
+            }
             self.batches
                 .push_back(vec![scanofld(LEAVE_CH, 0, band, ch, period)]);
         }
         if !self.fw.no_end {
-            self.batches
-                .push_back(vec![scanofld(END_SCAN, self.fw.end_status, 0, 0, 0)]);
+            self.end_scan();
         }
+    }
+
+    /// END_SCAN with the scripted status, then the after-end batches.
+    fn end_scan(&mut self) {
+        self.batches
+            .push_back(vec![scanofld(END_SCAN, self.fw.end_status, 0, 0, 0)]);
+        self.batches.extend(self.fw.after_end.iter().cloned());
     }
 }
