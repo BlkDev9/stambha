@@ -13,9 +13,9 @@ const H2C_HEADER_LEN: usize = 8;
 const H2C_HDR_REC_ACK: u32 = 1 << 14;
 const H2C_HDR_DONE_ACK: u32 = 1 << 15;
 const H2C_HDR_TOTAL_LEN: u32 = 0x3FFF;
-const H2C_CAT_MAC: u8 = 1;
-const H2C_CL_MAC_FW_OFLD: u8 = 9;
-const H2C_FUNC_OFLD_CFG: u8 = 0x14;
+pub(super) const H2C_CAT_MAC: u8 = 1;
+pub(super) const H2C_CL_MAC_FW_OFLD: u8 = 9;
+pub(super) const H2C_FUNC_OFLD_CFG: u8 = 0x14;
 
 /// `fw.c:5321`: the OFLD_CFG payload.
 pub const OFLD_CFG: [u8; 8] = [0x09, 0, 0, 0, 0x5E, 0, 0, 0];

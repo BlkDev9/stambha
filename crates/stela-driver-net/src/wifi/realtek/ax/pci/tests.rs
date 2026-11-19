@@ -8,10 +8,10 @@ use std::sync::Mutex;
 // The beacon DMA model hands out IOVAs 0x1000_0000 + 0x10000 * n in mapping
 // order, and `Rings::install` maps the TX BD pool, the RX BD pool, the 16 RX
 // buffers (RXQ then RPQ) and the CH12 slots in that order.
-const TX_POOL: u32 = 0x1001_0000;
+pub(crate) const TX_POOL: u32 = 0x1001_0000;
 const RX_POOL: u32 = 0x1002_0000;
 const RX_BUFFER0: u32 = 0x1003_0000;
-const FWCMD: u32 = 0x1013_0000;
+pub(crate) const FWCMD: u32 = 0x1013_0000;
 const MAPPINGS: usize = 19;
 
 fn install(m: &Arc<Mutex<Model>>) -> Rings {
@@ -45,7 +45,7 @@ fn settled() -> RegisterModel {
 }
 
 /// The CH12 DMA engine consumes every kicked entry at once.
-fn reclaim_at_once(io: &mut RegisterModel) {
+pub(crate) fn reclaim_at_once(io: &mut RegisterModel) {
     io.on_read(
         0x1080,
         Box::new(|m: &mut RegisterModel| {
@@ -56,7 +56,7 @@ fn reclaim_at_once(io: &mut RegisterModel) {
 }
 
 /// What the device would read at `iova`, through the model's mapping.
-fn device_read(m: &Model, iova: u64, len: usize) -> Vec<u8> {
+pub(crate) fn device_read(m: &Model, iova: u64, len: usize) -> Vec<u8> {
     let (base, (pages, cpu)) = m.mappings.range(..=iova).next_back().unwrap();
     assert!(iova + len as u64 <= base + pages.bytes() as u64);
     let at = cpu + (iova - base) as usize;
@@ -67,7 +67,7 @@ fn device_read(m: &Model, iova: u64, len: usize) -> Vec<u8> {
 
 /// Put `bytes` at `iova` as the device would write them, through the
 /// model's mapping: the mirror of `device_read`.
-fn device_write(m: &Model, iova: u64, bytes: &[u8]) {
+pub(crate) fn device_write(m: &Model, iova: u64, bytes: &[u8]) {
     let (base, (pages, cpu)) = m.mappings.range(..=iova).next_back().unwrap();
     assert!(iova + bytes.len() as u64 <= base + pages.bytes() as u64);
     let at = cpu + (iova - base) as usize;
@@ -77,7 +77,7 @@ fn device_write(m: &Model, iova: u64, bytes: &[u8]) {
     unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len()) };
 }
 
-fn running() -> (Arc<Mutex<Model>>, Rings, RegisterModel) {
+pub(crate) fn running() -> (Arc<Mutex<Model>>, Rings, RegisterModel) {
     let m = Arc::new(Mutex::new(Model::default()));
     let rings = install(&m);
     let mut io = settled();
@@ -624,7 +624,7 @@ fn hardware_index(io: &mut RegisterModel, hw: u32) {
 }
 
 /// RXQ entry `entry`'s buffer, as the device sees it.
-fn rxq_buffer(entry: usize) -> u64 {
+pub(crate) fn rxq_buffer(entry: usize) -> u64 {
     u64::from(RX_BUFFER0) + 0x10000 * entry as u64
 }
 

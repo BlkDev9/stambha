@@ -941,4 +941,4 @@ unsafe fn deliver(
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

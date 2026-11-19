@@ -11,6 +11,7 @@
 pub mod bringup;
 pub mod c2h;
 pub mod cmac;
+pub mod command;
 pub mod dmac;
 pub mod efuse;
 pub mod fwdl;
