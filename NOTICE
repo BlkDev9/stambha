@@ -727,7 +727,8 @@ crates/stela-driver-net/src/wifi/realtek/ax/: Realtek RTL8852C (rtw89) native
     drivers/net/wireless/realtek/rtw89/rtw8852c_rfk_table.c,
     drivers/net/wireless/realtek/rtw89/rtw8852c_table.c,
     drivers/net/wireless/realtek/rtw89/rtw8852ce.c,
-    drivers/net/wireless/realtek/rtw89/txrx.h, include/linux/iopoll.h
+    drivers/net/wireless/realtek/rtw89/txrx.h,
+    drivers/net/wireless/realtek/rtw89/util.h, include/linux/iopoll.h
 crates/stela-driver-storage/src/: Genesys Logic GL9750 native SDHCI
     Linux cc9de5d4b5ab6459f5774946aa3195ad51236fa8; GPL-2.0-or-later
     drivers/mmc/host/sdhci-pci-gli.c, drivers/pci/setup-res.c

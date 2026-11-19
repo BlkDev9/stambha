@@ -622,12 +622,13 @@ unsafe fn acknowledge<I: AxIo + ?Sized>(
     };
     // rtw89_phy_dm_init (core.c:6697). Every failure here follows the coex
     // init, so the teardown undoes it.
-    let rfk = match phy::calibrate(io, tables, &started.efuse, started.cut) {
-        Ok(rfk) => rfk,
+    let (rfk, _offset_base) = match phy::calibrate(io, tables, &started.efuse, started.cut) {
+        Ok(done) => done,
         Err(error) => return (Err(BringUpError::new(error.step, error.error)), true),
     };
-    // The BB gain table is memory only on AX (bb.rs), and nothing ported
-    // reads it yet: the channel set-up does.
+    // The BB gain table is memory only on AX (bb.rs). It and the RPL bias
+    // are the channel set-up's (`channel::set_channel`), which the
+    // bring-up does not run yet.
     let running = Running {
         cut: started.cut,
         firmware: started.firmware,
