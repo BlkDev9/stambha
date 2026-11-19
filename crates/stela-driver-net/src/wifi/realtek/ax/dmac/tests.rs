@@ -147,3 +147,142 @@ fn dmac_dead_read_is_refused() {
     m.on_read(0x8400, Box::new(|_: &mut RegisterModel| 0xDEAD_BEEF));
     assert!(matches!(pre_init(&mut m), Err(AxError::Dma(_))));
 }
+
+#[test]
+fn dle_init_scc_matches_linux_sequence() {
+    let mut m = ready();
+    m.set32(0x8C08, 0xFFFF_FFFF);
+    m.set32(0x9008, 0);
+    m.set32(0x8400, 0x6000_0000 | 0x0480_0000);
+
+    dle_init(&mut m, &SCC, None).unwrap();
+
+    // mac.c:2274 with rtw8852c_dle_mem_pcie[RTW89_QTA_SCC]: wde_size19
+    // {64, 3328, 0}, ple_size19 {128, 1904, 16}, wde_qt18, ple_qt46/47.
+    let want = [
+        Op::W32(0x8400, 0x6000_0000),
+        Op::W32(0x8404, 0x0480_0000),
+        Op::W32(0x8C08, 0xED00_C0FC),
+        Op::W32(0x9008, 0x0770_1A01),
+        Op::W32(0x8C40, 0x0C9C_0C9C),
+        Op::W32(0x8C44, 0x003C_003C),
+        Op::W32(0x8C4C, 0),
+        Op::W32(0x8C50, 0x0028_0028),
+        Op::W32(0x9040, 0x020D_020D),
+        Op::W32(0x9044, 0),
+        Op::W32(0x9048, 0x0020_0010),
+        Op::W32(0x904C, 0x0014_0014),
+        Op::W32(0x9050, 0x040A_000D),
+        Op::W32(0x9054, 0x000D_000D),
+        Op::W32(0x9058, 0x04AF_00B2),
+        Op::W32(0x905C, 0),
+        Op::W32(0x9060, 0x041D_0020),
+        Op::W32(0x9064, 0x003E_003E),
+        Op::W32(0x9068, 0x00A0_0008),
+        Op::W32(0x906C, 0x040D_0010),
+        Op::W32(0x8400, 0x6480_0000),
+    ];
+    assert_eq!(m.writes(), want);
+}
+
+#[test]
+fn dle_init_scc_ready_timeout() {
+    let mut m = RegisterModel::new();
+    m.on_read(0x8D00, Box::new(|_: &mut RegisterModel| 3));
+    m.on_read(0x9100, Box::new(|_: &mut RegisterModel| 1));
+    m.set32(0x8400, 0x6000_0000);
+    assert_eq!(
+        dle_init(&mut m, &SCC, None),
+        Err(AxError::Timeout {
+            register: 0x9100,
+            mask: 0x3
+        })
+    );
+}
+
+#[test]
+fn preload_init_matches_linux_sequence() {
+    let mut m = RegisterModel::new();
+    preload_init(&mut m).unwrap();
+    // preload_init_set_ax(0), mac.c:2345: USEMAXSZ = 10 * 52 = 520, B0_PRELD_FEN,
+    // NXT_TXENDWIN = 1, NXT_RSVMINSZ = 52.
+    assert_eq!(
+        m.writes(),
+        [
+            Op::W32(0x9F48, 0x0208_0000),
+            Op::W32(0x9F48, 0x8208_0000),
+            Op::W32(0x9F4C, 0x0100),
+            Op::W32(0x9F4C, 0x0134),
+        ]
+    );
+}
+
+fn hfc_model() -> RegisterModel {
+    let mut m = RegisterModel::new();
+    m.set32(0x8400, 0x6000_0000);
+    m.set32(0x1700, 0x0000_0C39);
+    m.set32(0x179C, 0x0C9C);
+    m.set32(0x1798, 0);
+    m
+}
+
+#[test]
+fn hfc_init_matches_linux_sequence() {
+    let mut m = hfc_model();
+    hfc_init(&mut m).unwrap();
+
+    // mac.c:1194 with en = h2c_en = true; rtw8852c_hfc_param_ini_pcie[SCC].
+    let mut want = Vec::new();
+    want.push(Op::W32(0x1700, 0x0000_0C30));
+    for ch in 0..12u32 {
+        let grp1 = matches!(ch, 4..=7 | 10 | 11);
+        let val = if grp1 { 0x864E_000D } else { 0x064E_000D };
+        want.push(Op::W32(0x1710 + 4 * ch, val));
+    }
+    want.extend([
+        Op::W32(0x1790, 0x064E_064E),
+        Op::W32(0x17A4, 0),
+        Op::W32(0x1704, 0x0028_0002),
+        Op::W32(0x1794, 0x0C9C),
+        Op::W32(0x17A0, 0),
+        Op::W32(0x1700, 0x0000_0010),
+        Op::W32(0x1700, 0x0000_0019),
+        Op::Delay(10),
+    ]);
+    assert_eq!(m.writes(), want);
+
+    // hfc_get_mix_info_ax, mac.c:1053, is the last thing that runs.
+    let reads: Vec<u32> = m
+        .trace
+        .iter()
+        .filter_map(|op| match op {
+            Op::R32(r) => Some(*r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reads[reads.len() - 10..],
+        [
+            0x1798, 0x178C, 0x179C, 0x17A8, 0x1700, 0x1704, 0x1794, 0x17A0, 0x17A4, 0x1790
+        ]
+    );
+}
+
+#[test]
+fn hfc_init_checks_dmac_before_each_step() {
+    let mut m = hfc_model();
+    hfc_init(&mut m).unwrap();
+    // 1 start + 12 hfc_ch_ctrl + hfc_pub_ctrl + 12 hfc_upd_ch_info + mix info.
+    let n = m.trace.iter().filter(|op| **op == Op::R32(0x8400)).count();
+    assert_eq!(n, 1 + 12 + 1 + 12 + 1);
+}
+
+#[test]
+fn hfc_init_refuses_inconsistent_public_pages() {
+    let mut m = hfc_model();
+    m.set32(0x179C, 0x0C9B);
+    assert_eq!(
+        hfc_init(&mut m),
+        Err(AxError::Mac("HCI flow control public pages do not add up"))
+    );
+}
