@@ -11,9 +11,12 @@
 //! is read from RXQ by polling. [`bring_up`] puts these in Linux's order
 //! before powering the chip off again. The PHY tables the firmware file
 //! carries are found ([`elements`]) and can be walked by RFE type and cut
-//! ([`phy_table`]), but nothing writes them yet. It grants no BB or RF
-//! register writes, no calibration, no station and no interrupts: the chip
-//! is powered off at the end, and nothing past that one H2C runs.
+//! ([`phy_table`]), and BB and RF registers can be reached ([`bb`], and
+//! [`rf`] through the direct window or SWSI), but nothing writes the tables
+//! yet. The bring-up writes no BB or RF register and grants no calibration,
+//! no station and no interrupts: the chip is powered off at the end, and
+//! nothing past that one H2C runs.
+pub mod bb;
 pub mod bringup;
 pub mod c2h;
 pub mod cmac;
@@ -27,6 +30,7 @@ pub mod io;
 pub mod pci;
 pub mod phy_table;
 pub mod power;
+pub mod rf;
 pub mod rx;
 pub mod sys;
 #[cfg(test)]
