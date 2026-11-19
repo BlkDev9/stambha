@@ -108,6 +108,9 @@ pub enum AxError {
     /// The firmware scan offload could not be built, started or finished;
     /// the message says why.
     Scan(&'static str),
+    /// The firmware file's TX power or regulatory elements are missing or
+    /// unusable; the message says which.
+    TxPower(&'static str),
 }
 
 impl fmt::Display for AxError {
@@ -165,6 +168,7 @@ impl fmt::Display for AxError {
                  {ret:#04x})"
             ),
             Self::Scan(what) => write!(f, "scan: {what}"),
+            Self::TxPower(what) => write!(f, "tx power: {what}"),
             Self::FirmwareStatus { what, fw_ctrl } => write!(f, "{what} (0x01E0={fw_ctrl:#010x})"),
             Self::SecureBootUnsupported => f.write_str("secure-boot firmware is unsupported"),
             Self::AlreadyPowered => f.write_str("MAC has already powered on"),

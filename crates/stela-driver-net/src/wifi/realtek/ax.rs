@@ -81,6 +81,7 @@ pub mod sys;
 #[cfg(test)]
 pub(crate) mod tests;
 pub mod trx;
+pub mod txpwr_tables;
 pub mod vif;
 
 pub use bringup::{BringUpError, Earlier, Host, Rf18, Rf18Line, Running, bring_up, quiesce};
