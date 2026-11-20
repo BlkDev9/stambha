@@ -54,6 +54,7 @@
 //! scan's boot channel, no IQK, DPK, TSSI or tracking, no association, no
 //! transmission request and no interrupts; the chip is powered off at the
 //! end.
+pub mod assoc;
 pub mod bb;
 pub mod bringup;
 pub mod c2h;

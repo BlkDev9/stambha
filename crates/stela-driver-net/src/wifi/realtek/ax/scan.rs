@@ -88,6 +88,7 @@ use super::bb;
 use super::c2h::{C2h, SCAN_END, SCAN_ENTER_CH, SCAN_STATUS_SUCCESS, ScanOfld};
 use super::chan::{Chan, HwBand, frequency};
 use super::command::{CommandError, Refused, Session};
+use super::dm::Dig;
 use super::h2c::{H2C_FUNC_ADD_SCANOFLD_CH, H2C_FUNC_SCANOFLD, SCAN_LIST_LIMIT, ScanChannel};
 use super::io::{AxError, AxIo, clear32, set32};
 use super::live::Live;
@@ -441,12 +442,6 @@ const B_AX_RX_FLTR_CFG_MASK: u32 = !0x003F_0000;
 /// (`fw.c:10423-10425`).
 const DEFAULT_AX_RX_FLTR: u32 = 0x0300_44BE;
 const SCAN_RX_FLTR: u32 = DEFAULT_AX_RX_FLTR & !(1 << 7 | 1 << 2 | 1 << 1);
-/// 8852C's `dig_regs` (`rtw8852c.c:228-231`): `R_SEG0R_PD` with
-/// `B_SEG0R_PD_LOWER_BOUND_MSK` and `B_SEG0R_PD_SPATIAL_REUSE_EN_MSK`
-/// (`reg.h:9685-9696`).
-const R_SEG0R_PD: u32 = 0x481C;
-const B_SEG0R_PD_LOWER_BOUND_MSK: u32 = 0x0000_07C0;
-const B_SEG0R_PD_SPATIAL_REUSE_EN_MSK: u32 = 1 << 29;
 /// `RTW89_C2H_SCAN_DONE_ACK_RETURN` (`fw.h:3962`): the bits of
 /// ADD_SCANOFLD_CH's DONE_ACK return that fail it (`mac.c:5537-5539`).
 const SCAN_DONE_ACK_RETURN: u8 = 0x3F;
@@ -719,23 +714,6 @@ fn set_rx_fltr<I: AxIo + ?Sized>(io: &mut I, rx_fltr: u32) -> Result<(), AxError
     )
 }
 
-/// `rtw89_phy_dig_ctrl(pause = true)` on PHY 0, from `pause_dig` false: PD
-/// lower bound 0 (`disabled_dm_bitmap` is 0), spatial reuse off.
-fn dig_suspend<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
-    bb::field32(io, R_SEG0R_PD, B_SEG0R_PD_LOWER_BOUND_MSK, 0)?;
-    bb::field32(io, R_SEG0R_PD, B_SEG0R_PD_SPATIAL_REUSE_EN_MSK, 0)
-}
-
-/// `rtw89_phy_dig_ctrl(pause = false, restore = true)` on PHY 0
-/// (`phy.c:7850-7885`), from the scan's suspend: PD lower bound `bak_dig`,
-/// which only DIG tracking moves off the 0 `rtw89_phy_dig_reset` left
-/// (`phy.c:7651-7676`, `:7707-7714`; no tracking runs), and spatial reuse
-/// `total_sta_assoc > 0`, off, as no station is associated.
-fn dig_resume<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
-    bb::field32(io, R_SEG0R_PD, B_SEG0R_PD_LOWER_BOUND_MSK, 0)?;
-    bb::field32(io, R_SEG0R_PD, B_SEG0R_PD_SPATIAL_REUSE_EN_MSK, 0)
-}
-
 /// Whether `event` is END_SCAN.
 fn is_end(event: &Event<'_>) -> bool {
     matches!(event, Event::C2h(C2h::ScanOfld(r)) if r.reason == SCAN_END)
@@ -756,8 +734,8 @@ pub(super) fn ended(status: u8) -> ScanEnd {
 /// interrupt mitigation off, EDCCA at its maximum (returning the levels it
 /// read) and the address CAM (`INFO_CHANGE`, which v0 does not carry, so the
 /// bytes are vif init's), whose send hands what it drains to `sink`; the
-/// scan's RX filter; and the DIG suspend. The first failure is returned and
-/// nothing after it runs.
+/// scan's RX filter; and the DIG suspend, which `dig` skips when a join left
+/// DIG suspended. The first failure is returned and nothing after it runs.
 ///
 /// # Safety
 /// As [`passive`].
@@ -765,6 +743,7 @@ pub(super) unsafe fn hw_scan_start<I: AxIo + ?Sized>(
     io: &mut I,
     session: &mut Session<'_>,
     mac: [u8; 6],
+    dig: &mut Dig,
     sink: &mut dyn FnMut(Event<'_>),
 ) -> Result<EdccaBak, AxError> {
     clear32(io, R_AX_PORT_CFG_P0, B_AX_TSF_UDT_EN)?;
@@ -774,7 +753,7 @@ pub(super) unsafe fn hw_scan_start<I: AxIo + ?Sized>(
     // SAFETY: the caller's contract is `send`'s, word for word.
     unsafe { session.send(io, packet, sink) }?;
     set_rx_fltr(io, SCAN_RX_FLTR)?;
-    dig_suspend(io)?;
+    dig.suspend(io)?;
     Ok(edcca)
 }
 
@@ -870,8 +849,9 @@ pub(super) unsafe fn tail<I: AxIo + ?Sized>(
 /// keeps every frame a station receives ([`Mode::Station`]); the address
 /// CAM at the next seq, whose send hands what it drains to `sink`; the
 /// EDCCA levels from `edcca`; TSF sync on (`rtw89_mac_port_cfg_rx_sync`,
-/// `mac.c:4674-4684`); DIG resumed. The first failure is returned and
-/// nothing after it runs.
+/// `mac.c:4674-4684`); DIG resumed through `dig` with spatial reuse off,
+/// as no station is associated (`total_sta_assoc` 0). The first failure is
+/// returned and nothing after it runs.
 ///
 /// # Safety
 /// As [`passive`].
@@ -880,6 +860,7 @@ pub(super) unsafe fn hw_scan_complete<I: AxIo + ?Sized>(
     session: &mut Session<'_>,
     mac: [u8; 6],
     edcca: &EdccaBak,
+    dig: &mut Dig,
     sink: &mut dyn FnMut(Event<'_>),
 ) -> Result<(), AxError> {
     set_rx_fltr(io, DEFAULT_AX_RX_FLTR)?;
@@ -891,7 +872,7 @@ pub(super) unsafe fn hw_scan_complete<I: AxIo + ?Sized>(
     unsafe { session.send(io, packet, sink) }?;
     restore_edcca(io, edcca)?;
     set32(io, R_AX_PORT_CFG_P0, B_AX_TSF_UDT_EN)?;
-    dig_resume(io)
+    dig.resume(io, false)
 }
 
 /// Step `"scan start"`: the gate, spec S8, `Scanner::begin`, then
@@ -904,12 +885,13 @@ unsafe fn start<I: AxIo + ?Sized>(
     io: &mut I,
     session: &mut Session<'_>,
     inputs: &ScanInputs,
+    dig: &mut Dig,
 ) -> Result<Scan, AxError> {
     check_firmware(inputs.firmware)?;
     let mut scanner = Scanner::new(Mac(inputs.mac)).map_err(refusal)?;
     let drop = &mut |_: Event<'_>| {};
     // SAFETY: the caller's contract is `hw_scan_start`'s, word for word.
-    let edcca = unsafe { hw_scan_start(io, session, inputs.mac, drop) }?;
+    let edcca = unsafe { hw_scan_start(io, session, inputs.mac, dig, drop) }?;
     // Frames still waiting from core start and vif init are no results.
     session.rx.flush(drop);
     let mut policy = PassiveList;
@@ -1061,12 +1043,14 @@ pub unsafe fn passive<I: AxIo + ?Sized>(
     session: &mut Session<'_>,
     inputs: &ScanInputs,
 ) -> Result<ScanReport, ScanError> {
+    // A chip after vif init: DIG is not suspended.
+    let mut dig = Dig::default();
     // SAFETY: the caller's contract is `passive_with_edcca`'s, word for word.
-    unsafe { passive_with_edcca(io, session, inputs) }.map(|(report, _)| report)
+    unsafe { passive_with_edcca(io, session, inputs, &mut dig) }.map(|(report, _)| report)
 }
 
-/// [`passive`], with the EDCCA levels its scan start raised, for the
-/// restore.
+/// [`passive`] with DIG's pause in `dig`, and the EDCCA levels its scan
+/// start raised, for the restore.
 ///
 /// # Safety
 /// As [`passive`].
@@ -1074,10 +1058,11 @@ unsafe fn passive_with_edcca<I: AxIo + ?Sized>(
     io: &mut I,
     session: &mut Session<'_>,
     inputs: &ScanInputs,
+    dig: &mut Dig,
 ) -> Result<(ScanReport, EdccaBak), ScanError> {
     let at = |step: &'static str| move |error: AxError| ScanError { step, error };
     // SAFETY: the caller's contract is `start`'s, word for word.
-    let scan = unsafe { start(io, session, inputs) }.map_err(at("scan start"))?;
+    let scan = unsafe { start(io, session, inputs, dig) }.map_err(at("scan start"))?;
     let edcca = scan.edcca;
     // SAFETY: as above, `finish`'s.
     let report = unsafe { finish(io, session, scan) }.map_err(at("scan"))?;
@@ -1088,8 +1073,9 @@ unsafe fn passive_with_edcca<I: AxIo + ?Sized>(
 /// as [`super::live::start`] ran steps 1-4), with the efuse MAC and the
 /// downloaded firmware's version, through the receiver M2c scanned with
 /// ([`Mode::Scan`]). Refused before any access, as
-/// [`super::live::Live::begin_scan`] is, on a chip a failure powered off or
-/// whose last scan has not been ended.
+/// [`super::live::Live::begin_scan`] is, on a chip a failure powered off,
+/// whose last scan has not been ended, or with a BSSID set
+/// ([`super::live::CONNECTED`]).
 ///
 /// Nothing of `rtw89_hw_scan_complete` follows: the chip is left on the
 /// firmware's last channel with the scan's RX filter, EDCCA, TSF sync and
@@ -1108,17 +1094,20 @@ pub unsafe fn run_once<I: AxIo>(live: &mut Live<I>) -> Result<ScanReport, ScanEr
         error,
     };
     live.idle().map_err(refused)?;
+    live.unconnected().map_err(refused)?;
     let running = live.running();
     let inputs = ScanInputs {
         mac: running.mac,
         firmware: running.firmware,
     };
+    let mut dig = live.dig();
     let ran = live.session(|io, session| {
         session.rx.set_mode(Mode::Scan);
         // SAFETY: the caller's contract is `start`'s, which `passive_with_edcca`'s
         // is, for the live chip's own window and rings.
-        unsafe { passive_with_edcca(io, session, &inputs) }
+        unsafe { passive_with_edcca(io, session, &inputs, &mut dig) }
     });
+    live.set_dig(dig);
     let (report, edcca) = ran.map_err(refused).and_then(|ran| ran)?;
     live.scanned(edcca, report.end);
     Ok(report)

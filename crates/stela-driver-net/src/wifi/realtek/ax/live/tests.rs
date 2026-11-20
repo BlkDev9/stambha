@@ -1,5 +1,6 @@
 extern crate std;
 use super::*;
+use crate::wifi::realtek::ax::assoc::{AddrCam, AssocInputs, RaPeer};
 use crate::wifi::realtek::ax::bringup::tests::{
     BOTH, Chip, DEINIT, GNT_WL_OFF, HOME, MAC, NO_LTR, REPORT, RF18, RFK,
     assert_dma_stopped_before_power_off, assert_ends_with_power_off,
@@ -23,6 +24,7 @@ use crate::wifi::realtek::ax::tests::model::{Op, READ_FAILED, RegisterModel};
 use crate::wifi::realtek::ax::txpwr_tables::ID_TXPWR_LMT_5G;
 use crate::wifi::realtek::beacon::tests::{Domain, Model, Source};
 use crate::wifi::realtek::firmware::{Ce, Rtw89};
+use crate::wifi::station::phy::AccessCategory;
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use std::sync::Mutex;
 
@@ -921,4 +923,273 @@ fn scan_calls_out_of_turn_are_refused() {
     unsafe { live.end_scan() }.unwrap();
     // SAFETY: as above.
     unsafe { live.begin_scan(&three()) }.unwrap();
+}
+
+/// The plan's test AP.
+const AP: [u8; 6] = [0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
+
+fn ac(aci: u8, aifsn: u8, ecw_min: u8, ecw_max: u8, txop_32us: u16) -> AccessCategory {
+    AccessCategory {
+        aci,
+        admission_control: false,
+        aifsn,
+        ecw_min,
+        ecw_max,
+        txop_32us,
+    }
+}
+
+/// An association with [`AP`] on the live chip's band: AID 1, beacon
+/// interval 100, DTIM period 1, every legacy rate, no HT, no WMM.
+fn association(live: &Live<RegisterModel>) -> AssocInputs {
+    let band = live.chan().band;
+    AssocInputs {
+        mac: live.mac(),
+        bssid: AP,
+        aid: 1,
+        band,
+        beacon_int: 100,
+        dtim: 1,
+        peer: RaPeer {
+            legacy: if band == HwBand::G2 { 0xFFF } else { 0xFF },
+            ht: None,
+            rssi: 0,
+        },
+        edca: None,
+        short_slot: true,
+    }
+}
+
+#[test]
+fn a_scan_is_refused_while_a_bssid_is_set() {
+    let (mut live, _m) = live_hearing(&|_| {});
+    // SAFETY: as in `start_on`.
+    unsafe { live.set_bssid(AP) }.unwrap();
+    assert_eq!(live.bssid(), Some(AP));
+    let before = live.io().trace.len();
+    // rtw89_is_any_vif_connected_or_connecting (fw.c:10514-10529): a BSSID
+    // set means connected or connecting, whose scan this chip does not
+    // port; the restore's address CAM would also clear the BSSID entry.
+    // SAFETY: as above.
+    assert_eq!(unsafe { live.begin_scan(&three()) }, Err(CONNECTED));
+    // SAFETY: as above.
+    let scanned = unsafe { run_once(&mut live) };
+    assert_eq!(
+        scanned,
+        Err(ScanError {
+            step: "scan start",
+            error: CONNECTED
+        })
+    );
+    assert_eq!(live.io().trace.len(), before);
+    assert!(!live.scanning());
+    let a = association(&live);
+    // SAFETY: as above.
+    unsafe { live.associate(&a) }.unwrap();
+    // SAFETY: as above.
+    assert_eq!(unsafe { live.begin_scan(&three()) }, Err(CONNECTED));
+    // Once the station has left, scans run again.
+    // SAFETY: as above.
+    unsafe { live.leave() }.unwrap();
+    assert_eq!(live.bssid(), None);
+    // SAFETY: as above.
+    unsafe { live.begin_scan(&three()) }.unwrap();
+}
+
+#[test]
+fn association_steps_are_refused_while_a_scan_runs() {
+    let (mut live, _m) = live_hearing(&|_| {});
+    // SAFETY: as in `start_on`.
+    unsafe { live.begin_scan(&three()) }.unwrap();
+    let before = live.io().trace.len();
+    let h2c = live.h2c();
+    // Each would drain RXQ outside the scan's tracking, losing END_SCAN.
+    // SAFETY: as above.
+    assert_eq!(unsafe { live.set_bssid(AP) }, Err(SCAN_NOT_ENDED));
+    let a = association(&live);
+    // SAFETY: as above.
+    assert_eq!(unsafe { live.associate(&a) }, Err(SCAN_NOT_ENDED));
+    // SAFETY: as above.
+    assert_eq!(unsafe { live.leave() }, Err(SCAN_NOT_ENDED));
+    assert_eq!(live.io().trace.len(), before);
+    assert_eq!(live.h2c(), h2c);
+    assert_eq!(live.bssid(), None);
+    // The scan still ends at its END_SCAN.
+    drain_until_ended(&mut live);
+    assert_eq!(live.scan_state(), Some(ScanEnd::Ok));
+    // SAFETY: as above.
+    unsafe { live.end_scan() }.unwrap();
+    // SAFETY: as above.
+    unsafe { live.set_bssid(AP) }.unwrap();
+}
+
+#[test]
+fn associate_needs_its_bssid_band_and_address() {
+    let (mut live, _m) = live_hearing(&|_| {});
+    let a = association(&live);
+    let before = live.io().trace.len();
+    let refused =
+        |got: Result<(), AxError>| assert!(matches!(got, Err(AxError::Mac(_))), "{got:?}");
+    // No BSSID set yet, and a zero BSSID is no BSSID.
+    // SAFETY: as in `start_on`.
+    refused(unsafe { live.associate(&a) });
+    // SAFETY: as above.
+    refused(unsafe { live.set_bssid([0; 6]) });
+    assert_eq!(live.io().trace.len(), before);
+    // SAFETY: as above.
+    unsafe { live.set_bssid([0x02, 0x03, 0x04, 0x05, 0x06, 0x08]) }.unwrap();
+    let joined = live.io().trace.len();
+    // Another BSSID, another band than the one tuned, another address.
+    // SAFETY: as above.
+    refused(unsafe { live.associate(&a) });
+    // SAFETY: as above.
+    unsafe { live.set_bssid(AP) }.unwrap();
+    let joined_ap = live.io().trace.len();
+    assert!(joined_ap > joined);
+    let other_band = AssocInputs {
+        band: HwBand::G5,
+        ..a
+    };
+    // SAFETY: as above.
+    refused(unsafe { live.associate(&other_band) });
+    let other_mac = AssocInputs {
+        mac: [0x02, 0, 0, 0, 0, 1],
+        ..a
+    };
+    // SAFETY: as above.
+    refused(unsafe { live.associate(&other_mac) });
+    assert_eq!(live.io().trace.len(), joined_ap);
+    assert!(!live.associated());
+    // SAFETY: as above.
+    unsafe { live.associate(&a) }.unwrap();
+    assert!(live.associated());
+    let associated = live.io().trace.len();
+    // Associated: no second association, and no new BSSID until it leaves.
+    // SAFETY: as above.
+    refused(unsafe { live.associate(&a) });
+    // SAFETY: as above.
+    refused(unsafe { live.set_bssid(AP) });
+    assert_eq!(live.io().trace.len(), associated);
+}
+
+#[test]
+fn a_live_chip_joins_associates_and_leaves() {
+    let (mut live, m) = live_hearing(&|fw| {
+        // A frame from the AP right after the beacon filter's acks.
+        fw.after(9, 0x1E, vec![mgnt_frame(0x08, MAC, AP, b"m1", None, 3)]);
+    });
+    // SAFETY: as in `start_on`.
+    unsafe { live.tune(&g5(36)) }.unwrap();
+    // Seq 17: the BSSID's address CAM.
+    // SAFETY: as above.
+    unsafe { live.set_bssid(AP) }.unwrap();
+    let pre_auth = H2c::at(17)
+        .addr_cam_with(&AddrCam::with_bssid(MAC, AP), 0, 0)
+        .1;
+    assert_eq!(h2c_bytes(&m, 6, 0, 17)[24..], pre_auth[24..]);
+    let wmm = [
+        ac(0, 3, 4, 10, 0),
+        ac(1, 7, 4, 10, 0),
+        ac(2, 2, 3, 4, 94),
+        ac(3, 2, 2, 3, 47),
+    ];
+    let a = AssocInputs {
+        edca: Some(wmm),
+        ..association(&live)
+    };
+    // SAFETY: as above.
+    unsafe { live.associate(&a) }.unwrap();
+    assert!(live.associated());
+    // Seq 18-30: four EDCA, the CMAC table, join, CAM, RA, the beacon filter
+    // and four EDCA again (the 5 GHz short slot).
+    assert_eq!(live.h2c(), H2c::at(31));
+    let connected = H2c::at(24)
+        .addr_cam_with(&AddrCam::connected(MAC, AP, 1), 0, 0)
+        .1;
+    assert_eq!(h2c_bytes(&m, 6, 0, 24)[24..], connected[24..]);
+    // The test image is 0.27.66.1: BEACON_FILTER but not
+    // BEACON_LOSS_COUNT_V1, so the loss count is capped at 15.
+    assert_eq!(live.running().firmware, (0, 27, 66, 1));
+    assert_eq!(
+        h2c_bytes(&m, 9, 0x1E, 26)[24..28],
+        0x0028_4F07u32.to_le_bytes()
+    );
+    // The frame drained meanwhile comes first in the next drain.
+    let mut frames = Vec::new();
+    // SAFETY: as above.
+    unsafe {
+        live.drain(&mut |e| {
+            if let Event::Frame(f) = e {
+                frames.push(f);
+            }
+        })
+    }
+    .unwrap();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].mpdu[16..22], AP);
+    // SAFETY: as above.
+    unsafe { live.leave() }.unwrap();
+    assert!(!live.associated());
+    assert_eq!(live.bssid(), None);
+    // Seq 31-43: the beacon filter off, the CMAC table, join, the CAM
+    // without the link, the CAM without the BSSID, eight EDCA.
+    assert_eq!(live.h2c(), H2c::at(44));
+    assert_eq!(
+        h2c_bytes(&m, 9, 0x1E, 31)[24..28],
+        0x0028_4F00u32.to_le_bytes()
+    );
+    let cleared = H2c::at(35).addr_cam(MAC, 0, 0).1;
+    assert_eq!(h2c_bytes(&m, 6, 0, 35)[24..], cleared[24..]);
+    // Leaving with nothing set does nothing.
+    let left = live.io().trace.len();
+    // SAFETY: as above.
+    unsafe { live.leave() }.unwrap();
+    assert_eq!(live.io().trace.len(), left);
+}
+
+#[test]
+fn a_scan_after_a_failed_join_finds_dig_paused() {
+    let (mut live, _m) = live_hearing(&|_| {});
+    let dig_writes = |t: &[Op]| {
+        t.iter()
+            .filter(|o| matches!(o, Op::W32(0x1481C, _)))
+            .count()
+    };
+    let before = live.io().trace.len();
+    // SAFETY: as in `start_on`.
+    unsafe { live.set_bssid(AP) }.unwrap();
+    assert_eq!(dig_writes(&live.io().trace[before..]), 2);
+    // The join fails: the BSSID is cleared, and DIG stays suspended, as
+    // Linux resumes it only at association (core.c:5974) or after a scan.
+    // SAFETY: as above.
+    unsafe { live.leave() }.unwrap();
+    let scan = live.io().trace.len();
+    // SAFETY: as above.
+    unsafe { live.begin_scan(&three()) }.unwrap();
+    // The scan's suspend finds DIG paused (phy.c:7859).
+    assert_eq!(dig_writes(&live.io().trace[scan..]), 0);
+    drain_until_ended(&mut live);
+    let ended = live.io().trace.len();
+    // SAFETY: as above.
+    unsafe { live.end_scan() }.unwrap();
+    assert_eq!(dig_writes(&live.io().trace[ended..]), 2);
+    // Resumed: the next join suspends it again.
+    let join = live.io().trace.len();
+    // SAFETY: as above.
+    unsafe { live.set_bssid(AP) }.unwrap();
+    assert_eq!(dig_writes(&live.io().trace[join..]), 2);
+}
+
+#[test]
+fn a_failed_association_step_powers_off() {
+    let (mut live, _m) = live_hearing(&|_| {});
+    // SAFETY: as in `start_on`.
+    unsafe { live.set_bssid(AP) }.unwrap();
+    // DIG's register cannot be read when association resumes it.
+    live.io_mut().fail_reads_of(0x1481C);
+    let a = association(&live);
+    // SAFETY: as above.
+    assert_eq!(unsafe { live.associate(&a) }, Err(READ_FAILED));
+    assert!(!live.associated());
+    assert_powered_off_for_good(live);
 }

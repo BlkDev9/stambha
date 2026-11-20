@@ -64,12 +64,28 @@
 //! switch does: the chip is left with the scan's RX filter, EDCCA, TSF sync
 //! or DIG, or a stopped TX scheduler.
 //!
-//! This module grants no transmission, association or key yet: it submits
-//! nothing on the data or management queues, polls nothing outside its
-//! command session, and runs no IQK, DPK, TSSI, watchdog, interrupts, probe
-//! request or idle power save. It has no `Drop`: a live chip that is dropped
-//! keeps running, its rings and pools quarantined, as rtw88's `Hardware`
-//! keeps running for the boot.
+//! A station's join, association and leaving are operations too (M3 spec
+//! S9-S11, each step from [`assoc`]): [`Live::set_bssid`] before
+//! authentication, [`Live::associate`] at the association response,
+//! [`Live::leave`] afterwards, or after a join that never associated. Their
+//! H2Cs go through the command session without a wait; frames drained
+//! meanwhile are held for the next [`Live::drain`]. Each is refused while a
+//! scan has not been ended, so no drain outside the scan's tracking can
+//! take its END_SCAN; and a scan is refused while a BSSID is set
+//! ([`CONNECTED`]), Linux's connected-or-connecting test
+//! (`rtw89_is_any_vif_connected_or_connecting`, `fw.c:10514-10529`): the
+//! connected scan is not ported, and the restore's address CAM would clear
+//! the BSSID entry. DIG's pause ([`Dig`]) is kept across all of them, as
+//! Linux's `pause_dig` is. A failure after the first access powers the chip
+//! off: the firmware's role is left half programmed.
+//!
+//! This module grants no transmission or key yet: it submits nothing on the
+//! data or management queues, polls nothing outside its command session,
+//! and runs no IQK, DPK, TSSI, watchdog, interrupts, probe request or idle
+//! power save. It has no `Drop`: a live chip that is dropped keeps running,
+//! its rings and pools quarantined, as rtw88's `Hardware` keeps running for
+//! the boot.
+use super::assoc::{self, AssocInputs, Features};
 use super::bb::BbGain;
 use super::bringup::{self, BringUpError, Calibrated, FirmwareFile, Host, Running};
 use super::c2h::{C2h, SCAN_END};
@@ -77,6 +93,7 @@ use super::chan::Chan;
 use super::channel::{self, ChannelInputs, TxPower};
 use super::command::{Parked, Session};
 use super::core_tail;
+use super::dm::Dig;
 use super::efuse::RxGain;
 use super::h2c::{H2c, ScanChannel};
 use super::io::{AxError, AxIo};
@@ -102,9 +119,14 @@ pub const BOOT_CHANNEL: Tag = Tag {
 pub const POWERED_OFF: AxError =
     AxError::Phy("the chip was powered off after a failed channel switch or scan");
 
-/// What a scan, a channel switch or [`scan::run_once`] gets while the last
-/// scan has not been ended with [`Live::end_scan`].
+/// What a scan, a channel switch, [`scan::run_once`] or an association step
+/// gets while the last scan has not been ended with [`Live::end_scan`].
 pub const SCAN_NOT_ENDED: AxError = AxError::Scan("the last scan has not been ended");
+
+/// What a scan or [`scan::run_once`] gets while a BSSID is set
+/// ([`Live::set_bssid`] until [`Live::leave`]).
+pub const CONNECTED: AxError =
+    AxError::Scan("a BSSID is set: the station is connecting or connected");
 
 /// The most frames a [`Live`] holds for the next [`Live::drain`], as the
 /// receiver's own queue is bounded; past it they are dropped and counted
@@ -133,6 +155,12 @@ pub struct Live<I: AxIo> {
     scan: Option<LiveScan>,
     /// Frames drained outside [`Live::drain`] and [`Live::expire_scan`].
     held: Held,
+    /// `rtwvif_link->bssid`, from [`Live::set_bssid`] until [`Live::leave`].
+    bssid: Option<[u8; 6]>,
+    /// The association made, until [`Live::leave`].
+    associated: Option<AssocInputs>,
+    /// DIG's pause.
+    dig: Dig,
     /// A failure powered the chip off.
     off: bool,
 }
@@ -357,6 +385,9 @@ pub unsafe fn start<I: AxIo>(
         chan,
         scan: None,
         held: Held::default(),
+        bssid: None,
+        associated: None,
+        dig: Dig::default(),
         off: false,
     })
 }
@@ -411,6 +442,17 @@ impl<I: AxIo> Live<I> {
         self.held.dropped
     }
 
+    /// The BSSID [`Live::set_bssid`] set, until [`Live::leave`].
+    pub fn bssid(&self) -> Option<[u8; 6]> {
+        self.bssid
+    }
+
+    /// Whether [`Live::associate`] associated the station and it has not
+    /// left.
+    pub fn associated(&self) -> bool {
+        self.associated.is_some()
+    }
+
     /// Refused with [`POWERED_OFF`] on a chip a failure powered off, and
     /// with [`SCAN_NOT_ENDED`] while a scan was begun and not ended.
     pub(super) fn idle(&self) -> Result<(), AxError> {
@@ -421,6 +463,24 @@ impl<I: AxIo> Live<I> {
             return Err(SCAN_NOT_ENDED);
         }
         Ok(())
+    }
+
+    /// Refused with [`CONNECTED`] while a BSSID is set.
+    pub(super) fn unconnected(&self) -> Result<(), AxError> {
+        match self.bssid {
+            Some(_) => Err(CONNECTED),
+            None => Ok(()),
+        }
+    }
+
+    /// DIG's pause, for [`scan::run_once`]'s scan start.
+    pub(super) fn dig(&self) -> Dig {
+        self.dig
+    }
+
+    /// DIG's pause after [`scan::run_once`]'s scan start.
+    pub(super) fn set_dig(&mut self, dig: Dig) {
+        self.dig = dig;
     }
 
     /// `__rtw89_set_channel` to `chan` ([`channel::set_channel`]): the TX
@@ -473,26 +533,29 @@ impl<I: AxIo> Live<I> {
     ///
     /// Refused before any I/O, changing nothing: on a chip off
     /// ([`POWERED_OFF`]), while the last scan has not been ended
-    /// ([`SCAN_NOT_ENDED`]), for a list [`scan::scan_list`] would refuse, and
-    /// on a firmware without SCAN_OFFLOAD. A failure in the scan start's own
-    /// steps powers the chip off. A failed offload is aborted as Linux aborts
-    /// it: [`scan::stop`], its failure ignored, then the restore of
-    /// [`Live::end_scan`]; its error is returned, and the chip stays on
-    /// unless the restore failed.
+    /// ([`SCAN_NOT_ENDED`]), while a BSSID is set ([`CONNECTED`]), for a list
+    /// [`scan::scan_list`] would refuse, and on a firmware without
+    /// SCAN_OFFLOAD. A failure in the scan start's own steps powers the chip
+    /// off. A failed offload is aborted as Linux aborts it: [`scan::stop`],
+    /// its failure ignored, then the restore of [`Live::end_scan`]; its error
+    /// is returned, and the chip stays on unless the restore failed.
     ///
     /// # Safety
     /// [`start`]'s contract, still holding for this chip.
     pub unsafe fn begin_scan(&mut self, list: &[ScanChannel]) -> Result<(), AxError> {
         self.idle()?;
+        self.unconnected()?;
         scan::check_list(list)?;
         scan::check_firmware(self.running.firmware)?;
         let mac = self.running.mac;
         let budget_us = scan::scan_budget_us(list.len());
         let mut held = core::mem::take(&mut self.held);
+        let mut dig = self.dig;
         let started = self.session(|io, session| {
             // SAFETY: the caller's contract is `start`'s, which
             // `hw_scan_start`'s is, for the live chip's own window and rings.
-            let edcca = unsafe { scan::hw_scan_start(io, session, mac, &mut |e| held.keep(e)) }?;
+            let edcca =
+                unsafe { scan::hw_scan_start(io, session, mac, &mut dig, &mut |e| held.keep(e)) }?;
             session.rx.set_mode(Mode::Scan);
             session.rx.flush(&mut |e| held.keep(e));
             let mut scan = LiveScan {
@@ -512,6 +575,7 @@ impl<I: AxIo> Live<I> {
             Ok((scan, offloaded))
         });
         self.held = held;
+        self.dig = dig;
         let (mut scan, offloaded) = match started {
             Ok(Ok(started)) => started,
             Ok(Err(error)) => {
@@ -695,13 +759,144 @@ impl<I: AxIo> Live<I> {
         unsafe { self.tune(&chan) }?;
         let mac = self.running.mac;
         let mut held = core::mem::take(&mut self.held);
+        let mut dig = self.dig;
         let completed = self.session(|io, session| {
             // SAFETY: as above, `hw_scan_complete`'s, for the live chip's own
             // window and rings.
-            unsafe { scan::hw_scan_complete(io, session, mac, edcca, &mut |e| held.keep(e)) }
+            unsafe {
+                scan::hw_scan_complete(io, session, mac, edcca, &mut dig, &mut |e| held.keep(e))
+            }
         });
         self.held = held;
+        self.dig = dig;
         match completed {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                self.power_off();
+                Err(error)
+            }
+            Err(off) => Err(off),
+        }
+    }
+
+    /// Set the BSSID before authentication (M3 spec S9.2-S9.3,
+    /// [`assoc::set_bssid`]): its address CAM, then DIG suspended unless it
+    /// already is. A station that has not associated may set another: the
+    /// CAM follows the last. Refused before any I/O, changing nothing: on a
+    /// chip off ([`POWERED_OFF`]), while a scan has not been ended
+    /// ([`SCAN_NOT_ENDED`]), for a zero BSSID (Linux's "no BSSID"), and
+    /// while associated (`Mac`). Any later failure powers the chip off.
+    ///
+    /// # Safety
+    /// [`start`]'s contract, still holding for this chip.
+    pub unsafe fn set_bssid(&mut self, bssid: [u8; 6]) -> Result<(), AxError> {
+        self.idle()?;
+        if bssid == [0; 6] {
+            return Err(AxError::Mac("a zero BSSID is no BSSID"));
+        }
+        if self.associated.is_some() {
+            return Err(AxError::Mac("a new BSSID while associated"));
+        }
+        let mac = self.running.mac;
+        let mut held = core::mem::take(&mut self.held);
+        let mut dig = self.dig;
+        let done = self.session(|io, session| {
+            // SAFETY: the caller's contract is `start`'s, which `set_bssid`'s
+            // is, for the live chip's own window and rings.
+            unsafe { assoc::set_bssid(io, session, mac, bssid, &mut dig, &mut |e| held.keep(e)) }
+        });
+        self.held = held;
+        self.dig = dig;
+        self.done(done)?;
+        self.bssid = Some(bssid);
+        Ok(())
+    }
+
+    /// Associate the station with the BSS [`Live::set_bssid`] set (M3 spec
+    /// S10, [`assoc::associate`]), with this chip's firmware features and
+    /// DIG's pause; frames drained meanwhile are held for the next
+    /// [`Live::drain`]. Refused before any I/O, changing nothing: on a chip
+    /// off ([`POWERED_OFF`]), while a scan has not been ended
+    /// ([`SCAN_NOT_ENDED`]), and with `Mac` when already associated, when
+    /// `inputs` names another BSSID than the one set, another address than
+    /// the chip's, or another band than the channel tuned (Linux takes it
+    /// from the vif's channel context), or for EDCA parameters
+    /// [`assoc::check`] refuses. Any later failure powers the chip off.
+    ///
+    /// # Safety
+    /// [`start`]'s contract, still holding for this chip.
+    pub unsafe fn associate(&mut self, inputs: &AssocInputs) -> Result<(), AxError> {
+        self.idle()?;
+        if self.associated.is_some() {
+            return Err(AxError::Mac("already associated"));
+        }
+        if self.bssid != Some(inputs.bssid) {
+            return Err(AxError::Mac("an association without its BSSID set"));
+        }
+        if inputs.mac != self.running.mac {
+            return Err(AxError::Mac("an association for another address"));
+        }
+        if inputs.band != self.chan.band {
+            return Err(AxError::Mac("an association on a band not tuned"));
+        }
+        assoc::check(inputs)?;
+        let features = Features::of(self.running.firmware);
+        let mut held = core::mem::take(&mut self.held);
+        let mut dig = self.dig;
+        let done = self.session(|io, session| {
+            // SAFETY: the caller's contract is `start`'s, which `associate`'s
+            // is, for the live chip's own window and rings.
+            unsafe {
+                assoc::associate(io, session, inputs, features, &mut dig, &mut |e| {
+                    held.keep(e)
+                })
+            }
+        });
+        self.held = held;
+        self.dig = dig;
+        self.done(done)?;
+        self.associated = Some(*inputs);
+        Ok(())
+    }
+
+    /// Leave (M3 spec S11): from an association, [`assoc::leave`] for it;
+    /// from a BSSID set without one, [`assoc::clear_bssid`]; with neither,
+    /// nothing, without I/O. Either way the BSSID and the association are
+    /// gone afterwards; DIG is left as it is. Refused before any I/O,
+    /// changing nothing, on a chip off ([`POWERED_OFF`]) and while a scan
+    /// has not been ended ([`SCAN_NOT_ENDED`]). A failure powers the chip
+    /// off.
+    ///
+    /// # Safety
+    /// [`start`]'s contract, still holding for this chip.
+    pub unsafe fn leave(&mut self) -> Result<(), AxError> {
+        self.idle()?;
+        if self.bssid.is_none() {
+            return Ok(());
+        }
+        let associated = self.associated.take();
+        self.bssid = None;
+        let features = Features::of(self.running.firmware);
+        let mac = self.running.mac;
+        let mut held = core::mem::take(&mut self.held);
+        let done = self.session(|io, session| {
+            let sink = &mut |e: Event<'_>| held.keep(e);
+            match &associated {
+                // SAFETY: the caller's contract is `start`'s, which `leave`'s
+                // is, for the live chip's own window and rings.
+                Some(inputs) => unsafe { assoc::leave(io, session, inputs, features, sink) },
+                // SAFETY: as above, `clear_bssid`'s.
+                None => unsafe { assoc::clear_bssid(io, session, mac, sink) },
+            }
+        });
+        self.held = held;
+        self.done(done)
+    }
+
+    /// The end of an association step run on the session: its error, the
+    /// chip powered off for it.
+    fn done(&mut self, done: Result<Result<(), AxError>, AxError>) -> Result<(), AxError> {
+        match done {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => {
                 self.power_off();
@@ -719,12 +914,14 @@ impl<I: AxIo> Live<I> {
     }
 
     /// `rtw89_core_stop` after a failure ([`bringup::shut_down`]): every
-    /// later call is refused with [`POWERED_OFF`], and a scan is gone with
-    /// the firmware.
+    /// later call is refused with [`POWERED_OFF`], and a scan, a BSSID and
+    /// an association are gone with the firmware.
     fn power_off(&mut self) {
         bringup::shut_down(&mut self.io, &self.rings, self.host);
         self.off = true;
         self.scan = None;
+        self.bssid = None;
+        self.associated = None;
     }
 
     /// Run `f` on the command session, resumed from where the last one was
