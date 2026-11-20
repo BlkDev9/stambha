@@ -37,9 +37,9 @@
 //! module does not grant interrupts, NAPI, RX parsing (RXQ and RPQ buffers
 //! are handed over raw and whole; only [`releases`] reads an RPQ buffer),
 //! TX on ACH4-7, CH9-11, ASPM/L1SS setup, the WD body and info (the caller
-//! hands them over whole), or firmware readiness: a consumed TXBD proves
-//! only that the DMA engine read the WD page, and a release report only
-//! that the MAC finished with the frame.
+//! hands them over whole, the info always included), or firmware readiness:
+//! a consumed TXBD proves only that the DMA engine read the WD page, and a
+//! release report only that the MAC finished with the frame.
 use super::io::{AxError, AxIo, clear16, clear32, field32, poll32, poll32_atomic, set32};
 use crate::bus::dma::{
     mapping::{Direction, DmaDomain, DmaError},
@@ -522,7 +522,10 @@ fn zero(allocation: &Allocation, bytes: usize) -> Result<(), AxError> {
 /// `rings`, reset the BD RAM and start DMA with only CH12 enabled.
 ///
 /// Runs after the MAC's DMAC pre-init, as `rtw89_mac_partial_init` orders
-/// them; nothing here assumes it runs first. A failure leaves CH12 stopped.
+/// them; nothing here assumes it runs first. A failure leaves CH12 and the
+/// data and management queues stopped. Every host index restarts as soon as
+/// `clr_idx_all` has restarted the hardware's, so a failure after it leaves
+/// RXQ and RPQ with nothing to deliver.
 ///
 /// # Safety
 /// `io` is the exclusive register window of exactly the RTL8852C requester
@@ -584,8 +587,12 @@ pub unsafe fn pre_init<I: AxIo + ?Sized>(
     stop_dma(io)?;
     poll_dma_all_idle(io)?;
     clr_idx_all(io)?;
+    // The host indices restart with the hardware's, before any later step
+    // can fail: an RX host index left where it was would read the zeroed
+    // hardware index as a ring of filled (stale) entries.
+    restart_host_indices(rings);
     mode_op(io)?;
-    // rtw89_pci_ops_reset: ring registers and the software indices.
+    // rtw89_pci_ops_reset: the ring registers.
     reset_trx_rings(io, rings)?;
     // rtw89_pci_rst_bdram_ax (pci.c:47).
     rst_bdram(io)?;
@@ -798,14 +805,10 @@ fn mode_op<I: AxIo + ?Sized>(io: &mut I) -> Result<(), AxError> {
     clear32(io, R_AX_PKTIN_SETTING, B_AX_WD_ADDR_INFO_LENGTH)
 }
 
-/// `rtw89_pci_reset_trx_rings` (`pci.c:1776`) without `group_bd_addr`, with
-/// `rx_ring_eq_is_full` false, then `rtw89_pci_init_wp_16sel`.
-fn reset_trx_rings<I: AxIo + ?Sized>(io: &mut I, rings: &Rings) -> Result<(), AxError> {
-    let mut tx = [0; TX_CHANNELS];
-    for (channel, address) in tx.iter_mut().enumerate() {
-        *address = rings.tx_ring(channel)?;
-    }
-    let rx = [rings.rx_ring(0)?, rings.rx_ring(1)?];
+/// The software indices of `rtw89_pci_reset_trx_rings` (`pci.c:1776`),
+/// which `pre_init` restarts as soon as `clr_idx_all` has restarted the
+/// hardware's.
+fn restart_host_indices(rings: &Rings) {
     rings.ch12_host.set(0);
     // Every TX `bd_ring->wp` and `rp` restarts at 0 (`pci.c:1804-1805`). A
     // WD page still in flight stays out of its pool: no BD names it now, so
@@ -819,6 +822,17 @@ fn reset_trx_rings<I: AxIo + ?Sized>(io: &mut I, rings: &Rings) -> Result<(), Ax
     for host in &rings.rx_host {
         host.set(0);
     }
+}
+
+/// `rtw89_pci_reset_trx_rings` (`pci.c:1776`) without `group_bd_addr`, with
+/// `rx_ring_eq_is_full` false, then `rtw89_pci_init_wp_16sel`. Its software
+/// indices are `restart_host_indices`.
+fn reset_trx_rings<I: AxIo + ?Sized>(io: &mut I, rings: &Rings) -> Result<(), AxError> {
+    let mut tx = [0; TX_CHANNELS];
+    for (channel, address) in tx.iter_mut().enumerate() {
+        *address = rings.tx_ring(channel)?;
+    }
+    let rx = [rings.rx_ring(0)?, rings.rx_ring(1)?];
     // The first ring address store publishes the rings.
     rings.programmed.set(true);
     for (channel, address) in TX_TABLE.iter().zip(tx) {
@@ -918,6 +932,10 @@ pub const PAYLOAD_BYTES: usize = 2048;
 /// entry carries. Every frame here takes exactly one.
 pub const MAX_TX_FRAME: usize = 2044;
 /// The WD body v1 (32 bytes) and WD info (24 bytes) a frame's caller builds.
+/// The info is required: wp_info always follows at byte 56, where Linux puts
+/// it at 32 for a frame without the info (`pci.c:1524-1527`), so
+/// [`Txq::submit`] refuses a head whose body dword 0 lacks WD_INFO_EN.
+/// Linux sets it on every management and data frame (`core.c:925`, `:1149`).
 pub const WD_HEAD_BYTES: usize = 56;
 /// `RTW89_TX_DONE` (`core.h:4676`): the frame was acknowledged.
 pub const TX_DONE: u8 = 0;
@@ -937,6 +955,8 @@ const _: () = assert!(WD_PAGES == TX_ENTRIES && WD_PAGES <= u8::MAX as usize);
 const _: () = assert!(WD_BYTES <= WD_PAGE_BYTES && MAX_TX_FRAME <= PAYLOAD_BYTES);
 /// `RTW89_PCI_TXWP_VALID` (`pci.h:1474`).
 const TXWP_VALID: u16 = 1 << 15;
+/// `RTW89_TXWD_BODY0_WD_INFO_EN` (`txrx.h:72`), in body dword 0.
+const WD_INFO_EN: u32 = 1 << 22;
 /// `B_PCIADDR_LS_V1_MASK` (`pci.h:1500`).
 const PCIADDR_LS_V1: u16 = 1 << 15;
 
@@ -1129,6 +1149,14 @@ impl Txq<'_> {
     /// the CPU and mark its page's TXBD done; a page already reported
     /// returns to its pool. Nothing is written to the device.
     ///
+    /// Before `pre_init`, after `deinit` and after a `pre_init` that failed,
+    /// it is refused with `Tx("TX rings are stopped")` and nothing is read:
+    /// `clr_idx_all` restarts the hardware index at 0 while the host's still
+    /// stand where the last reclaim left them, so a 0 read then would pass
+    /// for TXBDs read that nothing proves the device read. Their pages stay
+    /// in flight; once the next `pre_init` restarts the ring no TXBD names
+    /// them, so they never return (see `restart_host_indices`).
+    ///
     /// With no TXBD outstanding nothing is read. A hardware index past the
     /// ring, or past the host index (one the host never gave, which Linux
     /// would take as a wrap), or all ones, is refused before anything
@@ -1142,6 +1170,9 @@ impl Txq<'_> {
     pub unsafe fn reclaim<I: AxIo + ?Sized>(&mut self, io: &mut I) -> Result<(), AxError> {
         let slot = self.ch.slot();
         let rings = &mut *self.rings;
+        if !rings.data_ready.get() {
+            return Err(AxError::Tx("TX rings are stopped"));
+        }
         let wp = usize::from(rings.data_host[slot].get());
         let rp = usize::from(rings.data_hw[slot].get());
         if wp == rp {
@@ -1192,7 +1223,8 @@ impl Txq<'_> {
     ///
     /// A full queue ([`Txq::free`] 0) returns `Ok(None)` without touching
     /// the device. A frame that is empty or longer than [`MAX_TX_FRAME`] is
-    /// refused, as is any frame before `pre_init` or after `deinit`.
+    /// refused, as is a head without WD_INFO_EN (b22 of body dword 0; see
+    /// [`WD_HEAD_BYTES`]) and any frame before `pre_init` or after `deinit`.
     ///
     /// A failure before the kick hands nothing over: the page stays free
     /// and the host index unmoved. A failed kick write keeps the page in
@@ -1215,6 +1247,9 @@ impl Txq<'_> {
         }
         if payload.len() > MAX_TX_FRAME {
             return Err(AxError::Tx("frame longer than one TX address entry"));
+        }
+        if u32::from_le_bytes([head[0], head[1], head[2], head[3]]) & WD_INFO_EN == 0 {
+            return Err(AxError::Tx("WD head without its WD info"));
         }
         if !self.rings.data_ready.get() {
             return Err(AxError::Tx("TX rings are stopped"));
@@ -1378,9 +1413,12 @@ impl Rxq<'_> {
     /// buffer is touched. An error from `each` ends the batch: as Linux's
     /// `err_sync_device` path (`pci.c:401-403`), that buffer is still given
     /// back and consumed, the host index is written for every entry consumed,
-    /// and the error is returned. A failure to take or give back a buffer
-    /// leaves that entry unconsumed (the host's, and redelivered by the next
-    /// poll), with the host index still written for the entries before it.
+    /// and the error is returned. A failure to take a buffer leaves that
+    /// entry unconsumed (the host's, and redelivered by the next poll), with
+    /// the host index still written for the entries before it. A failure to
+    /// give a buffer back after `each` has run on it also ends the batch,
+    /// but that entry is consumed, so nothing `each` has seen is delivered
+    /// twice; `each`'s own error wins over it.
     ///
     /// # Safety
     /// `io` is the exclusive register window of the same RTL8852C requester
@@ -1492,8 +1530,9 @@ unsafe fn poll_rx<I: AxIo + ?Sized>(
         // SAFETY: `entry` lies in [host index, hardware index), which the
         // hardware index has passed: the device finished writing its buffer
         // and cannot write it again until the host index is written past
-        // it, which happens only below, after this buffer is given back. The
-        // `poll` contract holds.
+        // it, which happens only below, once `deliver` has copied it out and
+        // is done with it; the CPU reads it again only after another
+        // `sync_for_cpu`. The `poll` contract holds.
         match unsafe { deliver(buffer, copy, each) } {
             Ok(delivered) => {
                 consumed += 1;
@@ -1527,9 +1566,9 @@ unsafe fn poll_rx<I: AxIo + ?Sized>(
 
 /// One filled RXQ entry: `sync_for_cpu` its buffer, copy all of it into
 /// `copy`, call `each` with the copy, then `sync_for_device` the buffer.
-/// `Ok` carries `each`'s outcome once the buffer is back with the device;
-/// `Err` means the buffer could not be taken or given back, and `each` may
-/// not have run.
+/// `Ok` means `each` has run, so the entry is consumed: it carries `each`'s
+/// error, else the `sync_for_device` failure, else success. `Err` means the
+/// buffer could not be taken and `each` did not run.
 ///
 /// # Safety
 /// The device has finished writing `buffer` and cannot write it until the
@@ -1558,12 +1597,11 @@ unsafe fn deliver(
             .copy_to_nonoverlapping(copy.as_mut_ptr(), RX_BUFFER_BYTES)
     };
     let delivered = each(copy);
-    match (delivered, buffer.dma.sync_for_device(whole)) {
-        (delivered, Ok(())) => Ok(delivered),
-        // The first cause wins.
-        (Err(error), Err(_)) => Err(error),
-        (Ok(()), Err(error)) => Err(error.into()),
-    }
+    let given = buffer.dma.sync_for_device(whole);
+    // Once `each` has seen the buffer it is consumed whatever the give-back
+    // says: delivered again, an RPQ report could return a page since reused.
+    // The first cause wins.
+    Ok(delivered.and(given.map_err(AxError::from)))
 }
 
 #[cfg(test)]
