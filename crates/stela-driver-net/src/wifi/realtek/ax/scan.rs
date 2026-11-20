@@ -3,14 +3,16 @@
 // Copyright(c) 2020  Realtek Corporation
 // Copyright(c) 2019-2022  Realtek Corporation
 // Copyright(c) 2020-2022  Realtek Corporation
-//! An RTL8852C's first passive scan, from the end of `rtw89_core_start` to
-//! the end of the firmware's scan offload (M2c spec S2, S8-S13), as
-//! `rtw89_ops_hw_scan` (`mac80211.c:1279-1320`) runs it from idle.
+//! An RTL8852C's first passive scan, the firmware's scan offload over 38
+//! channels (M2c spec S2, S8-S13), as `rtw89_ops_hw_scan`
+//! (`mac80211.c:1279-1320`) runs it from idle once `rtw89_leave_ips`
+//! (`ps.c:257-278`) has brought the chip up: on a live chip
+//! ([`super::live::start`], whose [`super::live::leave_ips`] is the rest of
+//! `rtw89_core_start`, `rtw89_set_channel` to 2.4 GHz channel 1 with its TX
+//! power, and `rtw89_mac_vif_init`), [`run_once`]; on a command session that
+//! went through the same steps, [`passive`].
 //!
-//! In `rtw89_leave_ips`'s order (`ps.c:257-278`): the rest of
-//! `rtw89_core_start` ([`core_tail`]), `rtw89_set_channel` to 2.4 GHz
-//! channel 1 ([`channel::set_channel`]) and `rtw89_mac_vif_init` ([`vif`]).
-//! Then `rtw89_hw_scan_start` (`fw.c:10367-10437`) after the SCAN_OFFLOAD
+//! `rtw89_hw_scan_start` (`fw.c:10367-10437`) after the SCAN_OFFLOAD
 //! firmware gate (`fw.c:898`): `rtw89_mac_port_cfg_rx_sync(false)`
 //! (`mac.c:4674-4684`), `rtw89_core_scan_start` (`core.c:7063-7081`) with
 //! `rtw89_pci_recalc_int_mit` (`pci.c:4261-4283`),
@@ -27,10 +29,11 @@
 //! to [`STOP_WAIT_US`] for END_SCAN, as the stop's wait condition is
 //! completed only by END_SCAN (`mac.c:6131-6157`); the result is reported,
 //! not failed. The beacons and probe responses received meanwhile
-//! ([`receive`](super::receive)) go through `wifi::scan::Scanner::observe` (cfg80211's BSS
-//! parsing, spec S1.12) and are kept by BSSID with `Bss::keep_name_of`.
-//! Frames still queued from core start and vif init are flushed away before
-//! `Scanner::begin`; frames drained between ADD_SCANOFLD_CH and SCANOFLD's
+//! ([`receive`](super::receive), in its scan mode, M2c's) go through
+//! `wifi::scan::Scanner::observe` (cfg80211's BSS parsing, spec S1.12) and
+//! are kept by BSSID with `Bss::keep_name_of`. Frames still queued from core
+//! start and vif init are flushed away before `Scanner::begin`; frames
+//! drained between ADD_SCANOFLD_CH and SCANOFLD's
 //! DONE_ACK are held until `Scanner::submitted`; after END_SCAN or the stop,
 //! RXQ is drained until a poll finds it empty, or for at most 64 polls
 //! (`MAX_TAIL_POLLS`), which the report then says
@@ -52,24 +55,23 @@
 //!
 //! Not ported (spec S1.2, S1.5, S1.17): PKT_OFLD probe templates, the
 //! software steps of `rtw89_hw_scan_start`, `rtw89_hw_scan_complete`'s
-//! restores (the chip is powered off after the scan), and the 6 GHz, MCC
-//! and connected-scan branches. This module grants no transmission request,
-//! no association, no interrupts and no channel switch beyond the boot
-//! channel; its only H2Cs are those of the steps above.
+//! restores (after [`run_once`] the chip is left as the scan left it, which
+//! [`super::bringup::bring_up`] powers off), and the 6 GHz, MCC and
+//! connected-scan branches. This module grants no transmission request, no
+//! association, no interrupts and no channel switch; its only H2Cs are those
+//! of the scan start and its stop.
 use alloc::vec::Vec;
 use core::fmt;
 
 use super::bb;
 use super::c2h::{C2h, SCAN_END, SCAN_ENTER_CH, SCAN_STATUS_SUCCESS, ScanOfld};
-use super::chan::{Chan, HwBand, frequency};
-use super::channel::{self, ChannelInputs};
+use super::chan::{HwBand, frequency};
 use super::command::{CommandError, Refused, Session};
-use super::core_tail;
-use super::h2c::{H2C_FUNC_ADD_SCANOFLD_CH, H2C_FUNC_SCANOFLD, H2c, ScanChannel};
+use super::h2c::{H2C_FUNC_ADD_SCANOFLD_CH, H2C_FUNC_SCANOFLD, ScanChannel};
 use super::io::{AxError, AxIo, clear32};
-use super::pci::Rings;
-use super::receive::{Event, Received, Tag};
-use super::vif::{self, MAC_ID, PORT};
+use super::live::Live;
+use super::receive::{Event, Mode, Received};
+use super::vif::{MAC_ID, PORT};
 use crate::Mac;
 use crate::wifi::frame::Mpdu;
 use crate::wifi::scan::{self as wscan, Outcome, Policy, Request, Retirement, Scanner, Ticket};
@@ -216,18 +218,17 @@ pub struct Listed<'a> {
     pub network: &'a Network,
 }
 
-/// What the scan needs from the bring-up: the efuse MAC address, the
-/// firmware version (major, minor, sub, idx) and the channel inputs of
-/// [`channel::set_channel`].
+/// What the scan needs from the bring-up: the efuse MAC address and the
+/// firmware version (major, minor, sub, idx).
 #[derive(Clone, Copy, Debug)]
-pub struct ScanInputs<'a> {
+pub struct ScanInputs {
     pub mac: [u8; 6],
     pub firmware: (u8, u8, u8, u8),
-    pub channel: ChannelInputs<'a>,
 }
 
-/// A failed step (spec S2): `"core start"`, `"set channel"`, `"vif init"`,
-/// `"scan start"` or `"scan"`.
+/// A failed step (M2c spec S2, M3 spec S2): `"core start"`,
+/// `"set channel"`, `"tx power"` or `"vif init"` of
+/// [`super::live::leave_ips`], `"scan start"` or `"scan"` of the scan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanError {
     pub step: &'static str,
@@ -378,12 +379,6 @@ const B_SEG0R_PD_SPATIAL_REUSE_EN_MSK: u32 = 1 << 29;
 const SCAN_DONE_ACK_RETURN: u8 = 0x3F;
 /// SCANOFLD fails on any non-zero return (`data.err = !!h2c_return`).
 const SCANOFLD_RETURN: u8 = 0xFF;
-/// The tag of spec S6's channel, 2.4 GHz channel 1, until the first
-/// ENTER_CH.
-const BOOT_CHANNEL: Tag = Tag {
-    band: HwBand::G2,
-    channel: 1,
-};
 /// The most RXQ polls after END_SCAN or the stop: the drain ends earlier at
 /// the first poll that finds RXQ empty.
 const MAX_TAIL_POLLS: usize = 64;
@@ -648,11 +643,11 @@ fn is_end(event: &Event<'_>) -> bool {
 /// with its wait, and `submitted`.
 ///
 /// # Safety
-/// As [`run`].
+/// As [`passive`].
 unsafe fn start<I: AxIo + ?Sized>(
     io: &mut I,
     session: &mut Session<'_>,
-    inputs: &ScanInputs<'_>,
+    inputs: &ScanInputs,
 ) -> Result<Scan, AxError> {
     if inputs.firmware < SCAN_OFFLOAD_MIN {
         return Err(AxError::Scan("firmware predates SCAN_OFFLOAD (0.27.36.0)"));
@@ -738,7 +733,7 @@ unsafe fn start<I: AxIo + ?Sized>(
 /// are kept; then the scanner's completion and the report.
 ///
 /// # Safety
-/// As [`run`].
+/// As [`passive`].
 unsafe fn finish<I: AxIo + ?Sized>(
     io: &mut I,
     session: &mut Session<'_>,
@@ -819,39 +814,65 @@ unsafe fn finish<I: AxIo + ?Sized>(
     })
 }
 
-/// Spec S2 steps 1-7 (see the module documentation), each failing with its
-/// step: `"core start"` ([`core_tail::run`]), `"set channel"` (2.4 GHz
-/// channel 1), `"vif init"` ([`vif::init`] with `inputs.mac`), `"scan
-/// start"` and `"scan"`. One [`Session`] carries every H2C, numbered on from
-/// `h2c`. The first failure is returned and nothing after it runs; the
-/// caller powers the chip off. A scan that never ends is stopped and
-/// reported, not failed.
+/// M2c spec S2 steps 5-7 (see the module documentation) on `session`, whose
+/// steps 1-4 ([`super::live::leave_ips`]) already ran: `"scan
+/// start"` and `"scan"`, the receiver as it is. The session carries every
+/// H2C, numbered on from where it is. The first failure is returned and
+/// nothing after it runs; the caller powers the chip off. A scan that never
+/// ends is stopped and reported, not failed.
 ///
 /// # Safety
-/// The contract of `Ch12::submit` and `Rxq::poll` for `io` and `rings`:
-/// `io` is the exclusive register window of the same RTL8852C requester
-/// that `pci::pre_init` programmed with `rings`, `pre_init` succeeded, and
-/// its contract still holds: its DMA domain isolates that requester, the
-/// rings are coherent WB RAM with NoSnoop and ATS disabled, and one worker
-/// owns the device and its queues.
-pub unsafe fn run<I: AxIo + ?Sized>(
+/// The contract of `Ch12::submit` and `Rxq::poll` for `io` and the
+/// session's rings: `io` is the exclusive register window of the same
+/// RTL8852C requester that `pci::pre_init` programmed with them, `pre_init`
+/// succeeded, and its contract still holds: its DMA domain isolates that
+/// requester, the rings are coherent WB RAM with NoSnoop and ATS disabled,
+/// and one worker owns the device and its queues.
+pub unsafe fn passive<I: AxIo + ?Sized>(
     io: &mut I,
-    rings: &mut Rings,
-    h2c: &mut H2c,
-    inputs: &ScanInputs<'_>,
+    session: &mut Session<'_>,
+    inputs: &ScanInputs,
 ) -> Result<ScanReport, ScanError> {
     let at = |step: &'static str| move |error: AxError| ScanError { step, error };
-    let mut session = Session::new(rings, h2c, BOOT_CHANNEL);
-    // SAFETY: the caller's contract is `core_tail::run`'s, word for word.
-    unsafe { core_tail::run(io, &mut session) }.map_err(at("core start"))?;
-    let chan = Chan::new20(BOOT_CHANNEL.band, BOOT_CHANNEL.channel).map_err(at("set channel"))?;
-    channel::set_channel(io, &chan, &inputs.channel).map_err(at("set channel"))?;
-    // SAFETY: as above, `vif::init`'s.
-    unsafe { vif::init(io, &mut session, inputs.mac) }.map_err(at("vif init"))?;
-    // SAFETY: as above, `start`'s.
-    let scan = unsafe { start(io, &mut session, inputs) }.map_err(at("scan start"))?;
+    // SAFETY: the caller's contract is `start`'s, word for word.
+    let scan = unsafe { start(io, session, inputs) }.map_err(at("scan start"))?;
     // SAFETY: as above, `finish`'s.
-    unsafe { finish(io, &mut session, scan) }.map_err(at("scan"))
+    unsafe { finish(io, session, scan) }.map_err(at("scan"))
+}
+
+/// M2c's first passive scan on `live` ([`passive`]: M2c spec S2 steps 5-7,
+/// as [`super::live::start`] ran steps 1-4), with the efuse MAC
+/// and the downloaded firmware's version, through the receiver M2c scanned
+/// with ([`Mode::Scan`]), which goes back to [`Mode::Station`] after the
+/// scan, failed or not.
+///
+/// Nothing of `rtw89_hw_scan_complete` follows: the chip is left on the
+/// firmware's last channel with the scan's RX filter, EDCCA, TSF sync and
+/// DIG, as M2c left it for the power-off. The receiver keeps tagging frames
+/// with that last channel, where the radio is.
+///
+/// # Safety
+/// [`super::live::start`]'s contract, still holding for `live`.
+pub unsafe fn run_once<I: AxIo>(live: &mut Live<I>) -> Result<ScanReport, ScanError> {
+    let running = live.running();
+    let inputs = ScanInputs {
+        mac: running.mac,
+        firmware: running.firmware,
+    };
+    let scanned = live.session(|io, session| {
+        session.rx.set_mode(Mode::Scan);
+        // SAFETY: the caller's contract is `start`'s, which `passive`'s
+        // is, for the live chip's own window and rings.
+        let scanned = unsafe { passive(io, session, &inputs) };
+        session.rx.set_mode(Mode::Station);
+        scanned
+    });
+    scanned
+        .map_err(|error| ScanError {
+            step: "scan start",
+            error,
+        })
+        .and_then(|scanned| scanned)
 }
 
 #[cfg(test)]

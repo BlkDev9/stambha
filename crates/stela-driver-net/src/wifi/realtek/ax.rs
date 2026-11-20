@@ -40,16 +40,20 @@
 //! and recording any other refusal. [`vif`] is `rtw89_mac_vif_init` for one
 //! unassociated station on port 0 and macid 0: the port registers, the DMAC
 //! and CMAC tables, then the macid unpause, role, join, address CAM and CMAC
-//! table H2Cs through the same session. [`scan`] runs these in Linux's order
-//! (core start, channel 1, vif init), then the firmware's passive scan
-//! offload over 38 channels, and keeps the beacons and probe responses it
-//! hears as networks by BSSID. [`bring_up`] runs [`scan::run`] after
-//! `rtw89_phy_dm_init`, with the BB gain table, efuse RX gain offsets, RPL
-//! bias and cut the steps before it produced, and reports the networks with
-//! RF 0x18 read through both of its windows ([`Rf18`]). The bring-up grants
-//! no channel but the scan's boot channel, no IQK, DPK, TSSI or tracking, no
-//! association, no transmission request and no interrupts; the chip is
-//! powered off at the end.
+//! table H2Cs through the same session. [`live`] keeps the chip powered:
+//! [`live::start`] runs the bring-up through `rtw89_phy_dm_init`, then
+//! these in Linux's order (core start, channel 1 with its TX power, vif
+//! init), then allocates the TX pools; [`live::Live::tune`] switches
+//! channel and [`live::Live::stop`] tears the chip down. [`scan`] runs the
+//! firmware's passive scan offload over 38 channels on it, and keeps the
+//! beacons and probe responses it hears as networks by BSSID. [`bring_up`]
+//! is [`live::start`], [`scan::run_once`] and [`live::Live::stop`], with the
+//! BB gain table, efuse RX gain offsets, RPL bias and cut the steps before
+//! the scan produced, and reports the networks with RF 0x18 read through
+//! both of its windows ([`Rf18`]). The bring-up grants no channel but the
+//! scan's boot channel, no IQK, DPK, TSSI or tracking, no association, no
+//! transmission request and no interrupts; the chip is powered off at the
+//! end.
 pub mod bb;
 pub mod bringup;
 pub mod c2h;
@@ -66,6 +70,7 @@ pub mod elements;
 pub mod fwdl;
 pub mod h2c;
 pub mod io;
+pub mod live;
 pub mod pci;
 pub mod phy;
 pub mod phy_table;
@@ -87,7 +92,9 @@ pub mod txpwr;
 pub mod txpwr_tables;
 pub mod vif;
 
-pub use bringup::{BringUpError, Earlier, Host, Rf18, Rf18Line, Running, bring_up, quiesce};
+pub use bringup::{
+    BringUpError, Earlier, FirmwareFile, Host, Rf18, Rf18Line, Running, bring_up, quiesce,
+};
 pub use command::H2cAck;
 pub use fwdl::download;
 pub use io::{
@@ -95,6 +102,7 @@ pub use io::{
     poll_sample, poll_sample_atomic, poll32, poll32_atomic, poll32_value, poll32_value_atomic,
     set8, set16, set32,
 };
+pub use live::{Live, StartError};
 pub use phy::{PhyReport, RfkReport};
 // `pci::pre_init` and `dmac::pre_init` are reached by their module only.
 pub use pci::{Ch12, Rings, encode_txbd};

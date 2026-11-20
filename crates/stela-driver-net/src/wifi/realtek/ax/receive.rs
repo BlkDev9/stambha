@@ -247,6 +247,12 @@ impl Receiver {
         self.pending.len()
     }
 
+    /// Which frames are kept (tests only).
+    #[cfg(test)]
+    pub(crate) fn mode(&self) -> Mode {
+        self.mode
+    }
+
     /// Route one RXQ buffer (spec S11.4). A buffer `rx::parse` refuses is
     /// `Err(AxError::Rx(..))` and changes nothing; everything else is
     /// `Ok`, with what was dropped in [`Receiver::counts`].

@@ -204,6 +204,35 @@ pub trait AxIo {
     fn now_us(&mut self) -> Result<u64, AxError>;
 }
 
+/// A borrowed window is the window: every access goes to `T` unchanged, so
+/// an owner of `I` (the live chip) can run on a caller's `&mut I` too.
+impl<T: AxIo + ?Sized> AxIo for &mut T {
+    fn read8(&mut self, reg: u32) -> Result<u8, AxError> {
+        (**self).read8(reg)
+    }
+    fn read16(&mut self, reg: u32) -> Result<u16, AxError> {
+        (**self).read16(reg)
+    }
+    fn read32(&mut self, reg: u32) -> Result<u32, AxError> {
+        (**self).read32(reg)
+    }
+    fn write8(&mut self, reg: u32, v: u8) -> Result<(), AxError> {
+        (**self).write8(reg, v)
+    }
+    fn write16(&mut self, reg: u32, v: u16) -> Result<(), AxError> {
+        (**self).write16(reg, v)
+    }
+    fn write32(&mut self, reg: u32, v: u32) -> Result<(), AxError> {
+        (**self).write32(reg, v)
+    }
+    fn delay_us(&mut self, us: u64) {
+        (**self).delay_us(us)
+    }
+    fn now_us(&mut self) -> Result<u64, AxError> {
+        (**self).now_us()
+    }
+}
+
 macro_rules! masked {
     ($t:ty, $read:ident, $write:ident, $set:ident, $clear:ident, $field:ident) => {
         /// `rtw89_write*_set`: set `bits`, keeping the rest.

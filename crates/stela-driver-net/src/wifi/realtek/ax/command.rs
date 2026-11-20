@@ -438,6 +438,15 @@ fn account(
     }
 }
 
+/// A [`Session`]'s own state between two sessions on the same rings and H2C
+/// sequence ([`Session::park`], [`Session::resume`]): the receiver, the
+/// ledger, and the last in-range RXQ hardware index a drain read.
+pub struct Parked {
+    pub rx: Receiver,
+    pub ledger: Ledger,
+    rxq_hw: u16,
+}
+
 /// The command channel after `rtw89_phy_dm_init`: CH12 for every H2C, RXQ
 /// drained through one [`Receiver`] after each and during every wait. The
 /// H2C sequence is the caller's `h2c`, so it continues from wherever the
@@ -464,6 +473,31 @@ impl<'r> Session<'r> {
             ledger: Ledger::default(),
             awaited: None,
             rxq_hw: 0,
+        }
+    }
+
+    /// A session on the same rings and H2C sequence as the one `parked`
+    /// ended: its receiver (with the frames still waiting for their PPDU
+    /// status), its ledger and its last RXQ hardware index go on.
+    pub fn resume(rings: &'r mut Rings, h2c: &'r mut H2c, parked: Parked) -> Self {
+        let Parked { rx, ledger, rxq_hw } = parked;
+        Self {
+            rings,
+            h2c,
+            rx,
+            ledger,
+            awaited: None,
+            rxq_hw,
+        }
+    }
+
+    /// End the session, keeping what [`Session::resume`] goes on from. No
+    /// wait runs between two calls, so nothing is awaited.
+    pub fn park(self) -> Parked {
+        Parked {
+            rx: self.rx,
+            ledger: self.ledger,
+            rxq_hw: self.rxq_hw,
         }
     }
 
