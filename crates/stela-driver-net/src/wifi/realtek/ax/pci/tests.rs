@@ -1657,7 +1657,7 @@ fn a_pre_init_failing_after_the_index_clear_restarts_the_rx_host_indices() {
 /// An RPQ buffer as the device writes it: the RX BD info word (FS | LS |
 /// WRITE_SIZE), a long RX descriptor with `drv_info` 8-byte units of driver
 /// info after it, then one RPP dword per entry of `rpps`.
-fn rpq_buffer(drv_info: u32, rpps: &[u32]) -> Vec<u8> {
+pub(crate) fn rpq_buffer(drv_info: u32, rpps: &[u32]) -> Vec<u8> {
     let rpp_at = 4 + 32 + drv_info as usize * 8;
     let size = rpp_at + rpps.len() * 4;
     let mut b = vec![0u8; RX_BUFFER_BYTES];
@@ -1673,7 +1673,7 @@ fn rpq_buffer(drv_info: u32, rpps: &[u32]) -> Vec<u8> {
 }
 
 /// An RPP dword: SEQ [30:16], TX_STATUS [15:13], QSEL [12:8], MACID [7:0].
-fn rpp(seq: u32, status: u32, qsel: u32) -> u32 {
+pub(crate) fn rpp(seq: u32, status: u32, qsel: u32) -> u32 {
     seq << 16 | status << 13 | qsel << 8 | 0x5A
 }
 
@@ -1689,25 +1689,30 @@ fn releases_parse_every_rpp_in_a_buffer() {
             1 << 31 | rpp(0, 3, 0x03),
         ],
     );
+    // Seq 16 is past the pools and qsel 4 names no channel: both skipped
+    // and counted (spec S6).
     assert_eq!(
         releases(&buffer),
-        Ok(vec![
-            Release {
-                seq: 3,
-                status: TX_DONE,
-                qsel: 0x12
-            },
-            Release {
-                seq: 15,
-                status: 1,
-                qsel: 0
-            },
-            Release {
-                seq: 0,
-                status: 3,
-                qsel: 3
-            },
-        ])
+        Ok(Releases {
+            reports: vec![
+                Release {
+                    seq: 3,
+                    status: TX_DONE,
+                    qsel: 0x12
+                },
+                Release {
+                    seq: 15,
+                    status: 1,
+                    qsel: 0
+                },
+                Release {
+                    seq: 0,
+                    status: 3,
+                    qsel: 3
+                },
+            ],
+            invalid: 2,
+        })
     );
     // A short descriptor and no driver info: the RPPs start at byte 20.
     let mut short = vec![0u8; 64];
@@ -1716,11 +1721,13 @@ fn releases_parse_every_rpp_in_a_buffer() {
     short[24..28].copy_from_slice(&rpp(5, 0, 0x02).to_le_bytes());
     // Past WRITE_SIZE: not a report.
     short[28..32].copy_from_slice(&rpp(6, 0, 0x02).to_le_bytes());
-    let seqs: Vec<u16> = releases(&short).unwrap().iter().map(|r| r.seq).collect();
+    let found = releases(&short).unwrap();
+    let seqs: Vec<u16> = found.reports.iter().map(|r| r.seq).collect();
     assert_eq!(seqs, [2, 5]);
+    assert_eq!(found.invalid, 0);
     // A trailing partial dword is not read (pci.c:681).
     short[0..4].copy_from_slice(&(1u32 << 15 | 1 << 14 | 31).to_le_bytes());
-    assert_eq!(releases(&short).unwrap().len(), 2);
+    assert_eq!(releases(&short).unwrap().reports.len(), 2);
 }
 
 #[test]
@@ -1741,11 +1748,11 @@ fn releases_refuse_malformed_buffers() {
         releases(&whole[..39]),
         Err(AxError::Tx("release report longer than its buffer"))
     );
-    assert_eq!(releases(&whole[..40]).unwrap().len(), 1);
+    assert_eq!(releases(&whole[..40]).unwrap().reports.len(), 1);
 }
 
 /// RPQ entry `entry`'s buffer: RPQ is ring 1, after RXQ's 32 buffers.
-fn rpq_buffer_iova(entry: usize) -> u64 {
+pub(crate) fn rpq_buffer_iova(entry: usize) -> u64 {
     u64::from(RX_BUFFER0) + 0x10000 * (RX_ENTRIES + entry) as u64
 }
 
@@ -1783,7 +1790,7 @@ fn rpq_polls_its_own_index() {
     assert_eq!(syncs(&m), (before + 3, cpu_before + 3));
     let seqs: Vec<u16> = seen
         .iter()
-        .flat_map(|buffer| releases(buffer).unwrap())
+        .flat_map(|buffer| releases(buffer).unwrap().reports)
         .map(|r| r.seq)
         .collect();
     assert_eq!(seqs, [0, 1, 2]);
@@ -1864,7 +1871,7 @@ fn rpq_buffer_read_but_not_given_back_is_still_consumed() {
     assert_eq!(io.trace, [Op::R32(0x121C), Op::W16(0x121C, 4)]);
     let seqs: Vec<u16> = seen
         .iter()
-        .flat_map(|buffer| releases(buffer).unwrap())
+        .flat_map(|buffer| releases(buffer).unwrap().reports)
         .map(|r| r.seq)
         .collect();
     assert_eq!(seqs, [0, 1, 2, 3]);

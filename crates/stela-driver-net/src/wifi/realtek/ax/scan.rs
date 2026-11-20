@@ -456,7 +456,7 @@ const MAX_EARLY: usize = super::receive::MAX_PENDING;
 /// The most BSSIDs kept; a frame from a new BSSID past it is dropped.
 const MAX_NETWORKS: usize = 512;
 
-fn wifi_band(band: HwBand) -> Band {
+pub(super) fn wifi_band(band: HwBand) -> Band {
     match band {
         HwBand::G2 => Band::Ghz2,
         HwBand::G5 => Band::Ghz5,
@@ -464,7 +464,7 @@ fn wifi_band(band: HwBand) -> Band {
     }
 }
 
-fn hw_band(band: Band) -> HwBand {
+pub(super) fn hw_band(band: Band) -> HwBand {
     match band {
         Band::Ghz2 => HwBand::G2,
         Band::Ghz5 => HwBand::G5,
@@ -851,7 +851,10 @@ pub(super) unsafe fn tail<I: AxIo + ?Sized>(
 /// EDCCA levels from `edcca`; TSF sync on (`rtw89_mac_port_cfg_rx_sync`,
 /// `mac.c:4674-4684`); DIG resumed through `dig` with spatial reuse off,
 /// as no station is associated (`total_sta_assoc` 0). The first failure is
-/// returned and nothing after it runs.
+/// returned and nothing after it runs: where Linux ignores the address
+/// CAM's send (`core.c:7099`), its failure here ends the restore, for the
+/// caller to power the chip off, as a CH12 that took no H2C leaves the
+/// firmware unreachable for every later step.
 ///
 /// # Safety
 /// As [`passive`].

@@ -40,9 +40,9 @@
 //! (`chan.c:3269-3302`) back to the operating channel through
 //! [`Live::tune`], TX power and receiver tag included, then
 //! `rtw89_hw_scan_complete_cb`. The operating channel is the one the last
-//! switch set, as Linux returns to its channel context's chandef, or to the
-//! default chandef, 2.4 GHz channel 1, when none is registered
-//! (`chan.c:614-616`).
+//! switch set, as Linux returns to its channel context's chandef, or, once
+//! [`Live::release_channel`] has released that context, to the default
+//! chandef, 2.4 GHz channel 1 (`chan.c:614-616`).
 //!
 //! While the scan's RX filter is on, from `rtw89_hw_scan_start` to the
 //! restore's filter write, the receiver keeps only beacons and probe
@@ -79,33 +79,59 @@
 //! Linux's `pause_dig` is. A failure after the first access powers the chip
 //! off: the firmware's role is left half programmed.
 //!
-//! This module grants no transmission or key yet: it submits nothing on the
-//! data or management queues, polls nothing outside its command session,
-//! and runs no IQK, DPK, TSSI, watchdog, interrupts, probe request or idle
-//! power save. It has no `Drop`: a live chip that is dropped keeps running,
-//! its rings and pools quarantined, as rtw88's `Hardware` keeps running for
-//! the boot.
-use super::assoc::{self, AssocInputs, Features};
+//! Frames go out on the data and management queues as `rtw89_ops_tx` hands
+//! them to `rtw89_core_tx_write` (`core.c:1453-1478`): the WD head of
+//! [`txd`], submitted on the TX channel the encoder names ([`super::pci::Txq::submit`]),
+//! [`Live::queue_management`] and [`Live::queue_data`]. A full channel is
+//! "no room", and so is any frame while a scan has not been ended, as
+//! `rtw89_hw_scan_start` stops mac80211's queues until
+//! `rtw89_hw_scan_complete` wakes them (`fw.c:10419`, `:10460`). Each frame
+//! is named by a [`Token`] until its release report. [`Live::service`] is
+//! the radio's poll, in `rtw89_pci_napi_poll`'s order (`pci.c:4528-4534`):
+//! RPQ's release reports (`rtw89_pci_poll_rpq_dma`, `pci.c:720`), each
+//! returning its page as `rtw89_pci_release_rpp` does and naming its token,
+//! then the TX reclaim of every channel with TXBDs outstanding
+//! (`rtw89_pci_reclaim_txbd`, `pci.c:501-520`), then [`Live::drain`], then
+//! [`Live::expire_scan`]. A report the pools cannot take (a seq past them,
+//! a qsel without a channel, a page not in flight) is counted, never
+//! reported. The live chip is the station's [`Chip`] (M3 spec S14.1).
+//!
+//! This module grants no key yet (M3b), and no TX status beyond RPQ's: a
+//! report says the MAC is done with a frame, acknowledged or not, nothing
+//! more. It runs no IQK, DPK, TSSI, watchdog, interrupts, probe request or
+//! idle power save, and processes no beacon filter report (M3 Task 18). It
+//! has no `Drop`: a live chip that is dropped keeps running, its rings and
+//! pools quarantined, as rtw88's `Hardware` keeps running for the boot.
+use super::assoc::{self, AssocInputs, Features, RaPeer};
 use super::bb::BbGain;
 use super::bringup::{self, BringUpError, Calibrated, FirmwareFile, Host, Running};
 use super::c2h::{C2h, SCAN_END};
-use super::chan::Chan;
-use super::channel::{self, ChannelInputs, TxPower};
+use super::chan::{Chan, frequency};
+use super::channel::{self, ChannelError, ChannelInputs, TxPower};
 use super::command::{Parked, Session};
 use super::core_tail;
 use super::dm::Dig;
 use super::efuse::RxGain;
 use super::h2c::{H2c, ScanChannel};
 use super::io::{AxError, AxIo};
-use super::pci::{Rings, TxPools};
+use super::pci::{Rings, TX_DONE, TxChannel, TxPools, WD_HEAD_BYTES, releases};
 use super::receive::{Event, MAX_PENDING, Mode, Received, Tag};
 use super::regd::Regds;
-use super::scan::{self, EdccaBak, ScanEnd, ScanError};
+use super::scan::{self, EdccaBak, ScanEnd, ScanError, hw_band, wifi_band};
+use super::station::chip::{
+    self, Association, Chip, Data, HardwareKey, Incoming, Management, Token,
+};
+use super::txd::{self, RateCaps};
 use super::txpwr_tables::TxPowerTables;
 use super::vif;
+use crate::Mac;
 use crate::bus::dma::{mapping::DmaDomain, memory::PageSource};
+use crate::wifi::Channel;
 use alloc::collections::VecDeque;
+use alloc::format;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 /// The channel `rtw89_leave_ips` sets from idle: an unassociated channel
 /// context is the default chandef, 2.4 GHz channel 1 (M2c spec S1.2).
@@ -133,6 +159,36 @@ pub const CONNECTED: AxError =
 /// ([`Live::held_dropped`]).
 const MAX_HELD: usize = MAX_PENDING;
 
+/// What every key call and every keyed frame gets in M3a (spec S14.5).
+pub const KEYS_BEFORE_M3B: &str = "keys before M3b";
+
+/// The data and management channels, in the order the reclaim reads them.
+const TX_CHANNELS: [TxChannel; 5] = [
+    TxChannel::Ach0,
+    TxChannel::Ach1,
+    TxChannel::Ach2,
+    TxChannel::Ach3,
+    TxChannel::Ch8,
+];
+
+/// What the TX side did, saturating, for [`Chip::diagnostic`]: frames
+/// queued, refused for no room, reported, reported acknowledged; release
+/// reports skipped (`Releases::invalid`) and stale (for a page not in
+/// flight or already reported).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TxCounts {
+    sent: u32,
+    full: u32,
+    reported: u32,
+    acked: u32,
+    skipped: u32,
+    stale: u32,
+}
+
+fn bump(counter: &mut u32) {
+    *counter = counter.saturating_add(1);
+}
+
 /// An RTL8852CE that [`start`] left running (M3 spec S3.1).
 pub struct Live<I: AxIo> {
     io: I,
@@ -151,6 +207,10 @@ pub struct Live<I: AxIo> {
     regds: (Regds, [u8; 2]),
     /// The channel the last switch set.
     chan: Chan,
+    /// The channel context's chandef, which a scan's restore returns to:
+    /// the last switch's, until [`Live::release_channel`] makes it the
+    /// default chandef.
+    home: Chan,
     /// The firmware scan begun, until [`Live::end_scan`] restores after it.
     scan: Option<LiveScan>,
     /// Frames drained outside [`Live::drain`] and [`Live::expire_scan`].
@@ -161,6 +221,7 @@ pub struct Live<I: AxIo> {
     associated: Option<AssocInputs>,
     /// DIG's pause.
     dig: Dig,
+    tx: TxCounts,
     /// A failure powered the chip off.
     off: bool,
 }
@@ -176,6 +237,8 @@ struct LiveScan {
     /// How the scan ended, once what followed END_SCAN, or the stop, was
     /// drained.
     end: Option<ScanEnd>,
+    /// [`Live::service`] handed its end on.
+    announced: bool,
 }
 
 impl LiveScan {
@@ -383,11 +446,13 @@ pub unsafe fn start<I: AxIo>(
         tables,
         regds,
         chan,
+        home: chan,
         scan: None,
         held: Held::default(),
         bssid: None,
         associated: None,
         dig: Dig::default(),
+        tx: TxCounts::default(),
         off: false,
     })
 }
@@ -398,6 +463,55 @@ fn tag_of(chan: &Chan) -> Tag {
         band: chan.band,
         channel: chan.channel,
     }
+}
+
+/// `first`, unless it is `Ok` and `next` failed: the first error wins.
+fn keep(first: &mut Result<(), AxError>, next: Result<(), AxError>) {
+    if first.is_ok() {
+        *first = next;
+    }
+}
+
+/// The token of WD page `page` of `ch`: its ring in bits 15:8.
+fn token(ch: TxChannel, page: u8) -> Token {
+    Token((ch.ring() as u16) << 8 | u16::from(page))
+}
+
+/// A received frame as the station hears it: the tag as a channel at its
+/// cfg80211 frequency, the free-running counter as its TSF.
+fn heard(frame: Received) -> chip::Received {
+    let Tag { band, channel } = frame.tag;
+    chip::Received {
+        bytes: frame.mpdu,
+        channel: Channel {
+            band: wifi_band(band),
+            number: u16::from(channel),
+            frequency_mhz: frequency(band, channel),
+        },
+        signal_dbm: frame.signal,
+        tsf: frame.free_run,
+        decrypted: frame.decrypted,
+        icv_error: frame.icv_error,
+        fcs_error: frame.fcs_error,
+    }
+}
+
+/// `channel` as a 20 MHz [`Chan`]: refused, as [`Chan::new20`] refuses, for
+/// a number past 255, one that is no 2.4 or 5 GHz channel, and a frequency
+/// that is not its number's.
+fn chan_of(channel: Channel) -> Result<Chan, AxError> {
+    const NOT_20: AxError = AxError::Phy("not a 20 MHz 2.4 or 5 GHz channel");
+    let number = u8::try_from(channel.number).map_err(|_| NOT_20)?;
+    let chan = Chan::new20(hw_band(channel.band), number)?;
+    if chan.freq != channel.frequency_mhz {
+        return Err(NOT_20);
+    }
+    Ok(chan)
+}
+
+/// A failure of `step` as [`Chip`] reports it.
+fn failed(step: &str, error: AxError) -> String {
+    format!("{step}: {error}")
 }
 
 impl<I: AxIo> Live<I> {
@@ -419,7 +533,8 @@ impl<I: AxIo> Live<I> {
 
     /// The channel the last switch set: [`start`]'s 2.4 GHz channel 1, then
     /// each [`Live::tune`]'s. A firmware scan takes the radio off it until
-    /// [`Live::end_scan`] switches back to it.
+    /// [`Live::end_scan`] switches back to it, or to 2.4 GHz channel 1 after
+    /// [`Live::release_channel`].
     pub fn chan(&self) -> Chan {
         self.chan
     }
@@ -492,13 +607,29 @@ impl<I: AxIo> Live<I> {
     /// a channel [`Chan::new20`] would not build. Any later failure leaves
     /// the TX scheduler stopped, so the chip is powered off
     /// ([`bringup::shut_down`]) and every later call fails with
-    /// [`POWERED_OFF`].
+    /// [`POWERED_OFF`]. The channel becomes the one a scan's restore
+    /// returns to.
     ///
     /// # Safety
     /// [`start`]'s contract, still holding for this chip.
     pub unsafe fn tune(&mut self, chan: &Chan) -> Result<(), AxError> {
-        self.idle()?;
-        channel::check_chan(chan)?;
+        // SAFETY: the caller's contract is `switch`'s, word for word.
+        unsafe { self.switch(chan) }.map_err(|failed| failed.error)
+    }
+
+    /// [`Live::tune`], its failure with its step: `"set channel"` for a
+    /// refusal and for every step of the switch but `set_txpwr`'s, `"tx
+    /// power"` for that.
+    ///
+    /// # Safety
+    /// [`start`]'s contract, still holding for this chip.
+    unsafe fn switch(&mut self, chan: &Chan) -> Result<(), ChannelError> {
+        let refused = |error| ChannelError {
+            step: "set channel",
+            error,
+        };
+        self.idle().map_err(refused)?;
+        channel::check_chan(chan).map_err(refused)?;
         let inputs = ChannelInputs {
             gain: &self.gain,
             rx_gain: &self.rx_gain,
@@ -511,9 +642,10 @@ impl<I: AxIo> Live<I> {
         };
         if let Err(failed) = channel::set_channel(&mut self.io, chan, &inputs, power) {
             self.power_off();
-            return Err(failed.error);
+            return Err(failed);
         }
         self.chan = *chan;
+        self.home = *chan;
         if let Some(parked) = self.parked.as_mut() {
             parked.rx.set_tag(tag_of(chan));
         }
@@ -563,6 +695,7 @@ impl<I: AxIo> Live<I> {
                 deadline_us: u64::MAX,
                 status: None,
                 end: None,
+                announced: false,
             };
             // SAFETY: as above, `offload`'s.
             let offloaded = unsafe {
@@ -634,8 +767,10 @@ impl<I: AxIo> Live<I> {
                 && let Some(status) = scan.status
             {
                 // SAFETY: as above, `tail`'s.
-                unsafe { scan::tail(io, session, sink) }?;
+                let tail = unsafe { scan::tail(io, session, sink) };
+                // The scan is over whether or not its tail could be read.
                 scan.end = Some(scan::ended(status));
+                tail?;
             }
             Ok(())
         });
@@ -647,10 +782,13 @@ impl<I: AxIo> Live<I> {
     /// without END_SCAN at its deadline is stopped as `rtw89_hw_scan_abort`
     /// does ([`scan::stop`]: SCANOFLD stop, then up to `STOP_WAIT_US` for
     /// END_SCAN), what followed drained into `sink` ([`scan::tail`]), after
-    /// the frames held, and it ends [`ScanEnd::Stopped`]. Anything else
-    /// changes nothing and does no I/O but the clock read: no scan, one that
-    /// ended or brought END_SCAN, one within its budget. Refused with
-    /// [`POWERED_OFF`] on a chip off.
+    /// the frames held, and it ends [`ScanEnd::Stopped`], `ended` when
+    /// END_SCAN came in the stop's wait or its tail. A stop or tail that
+    /// fails still ends it so, as Linux completes an abort whatever the
+    /// stop returned (`fw.c:10502-10510`), and returns its error; the stop
+    /// is never sent twice. Anything else changes nothing and does no I/O
+    /// but the clock read: no scan, one that ended or brought END_SCAN, one
+    /// within its budget. Refused with [`POWERED_OFF`] on a chip off.
     ///
     /// # Safety
     /// [`start`]'s contract, still holding for this chip.
@@ -668,29 +806,35 @@ impl<I: AxIo> Live<I> {
         self.release(sink);
         let mut scan = self.scan.take();
         let stopped = self.session(|io, session| {
+            let mut track = |e: Event<'_>| {
+                if let Some(scan) = scan.as_mut() {
+                    scan.track(&e);
+                }
+                sink(e)
+            };
             // SAFETY: the caller's contract is `start`'s, which `stop`'s is,
             // for the live chip's own window and rings.
-            let ended = unsafe {
-                scan::stop(io, session, &mut |e| {
-                    if let Some(scan) = scan.as_mut() {
-                        scan.track(&e);
-                    }
-                    sink(e)
-                })
-            }?;
-            // SAFETY: as above, `tail`'s.
-            unsafe { scan::tail(io, session, sink) }?;
+            let stop = unsafe { scan::stop(io, session, &mut track) };
+            let (ended, result) = match stop {
+                Ok(ended) => {
+                    // SAFETY: as above, `tail`'s.
+                    let tail = unsafe { scan::tail(io, session, &mut track) };
+                    (ended, tail.map(|_| ()))
+                }
+                Err(error) => (false, Err(error)),
+            };
             if let Some(scan) = scan.as_mut() {
+                let ended = ended || scan.status.is_some();
                 scan.end = Some(ScanEnd::Stopped { ended });
             }
-            Ok(())
+            result
         });
         self.scan = scan;
         stopped.and_then(|stopped| stopped)
     }
 
     /// `rtw89_hw_scan_complete` for the ended scan (M3 spec S8.3; see the
-    /// module documentation): the switch back to [`Live::chan`] through
+    /// module documentation): the switch back to the operating channel through
     /// [`Live::tune`], with its TX power and the receiver's tag, then
     /// [`scan::hw_scan_complete`] (the RX filter, the station receiver
     /// again, the address CAM, EDCCA, TSF sync, DIG), frames its CAM send
@@ -724,6 +868,7 @@ impl<I: AxIo> Live<I> {
             deadline_us: 0,
             status: None,
             end: Some(end),
+            announced: false,
         });
     }
 
@@ -754,7 +899,7 @@ impl<I: AxIo> Live<I> {
     /// # Safety
     /// [`start`]'s contract, still holding for this chip.
     unsafe fn restore(&mut self, edcca: &EdccaBak) -> Result<(), AxError> {
-        let chan = self.chan;
+        let chan = self.home;
         // SAFETY: the caller's contract is `tune`'s, word for word.
         unsafe { self.tune(&chan) }?;
         let mac = self.running.mac;
@@ -820,8 +965,9 @@ impl<I: AxIo> Live<I> {
     /// ([`SCAN_NOT_ENDED`]), and with `Mac` when already associated, when
     /// `inputs` names another BSSID than the one set, another address than
     /// the chip's, or another band than the channel tuned (Linux takes it
-    /// from the vif's channel context), or for EDCA parameters
-    /// [`assoc::check`] refuses. Any later failure powers the chip off.
+    /// from the vif's channel context). EDCA parameters the station layer
+    /// gives none of, or an invalid set of, are 802.11's QoS defaults
+    /// ([`AssocInputs::params`]). Any later failure powers the chip off.
     ///
     /// # Safety
     /// [`start`]'s contract, still holding for this chip.
@@ -839,7 +985,6 @@ impl<I: AxIo> Live<I> {
         if inputs.band != self.chan.band {
             return Err(AxError::Mac("an association on a band not tuned"));
         }
-        assoc::check(inputs)?;
         let features = Features::of(self.running.firmware);
         let mut held = core::mem::take(&mut self.held);
         let mut dig = self.dig;
@@ -891,6 +1036,220 @@ impl<I: AxIo> Live<I> {
         });
         self.held = held;
         self.done(done)
+    }
+
+    /// The channel context released after the station left (mac80211's
+    /// `ieee80211_link_release_channel` at the end of
+    /// `ieee80211_set_disassoc` and `ieee80211_destroy_auth_data`):
+    /// `rtw89_chanctx_ops_unassign_vif`'s `rtw89_set_channel`
+    /// (`chan.c:3432-3500`), which still finds the context registered and
+    /// switches to its channel again ([`Live::tune`] to [`Live::chan`]),
+    /// then `rtw89_chanctx_ops_remove` (`chan.c:3367-3373`): no context is
+    /// left, so the next scan's restore goes to the default chandef, 2.4
+    /// GHz channel 1 (`rtw89_entity_recalc`, `chan.c:614-616`), without a
+    /// switch now. Refused and failing as [`Live::tune`].
+    ///
+    /// # Safety
+    /// [`start`]'s contract, still holding for this chip.
+    pub unsafe fn release_channel(&mut self) -> Result<(), AxError> {
+        let chan = self.chan;
+        // SAFETY: the caller's contract is `tune`'s, word for word.
+        unsafe { self.tune(&chan) }?;
+        self.home = Chan::new20(BOOT_CHANNEL.band, BOOT_CHANNEL.channel)?;
+        Ok(())
+    }
+
+    /// Queue a management (or null data) frame, `bytes` from its MAC header
+    /// on without FCS, as `rtw89_core_tx_write` does for a station's frame:
+    /// the WD head of [`txd::management`] for the tuned band and the BSS's
+    /// basic rates `basic` (mac80211's band order, 0 before one is known),
+    /// submitted on the channel it names (CH8). `Ok(None)` is "no room":
+    /// the channel is full ([`super::pci::Txq::free`] as of the last reclaim), or a scan
+    /// has not been ended, which stops the queues; nothing is touched. The
+    /// token names the frame until its [`Incoming::Transmitted`]. Refused
+    /// with [`POWERED_OFF`] on a chip off and for what the encoder or
+    /// [`super::pci::Txq::submit`] refuses; a submit failure leaves the chip on.
+    ///
+    /// # Safety
+    /// [`start`]'s contract, still holding for this chip.
+    pub unsafe fn queue_management(
+        &mut self,
+        bytes: &[u8],
+        basic: u16,
+    ) -> Result<Option<Token>, AxError> {
+        if self.off {
+            return Err(POWERED_OFF);
+        }
+        if self.scan.is_some() {
+            return Ok(None);
+        }
+        let (ch, head) = txd::management(bytes, self.chan.band, basic)?;
+        // SAFETY: the caller's contract is `submit`'s, word for word.
+        unsafe { self.submit(ch, &head, bytes) }
+    }
+
+    /// Queue a data frame without a key, as [`Live::queue_management`]
+    /// queues a management frame: the WD head of [`txd::data`] for the
+    /// queue of `tid`, `eapol`, the tuned band, the peer's `supported`
+    /// rates and, once associated, the STBC and LDPC its RA H2C took
+    /// (`rtwsta_link->ra`, `core.c:1144-1145`; neither before).
+    ///
+    /// # Safety
+    /// [`start`]'s contract, still holding for this chip.
+    pub unsafe fn queue_data(
+        &mut self,
+        bytes: &[u8],
+        tid: u8,
+        eapol: bool,
+        supported: u16,
+    ) -> Result<Option<Token>, AxError> {
+        if self.off {
+            return Err(POWERED_OFF);
+        }
+        if self.scan.is_some() {
+            return Ok(None);
+        }
+        let caps = match &self.associated {
+            Some(a) => {
+                let ra = assoc::ra_info(&a.peer, a.band);
+                RateCaps {
+                    stbc: ra.stbc,
+                    ldpc: ra.ldpc,
+                }
+            }
+            None => RateCaps {
+                stbc: false,
+                ldpc: false,
+            },
+        };
+        let (ch, head) = txd::data(bytes, tid, eapol, self.chan.band, supported, caps, None)?;
+        // SAFETY: the caller's contract is `submit`'s, word for word.
+        unsafe { self.submit(ch, &head, bytes) }
+    }
+
+    /// One frame on `ch`, the channel its encoder named ([`super::pci::Txq::submit`]
+    /// checks no head against its queue), counted.
+    ///
+    /// # Safety
+    /// [`start`]'s contract: [`super::pci::Txq::submit`]'s for the live chip's own
+    /// window, rings and pools.
+    unsafe fn submit(
+        &mut self,
+        ch: TxChannel,
+        head: &[u8; WD_HEAD_BYTES],
+        bytes: &[u8],
+    ) -> Result<Option<Token>, AxError> {
+        // SAFETY: the caller's contract; `start` installed the pools for
+        // these rings' own requester.
+        let queued = unsafe {
+            self.rings
+                .txq(&mut self.pools, ch)
+                .submit(&mut self.io, head, bytes)
+        }?;
+        match queued {
+            Some(page) => {
+                bump(&mut self.tx.sent);
+                Ok(Some(token(ch, page)))
+            }
+            None => {
+                bump(&mut self.tx.full);
+                Ok(None)
+            }
+        }
+    }
+
+    /// The radio's poll (M3 spec S1.4), `rtw89_pci_napi_poll`'s order: RPQ,
+    /// each release report returning its page ([`TxPools::release`]) and
+    /// handed on as [`Incoming::Transmitted`], acknowledged for
+    /// `RTW89_TX_DONE`; the TX reclaim of every channel with TXBDs
+    /// outstanding; RXQ ([`Live::drain`]), its frames handed on; the scan
+    /// budget ([`Live::expire_scan`]); then, once, [`Incoming::ScanEnded`]
+    /// when the scan begun has ended, after every frame it heard. Every step
+    /// runs whatever an earlier one returned, and the first error is
+    /// returned. Beacon filter reports are not handed on (M3 Task 18).
+    /// Refused with [`POWERED_OFF`] on a chip off.
+    ///
+    /// # Safety
+    /// [`start`]'s contract, still holding for this chip.
+    pub unsafe fn service(&mut self, sink: &mut dyn FnMut(Incoming)) -> Result<(), AxError> {
+        if self.off {
+            return Err(POWERED_OFF);
+        }
+        // SAFETY: the caller's contract is `reports`'s, word for word.
+        let mut first = unsafe { self.reports(sink) };
+        for ch in TX_CHANNELS {
+            // SAFETY: as above, `reclaim`'s, for the live chip's own window,
+            // rings and pools.
+            let reclaimed = unsafe { self.rings.txq(&mut self.pools, ch).reclaim(&mut self.io) };
+            keep(&mut first, reclaimed);
+        }
+        let mut frames = |e: Event<'_>| {
+            if let Event::Frame(frame) = e {
+                sink(Incoming::Frame(heard(frame)));
+            }
+        };
+        // SAFETY: as above, `drain`'s.
+        keep(&mut first, unsafe { self.drain(&mut frames) });
+        // SAFETY: as above, `expire_scan`'s.
+        keep(&mut first, unsafe { self.expire_scan(&mut frames) });
+        if let Some(scan) = self.scan.as_mut()
+            && !scan.announced
+            && let Some(end) = scan.end
+        {
+            scan.announced = true;
+            sink(Incoming::ScanEnded {
+                completed: end == ScanEnd::Ok,
+            });
+        }
+        first
+    }
+
+    /// One RPQ poll ([`super::pci::Rpq::poll`]): every report of every
+    /// buffer, as `rtw89_pci_release_rpp` takes it.
+    ///
+    /// # Safety
+    /// [`start`]'s contract, still holding for this chip.
+    unsafe fn reports(&mut self, sink: &mut dyn FnMut(Incoming)) -> Result<(), AxError> {
+        let Self {
+            io,
+            rings,
+            pools,
+            tx,
+            ..
+        } = self;
+        let mut rpq = rings.rpq();
+        // SAFETY: the caller's contract is `poll`'s, for the live chip's own
+        // window and rings.
+        let polled = unsafe {
+            rpq.poll(io, &mut |buffer| {
+                let found = releases(buffer)?;
+                tx.skipped = tx.skipped.saturating_add(u32::from(found.invalid));
+                for release in found.reports {
+                    // `releases` keeps only seqs below the pools' 16 and the
+                    // qsels of a channel.
+                    let (Some(ch), Ok(page)) =
+                        (TxChannel::of_qsel(release.qsel), u8::try_from(release.seq))
+                    else {
+                        continue;
+                    };
+                    if !pools.release(ch, page) {
+                        bump(&mut tx.stale);
+                        continue;
+                    }
+                    let acknowledged = release.status == TX_DONE;
+                    bump(&mut tx.reported);
+                    if acknowledged {
+                        bump(&mut tx.acked);
+                    }
+                    sink(Incoming::Transmitted {
+                        token: token(ch, page),
+                        acknowledged,
+                    });
+                }
+                Ok(())
+            })
+        };
+        polled.map(|_| ())
     }
 
     /// The end of an association step run on the session: its error, the
@@ -966,6 +1325,189 @@ impl<I: AxIo> Live<I> {
             bringup::shut_down(&mut io, &rings, host);
         }
         (io, rings, pools)
+    }
+}
+
+/// The live chip beneath an rtw89 station (M3 spec S14.1). Each call is the
+/// [`Live`] operation it names, its error that operation's `AxError` text,
+/// a channel switch's prefixed with its step. Every call but [`Chip::mac`]
+/// and [`Chip::diagnostic`] is refused with [`POWERED_OFF`] once a failure
+/// powered the chip off.
+///
+/// Safe to call as the trait is: [`start`]'s contract is its caller's for
+/// as long as the live chip is used, which every call here is.
+impl<I: AxIo> Chip for Live<I> {
+    fn mac(&self) -> Mac {
+        Mac(self.running.mac)
+    }
+
+    /// [`Live::service`].
+    fn poll(&mut self, sink: &mut dyn FnMut(Incoming)) -> Result<(), String> {
+        // SAFETY: `start`'s contract holds for the live chip's every use.
+        unsafe { self.service(sink) }.map_err(|e| e.to_string())
+    }
+
+    /// [`Live::tune`], a failure named by its step (`"set channel"` or
+    /// `"tx power"`).
+    fn tune(&mut self, channel: Channel) -> Result<(), String> {
+        let chan = chan_of(channel).map_err(|e| failed("set channel", e))?;
+        // SAFETY: `start`'s contract holds for the live chip's every use.
+        unsafe { self.switch(&chan) }.map_err(|e| failed(e.step, e.error))
+    }
+
+    /// [`Live::begin_scan`] of `channels`, each passive with M2c's period
+    /// and dwell ([`scan::scan_list`]), within its own budget
+    /// ([`scan::scan_budget_us`] of the list).
+    fn begin_scan(&mut self, channels: &[Channel]) -> Result<(), String> {
+        if self.off {
+            return Err(POWERED_OFF.to_string());
+        }
+        let mut pairs = Vec::new();
+        for c in channels {
+            let number = u8::try_from(c.number)
+                .map_err(|_| AxError::Scan("scan channel not a 20 MHz 2.4 or 5 GHz channel"))
+                .map_err(|e| e.to_string())?;
+            pairs.push((hw_band(c.band), number));
+        }
+        let list = scan::scan_list(&pairs).map_err(|e| e.to_string())?;
+        // SAFETY: `start`'s contract holds for the live chip's every use.
+        unsafe { Live::begin_scan(self, &list) }.map_err(|e| e.to_string())
+    }
+
+    fn end_scan(&mut self) -> Result<(), String> {
+        // SAFETY: `start`'s contract holds for the live chip's every use.
+        unsafe { Live::end_scan(self) }.map_err(|e| e.to_string())
+    }
+
+    fn set_bssid(&mut self, bssid: Mac) -> Result<(), String> {
+        // SAFETY: `start`'s contract holds for the live chip's every use.
+        unsafe { Live::set_bssid(self, bssid.0) }.map_err(|e| e.to_string())
+    }
+
+    /// [`Live::queue_management`].
+    fn transmit_management(&mut self, frame: &Management<'_>) -> Result<Option<Token>, String> {
+        // SAFETY: `start`'s contract holds for the live chip's every use.
+        unsafe { self.queue_management(frame.bytes, frame.basic_rates) }.map_err(|e| e.to_string())
+    }
+
+    /// [`Live::queue_data`]; a frame with a key is refused until M3b.
+    fn transmit_data(&mut self, frame: &Data<'_>) -> Result<Option<Token>, String> {
+        if self.off {
+            return Err(POWERED_OFF.to_string());
+        }
+        if frame.key.is_some() {
+            return Err(KEYS_BEFORE_M3B.into());
+        }
+        // SAFETY: `start`'s contract holds for the live chip's every use.
+        unsafe { self.queue_data(frame.bytes, frame.tid, frame.eapol, frame.supported_rates) }
+            .map_err(|e| e.to_string())
+    }
+
+    /// [`Live::associate`] with the AP's peer at RSSI 0 (none averaged, M3
+    /// spec S1.9). Linux's channel context is the joined BSS's since the
+    /// join's switch, so there is none here unless `association` names
+    /// another channel than the one tuned, which is switched to first (a
+    /// failure named as [`Chip::tune`] names it).
+    fn associate(&mut self, association: &Association) -> Result<(), String> {
+        if self.off {
+            return Err(POWERED_OFF.to_string());
+        }
+        let chan = chan_of(association.channel).map_err(|e| failed("set channel", e))?;
+        if chan != self.chan {
+            // SAFETY: `start`'s contract holds for the live chip's every use.
+            unsafe { self.switch(&chan) }.map_err(|e| failed(e.step, e.error))?;
+        }
+        let inputs = AssocInputs {
+            mac: self.running.mac,
+            bssid: association.bssid.0,
+            aid: association.aid,
+            band: chan.band,
+            beacon_int: association.beacon_interval,
+            dtim: association.dtim_period,
+            peer: RaPeer {
+                legacy: association.legacy,
+                ht: association.ht,
+                rssi: 0,
+            },
+            edca: association.edca,
+            short_slot: association.short_slot,
+        };
+        // SAFETY: `start`'s contract holds for the live chip's every use.
+        unsafe { Live::associate(self, &inputs) }.map_err(|e| e.to_string())
+    }
+
+    /// [`Live::leave`], then, when a BSSID was set, the channel context
+    /// released ([`Live::release_channel`]).
+    fn disassociate(&mut self) -> Result<(), String> {
+        let joined = self.bssid.is_some();
+        // SAFETY: `start`'s contract holds for the live chip's every use.
+        unsafe { self.leave() }.map_err(|e| e.to_string())?;
+        if joined {
+            // SAFETY: as above.
+            unsafe { self.release_channel() }.map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Refused until M3b ([`KEYS_BEFORE_M3B`]).
+    fn add_key(&mut self, _key: &HardwareKey<'_>) -> Result<u8, String> {
+        if self.off {
+            return Err(POWERED_OFF.to_string());
+        }
+        Err(KEYS_BEFORE_M3B.into())
+    }
+
+    /// Refused until M3b ([`KEYS_BEFORE_M3B`]).
+    fn remove_key(&mut self, _cam: u8) -> Result<(), String> {
+        if self.off {
+            return Err(POWERED_OFF.to_string());
+        }
+        Err(KEYS_BEFORE_M3B.into())
+    }
+
+    /// Accepted without the BA CAM until M3b, with no access.
+    fn start_rx_block_ack(&mut self, _tid: u8, _ssn: u16) -> Result<(), String> {
+        if self.off {
+            return Err(POWERED_OFF.to_string());
+        }
+        Ok(())
+    }
+
+    /// As [`Chip::start_rx_block_ack`].
+    fn stop_rx_block_ack(&mut self, _tid: u8) -> Result<(), String> {
+        if self.off {
+            return Err(POWERED_OFF.to_string());
+        }
+        Ok(())
+    }
+
+    /// The TX counts, RPQ's skipped and stale reports, the receiver's
+    /// drops and the held frames dropped, naming no address.
+    fn diagnostic(&self) -> String {
+        let TxCounts {
+            sent,
+            full,
+            reported,
+            acked,
+            skipped,
+            stale,
+        } = self.tx;
+        let mut line = format!(
+            "tx sent {sent} reported {reported} acked {acked} full {full}, \
+             rpq skipped {skipped} stale {stale}"
+        );
+        if let Some(parked) = &self.parked {
+            let c = parked.rx.counts;
+            line.push_str(&format!(
+                ", rx fcs {} other {} short {} overflow {}",
+                c.dropped_fcs, c.other_frames, c.short_frames, c.overflow
+            ));
+        }
+        line.push_str(&format!(", held dropped {}", self.held.dropped));
+        if self.off {
+            line.push_str(", powered off");
+        }
+        line
     }
 }
 

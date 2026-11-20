@@ -1281,17 +1281,76 @@ fn station_mode_counts_frames_shorter_than_their_header() {
     );
     assert!(seen.is_empty(), "{seen:?}");
     assert_eq!(rx.counts.short_frames, 5);
-    // Exactly a header and an FCS each: delivered without the FCS.
+    // Exactly a header and an FCS each: delivered without the FCS. The
+    // ACK's whole 10 bytes are under mac80211's 16 (`should_drop_frame`).
     let seen = feed(
         &mut rx,
         &[short(&plain[..28]), short(&qos[..30]), short(&ack)],
     );
     let f = frames(&seen);
-    assert_eq!(f.len(), 3, "{seen:?}");
+    assert_eq!(f.len(), 2, "{seen:?}");
     assert_eq!(f[0].mpdu, plain[..24]);
     assert_eq!(f[1].mpdu, qos[..26]);
-    assert_eq!(f[2].mpdu, ack[..10]);
-    assert_eq!(rx.counts.short_frames, 5);
+    assert_eq!(rx.counts.short_frames, 6);
+}
+
+/// A control frame with frame-control byte `fc0`, `len` bytes before its
+/// FCS: a 16-byte header (RA, TA), then the BAR control and starting
+/// sequence or zeros.
+fn control(fc0: u8, len: usize) -> Vec<u8> {
+    let mut b = vec![fc0, 0, 0x05, 0xC0];
+    b.extend_from_slice(&[0x02, 0x11, 0x22, 0x33, 0x44, 0x55]);
+    b.extend_from_slice(&[0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);
+    b.resize(len, 0);
+    b.extend_from_slice(&FCS);
+    b
+}
+
+#[test]
+fn station_mode_drops_control_frames_but_bar_and_ps_poll() {
+    // mac80211's should_drop_frame: under 16 bytes without the FCS, or a
+    // control frame other than PS-Poll and BlockAckReq.
+    let mut rx = station(G2_1);
+    let short = |p: &[u8]| {
+        rx_buffer(
+            &Desc {
+                long: false,
+                ..mgnt(1)
+            },
+            p,
+        )
+    };
+    let seen = feed(
+        &mut rx,
+        &[
+            // RTS, Block Ack, CTS-to-self padded to 16, a control wrapper.
+            short(&control(0xB4, 16)),
+            short(&control(0x94, 24)),
+            short(&control(0xC4, 16)),
+            short(&control(0x74, 24)),
+            // PS-Poll and BlockAckReq go on.
+            short(&control(0xA4, 16)),
+            short(&control(0x84, 20)),
+        ],
+    );
+    let kept: Vec<u8> = frames(&seen).iter().map(|f| f.mpdu[0]).collect();
+    assert_eq!(kept, [0xA4, 0x84], "{seen:?}");
+    assert_eq!(rx.counts.other_frames, 4);
+    assert_eq!(rx.counts.short_frames, 0);
+    // Under 16 bytes: a CTS (10) and an extension frame (12), counted short.
+    let mut cts = control(0xC4, 10);
+    cts.truncate(10);
+    cts.extend_from_slice(&FCS);
+    let mut extension = vec![0x0C, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    extension.extend_from_slice(&FCS);
+    let seen = feed(&mut rx, &[short(&cts), short(&extension)]);
+    assert!(seen.is_empty(), "{seen:?}");
+    assert_eq!(rx.counts.short_frames, 2);
+    assert_eq!(rx.counts.other_frames, 4);
+    // A scan still counts every control frame as another frame, as M2c.
+    let mut scan = Receiver::new(G2_1);
+    assert!(feed(&mut scan, &[short(&control(0xA4, 16))]).is_empty());
+    assert_eq!(scan.counts.other_frames, 1);
 }
 
 #[test]

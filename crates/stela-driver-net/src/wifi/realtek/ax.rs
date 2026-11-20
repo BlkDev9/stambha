@@ -84,6 +84,7 @@ pub mod rf;
 pub mod rfk;
 pub mod rx;
 pub mod scan;
+pub mod station;
 pub mod sys;
 #[cfg(test)]
 pub(crate) mod tests;

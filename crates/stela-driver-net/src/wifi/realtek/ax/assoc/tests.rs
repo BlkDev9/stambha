@@ -547,7 +547,11 @@ fn associate_on_5g_takes_the_short_slot_mac80211_forces() {
 }
 
 #[test]
-fn associate_without_wmm_or_beacon_filter_sends_neither() {
+fn associate_without_wmm_sends_the_qos_defaults() {
+    // mac80211 still enables QoS without WMM ("we might have HT/VHT",
+    // mlme.c:6255-6270): ieee80211_set_wmm_default(.., true) hands
+    // conf_tx 802.11's defaults, then the short slot sends them again. An
+    // old firmware gets no beacon filter.
     let a = AssocInputs {
         edca: None,
         ..inputs(HwBand::G5)
@@ -562,35 +566,89 @@ fn associate_without_wmm_or_beacon_filter_sends_neither() {
     });
     assert_eq!(got, Ok(()));
     let mut b = H2c::at(17);
-    let want = [
+    let defaults = qos_defaults(false);
+    let mut want = edcas(&mut b, &defaults, false, HwBand::G5);
+    want.extend([
         b.assoc_cmac_tbl(0, 0, HwBand::G5).1,
         b.join_info(0, 0, true).1,
         b.addr_cam_with(&AddrCam::connected(LOCAL, AP, 5), 0, 0).1,
         b.ra(0, &ra_info(&a.peer, HwBand::G5)).1,
-    ];
+    ]);
+    want.extend(edcas(&mut b, &defaults, true, HwBand::G5));
     assert_eq!(ran.packets, want);
     // The port update still runs.
     assert!(ran.io.trace.contains(&Op::Delay(101_000)));
 }
 
 #[test]
-fn associate_refuses_edca_out_of_aci_order_before_any_access() {
+fn qos_defaults_are_set_wmm_defaults_with_qos() {
+    // util.c:1054-1117: aCWmin 15 (31 for 11b), aCWmax 1023; BE AIFS 3, BK
+    // 7; VI CW 7-15 (15-31), TXOP 3008 us (6016); VO CW 3-7 (7-15), TXOP
+    // 1504 us (3264); in ACI order, BE, BK, VI, VO.
+    assert_eq!(
+        qos_defaults(false),
+        [
+            ac(0, 3, 4, 10, 0),
+            ac(1, 7, 4, 10, 0),
+            ac(2, 2, 3, 4, 94),
+            ac(3, 2, 2, 3, 47),
+        ]
+    );
+    assert_eq!(
+        qos_defaults(true),
+        [
+            ac(0, 3, 5, 10, 0),
+            ac(1, 7, 5, 10, 0),
+            ac(2, 2, 4, 5, 188),
+            ac(3, 2, 3, 4, 102),
+        ]
+    );
+}
+
+#[test]
+fn an_invalid_edca_set_falls_back_to_the_qos_defaults() {
+    // _ieee80211_sta_wmm_params (mlme.c:4218-4247): CWmin 0, CWmin above
+    // CWmax, or an AC missing (here out of ACI order) is "using defaults";
+    // an AIFSN under 2 is taken as 2.
     let w = wmm();
+    let mut zero = w;
+    zero[1].ecw_min = 0;
+    let mut above = w;
+    above[2].ecw_min = 5;
+    for edca in [[w[3], w[2], w[0], w[1]], zero, above] {
+        // On 2.4 GHz with an 11b-only peer: the 11b defaults.
+        let mut a = AssocInputs {
+            edca: Some(edca),
+            short_slot: false,
+            ..inputs(HwBand::G2)
+        };
+        a.peer.legacy = 0xF;
+        a.peer.ht = None;
+        // SAFETY: as in `set_bssid_sends_the_pre_auth_cam_then_suspends_dig`.
+        let (got, ran) = on_session(17, &|_| {}, |io, s, sink| unsafe {
+            associate(io, s, &a, FULL, &mut Dig::default(), sink)
+        });
+        assert_eq!(got, Ok(()));
+        let want = edcas(&mut H2c::at(17), &qos_defaults(true), false, HwBand::G2);
+        assert_eq!(ran.packets[..4], want[..]);
+        assert_eq!(ran.packets.len(), 9);
+    }
+    let mut low = w;
+    low[0].aifsn = 1;
     let a = AssocInputs {
-        edca: Some([w[3], w[2], w[0], w[1]]),
+        edca: Some(low),
         ..inputs(HwBand::G5)
     };
-    let mut dig = Dig::default();
-    // SAFETY: as in `set_bssid_sends_the_pre_auth_cam_then_suspends_dig`.
-    let (got, ran) = on_session(17, &|_| {}, |io, s, sink| {
-        let before = io.trace.len();
-        // SAFETY: as above.
-        let got = unsafe { associate(io, s, &a, FULL, &mut dig, sink) };
-        (got, io.trace.len() - before)
+    // SAFETY: as above.
+    let (got, ran) = on_session(17, &|_| {}, |io, s, sink| unsafe {
+        associate(io, s, &a, FULL, &mut Dig::default(), sink)
     });
-    assert!(matches!(got.0, Err(AxError::Mac(_))), "{:?}", got.0);
-    assert_eq!(got.1, 0);
-    assert_eq!(ran.h2c, H2c::at(17));
+    assert_eq!(got, Ok(()));
+    // BE (seq 19, mac80211's third) with AIFS 2.
+    let mut clamped = w;
+    clamped[0].aifsn = 2;
+    let want = edcas(&mut H2c::at(17), &clamped, false, HwBand::G5);
+    assert_eq!(ran.packets[..4], want[..]);
 }
 
 #[test]
@@ -706,7 +764,8 @@ fn leave_takes_the_defaults_of_the_bss_it_left() {
             assert_eq!(payload_word(p, 1), word, "{legacy:#x}");
         }
     }
-    // Without WMM the radio programs no EDCA, nor without the feature any
+    // Without WMM, ERP_SLOT still sends the QoS defaults the association
+    // programmed, then the defaults without QoS; without the feature no
     // beacon filter.
     let a = AssocInputs {
         edca: None,
@@ -722,12 +781,20 @@ fn leave_takes_the_defaults_of_the_bss_it_left() {
     });
     assert_eq!(got, Ok(()));
     let mut b = H2c::at(31);
-    let want = [
+    let mut want = vec![
         b.assoc_cmac_tbl(0, 0, HwBand::G5).1,
         b.join_info(0, 0, false).1,
         b.addr_cam_with(&AddrCam::with_bssid(LOCAL, AP), 0, 0).1,
         b.addr_cam(LOCAL, 0, 0).1,
     ];
+    want.extend(edcas(&mut b, &qos_defaults(false), false, HwBand::G5));
+    let defaults = [
+        ac(0, 2, 4, 10, 0),
+        ac(1, 2, 4, 10, 0),
+        ac(2, 2, 4, 10, 0),
+        ac(3, 2, 4, 10, 0),
+    ];
+    want.extend(edcas(&mut b, &defaults, false, HwBand::G5));
     assert_eq!(ran.packets, want);
 }
 

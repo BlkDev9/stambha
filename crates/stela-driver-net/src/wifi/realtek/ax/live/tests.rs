@@ -28,6 +28,8 @@ use crate::wifi::station::phy::AccessCategory;
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use std::sync::Mutex;
 
+mod chip;
+
 type Started = Result<Live<RegisterModel>, StartError<RegisterModel>>;
 
 /// [`start`] on `c`'s chip, cut 2, without LTR, with the elements of `file`

@@ -31,12 +31,14 @@
 //!   and a frame failing its FCS or ICV is delivered flagged.
 //! - [`Mode::Station`] (M3 spec S7.1): every WIFI frame, once. A frame
 //!   failing its FCS or ICV (`RX_FLAG_FAILED_FCS_CRC`) is dropped and
-//!   counted, as mac80211 drops it, and so is one shorter than its
-//!   `ieee80211_hdrlen` and the FCS, as mac80211 drops it short. Beacons and
-//!   probe responses still wait for their status; every other frame is
-//!   delivered at once without a signal. Linux queues data frames for their
-//!   status too (`core.c:4554-4558`), but no Stela station decision reads a
-//!   data frame's signal.
+//!   counted, as mac80211 drops it, and so are, as its `should_drop_frame`
+//!   drops them, one under 16 bytes without the FCS and a control frame
+//!   other than PS-Poll and BlockAckReq; one shorter than its
+//!   `ieee80211_hdrlen` and the FCS is dropped as mac80211 drops it short.
+//!   Beacons and probe responses still wait for their status; every other
+//!   frame is delivered at once without a signal. Linux queues data frames
+//!   for their status too (`core.c:4554-4558`), but no Stela station
+//!   decision reads a data frame's signal.
 //!
 //! Linux matches and flushes each queued frame on its own, so neither
 //! restriction changes a kept frame's outcome, only its order relative to
@@ -78,6 +80,14 @@ const FCS_LEN: usize = 4;
 const FC0_TYPE_SUBTYPE: u8 = 0xFC;
 const FC0_BEACON: u8 = 0x80;
 const FC0_PROBE_RESP: u8 = 0x50;
+/// Type [3:2] 1 is control; PS-Poll and BlockAckReq are its subtypes 0xA
+/// and 8 (`ieee80211_is_pspoll`, `ieee80211_is_back_req`).
+const FC0_TYPE: u8 = 0x0C;
+const FC0_TYPE_CTL: u8 = 0x04;
+const FC0_PSPOLL: u8 = 0xA4;
+const FC0_BACK_REQ: u8 = 0x84;
+/// The shortest frame mac80211 keeps (`should_drop_frame`'s 16).
+const MIN_FRAME_LEN: usize = 16;
 /// `RTW89_HW_RATE_OFDM6` (`core.h:349`): legacy indices below it are CCK.
 const HW_RATE_OFDM6: u8 = 4;
 
@@ -132,11 +142,12 @@ pub enum Event<'a> {
 
 /// What was dropped or seen, all saturating. `segments`: multi-buffer
 /// frames, not assembled. `other_frames`: in [`Mode::Scan`], WIFI frames
-/// that are not beacons or probe responses. `short_frames`: WIFI payloads
+/// that are not beacons or probe responses; in [`Mode::Station`], control
+/// frames other than PS-Poll and BlockAckReq. `short_frames`: WIFI payloads
 /// without a frame-control field, and frames shorter than their header
 /// and an FCS (in [`Mode::Scan`], beacons and probe responses under 24
-/// bytes and the FCS; in [`Mode::Station`], any frame under its
-/// `ieee80211_hdrlen` and the FCS). `dropped_fcs`: in [`Mode::Station`],
+/// bytes and the FCS; in [`Mode::Station`], any frame under 16 bytes or its
+/// `ieee80211_hdrlen`, and the FCS). `dropped_fcs`: in [`Mode::Station`],
 /// WIFI frames failing their FCS or ICV. `ppdu`: PPDU statuses processed
 /// (`curr` ≤ 8), including those that found the queue empty.
 /// `ppdu_ignored`: PPDU statuses that came before any WIFI frame (`curr`
@@ -329,6 +340,19 @@ impl Receiver {
                 return;
             }
             Mode::Scan => HDR_LEN,
+            // mac80211's `should_drop_frame`, after the FCS: under 16 bytes,
+            // or a control frame other than PS-Poll and BlockAckReq.
+            Mode::Station if payload.len() < MIN_FRAME_LEN + FCS_LEN => {
+                bump(&mut self.counts.short_frames);
+                return;
+            }
+            Mode::Station
+                if fc0 & FC0_TYPE == FC0_TYPE_CTL
+                    && !matches!(fc0 & FC0_TYPE_SUBTYPE, FC0_PSPOLL | FC0_BACK_REQ) =>
+            {
+                bump(&mut self.counts.other_frames);
+                return;
+            }
             Mode::Station => match payload.get(..2) {
                 Some(&[fc0, fc1]) => header_len(u16::from_le_bytes([fc0, fc1])),
                 _ => {

@@ -12,7 +12,8 @@
 //!   on this chip is `rtw89_phy_dig_suspend`), the order mac80211's
 //!   `ieee80211_prep_connection` gives them (`mlme.c:9721-9737`).
 //! - [`associate`], at the association response: mac80211's
-//!   `ieee80211_assoc_config_link` programs the AP's WMM parameters first
+//!   `ieee80211_assoc_config_link` programs the AP's WMM parameters first,
+//!   or 802.11's QoS defaults without valid ones (`mlme.c:6255-6270`)
 //!   (`rtw89_ops_conf_tx`, `mac80211.c:912-937`, for VO, VI, BE and BK,
 //!   `mlme.c:4096-4116`, `:6257`) with the long slot, which every
 //!   disassociation resets (`ieee80211_reset_erp_info`, `main.c:430-438`);
@@ -76,8 +77,8 @@
 //! watchdog, keys (M3b: the key deletes before the beacon filter goes off,
 //! `sta_info.c:1577-1578`), RX block ack teardown, TX flushes, and any
 //! channel switch. Nor `ieee80211_regulatory_limit_wmm_params` on the
-//! defaults [`leave`] programs: the station layer limits the AP's
-//! parameters, which [`associate`] takes as given.
+//! defaults [`associate`] and [`leave`] program: the station layer limits
+//! the AP's parameters, which [`associate`] takes as given.
 use super::chan::HwBand;
 use super::command::Session;
 use super::dm::Dig;
@@ -395,8 +396,10 @@ pub struct AssocInputs {
     pub dtim: u8,
     pub peer: RaPeer,
     /// The AP's EDCA parameters in ACI order (BE, BK, VI, VO), as mac80211
-    /// hands them to `conf_tx`; `None`: the radio programs no EDCA (rtw88's
-    /// rule without WMM, spec S10.8).
+    /// hands them to `conf_tx`. `None`, the AP without WMM, and a set
+    /// mac80211 finds invalid both program 802.11's QoS defaults, as
+    /// `ieee80211_assoc_config_link` does (`mlme.c:6255-6270`,
+    /// [`qos_defaults`]; see [`AssocInputs::params`]).
     pub edca: Option<[AccessCategory; 4]>,
     /// `bss_conf->use_short_slot` from the AP's capability; 5 GHz is always
     /// short (`mlme.c:4310-4313`).
@@ -408,7 +411,41 @@ impl AssocInputs {
     fn short_slot(&self) -> bool {
         self.short_slot || self.band != HwBand::G2
     }
+
+    /// `use_11b` of `ieee80211_set_wmm_default` (`util.c:1047-1049`): a 2.4
+    /// GHz BSS that is not `operating_11g_mode`, which has no rate above 11
+    /// Mbps (`mlme.c:6352-6353`).
+    fn use_11b(&self) -> bool {
+        self.band == HwBand::G2 && self.peer.legacy & RATES_ABOVE_11M == 0
+    }
+
+    /// The EDCA parameters `conf_tx` gets at the association, in ACI order:
+    /// the AP's, each AIFSN under 2 taken as 2, as
+    /// `_ieee80211_sta_wmm_params` takes them (`mlme.c:4218-4224`); or, with
+    /// no WMM or a set it finds invalid (an AC missing, here one out of ACI
+    /// order, CWmin 0 or CWmin above CWmax, `mlme.c:4230-4247`), the QoS
+    /// defaults ([`qos_defaults`]).
+    pub fn params(&self) -> [AccessCategory; 4] {
+        let valid = |edca: &[AccessCategory; 4]| {
+            edca.iter()
+                .enumerate()
+                .all(|(i, c)| usize::from(c.aci) == i && c.ecw_min != 0 && c.ecw_min <= c.ecw_max)
+        };
+        match self.edca {
+            Some(mut edca) if valid(&edca) => {
+                for c in &mut edca {
+                    c.aifsn = c.aifsn.max(2);
+                }
+                edca
+            }
+            _ => qos_defaults(self.use_11b()),
+        }
+    }
 }
+
+/// The 2.4 GHz rates above 11 Mbps, OFDM 12-54 (bits 6-11 of the 12-bit
+/// order).
+const RATES_ABOVE_11M: u16 = 0xFC0;
 
 /// mac80211's AC order, VO, VI, BE, BK (`IEEE80211_AC_VO` 0 to `_BK` 3),
 /// as the ACIs `ac_to_fw_idx` maps them to (`mac80211.c:386-391`).
@@ -421,25 +458,6 @@ const B_AX_BFMEE_NDPA_EN: u32 = 0x7;
 /// `rtw89_mac_mu_gid_addr_ax` (`mac.c:4489-4493`, `reg.h:2178-2189`): the
 /// two position enables, then the four positions.
 const GID_TABLE: [u32; 6] = [0xC080, 0xC084, 0xC070, 0xC074, 0xC078, 0xC07C];
-
-/// Refuse what mac80211 never hands the driver, before any access: EDCA
-/// parameters out of ACI order, or a set `_ieee80211_sta_wmm_params` would
-/// drop for its defaults (CWmin 0 or above CWmax, `mlme.c:4230-4236`).
-pub(super) fn check(assoc: &AssocInputs) -> Result<(), AxError> {
-    if let Some(edca) = &assoc.edca {
-        if edca
-            .iter()
-            .enumerate()
-            .any(|(i, c)| usize::from(c.aci) != i)
-        {
-            return Err(AxError::Mac("EDCA parameters not in ACI order"));
-        }
-        if edca.iter().any(|c| c.ecw_min == 0 || c.ecw_min > c.ecw_max) {
-            return Err(AxError::Mac("EDCA parameters with CWmin 0 or above CWmax"));
-        }
-    }
-    Ok(())
-}
 
 /// `rtw89_conf_tx` (`mac80211.c:479-486`), each AC in mac80211's order:
 /// one EDCA H2C for `params` with the slot `short_slot` gives on `band`.
@@ -461,6 +479,36 @@ unsafe fn conf_tx<I: AxIo + ?Sized>(
         unsafe { session.send(io, packet, sink) }?;
     }
     Ok(())
+}
+
+/// `ieee80211_set_wmm_default(enable_qos = true)` (`util.c:1054-1117`,
+/// 802.11-2007 Table 7-37), in ACI order: aCWmin 31 when `use_11b`, else 15, and
+/// aCWmax 1023; BE AIFSN 3 and BK 7, each CWmin aCWmin and CWmax aCWmax, no
+/// TXOP; VI AIFSN 2, CW `(aCWmin + 1) / 2 - 1` to aCWmin, TXOP 3008 us
+/// (6016 with `use_11b`); VO AIFSN 2, CW `(aCWmin + 1) / 4 - 1` to
+/// `(aCWmin + 1) / 2 - 1`, TXOP 1504 us (3264). As exponents: aCWmin 15 is
+/// 4 and 31 is 5.
+pub fn qos_defaults(use_11b: bool) -> [AccessCategory; 4] {
+    let cw = if use_11b { 5 } else { 4 };
+    let ac = |aci: u8, aifsn: u8, ecw_min: u8, ecw_max: u8, txop_32us: u16| AccessCategory {
+        aci,
+        admission_control: false,
+        aifsn,
+        ecw_min,
+        ecw_max,
+        txop_32us,
+    };
+    let (vi_txop, vo_txop) = if use_11b {
+        (6016 / 32, 3264 / 32)
+    } else {
+        (3008 / 32, 1504 / 32)
+    };
+    [
+        ac(0, 3, cw, 10, 0),
+        ac(1, 7, cw, 10, 0),
+        ac(2, 2, cw - 1, cw, vi_txop),
+        ac(3, 2, cw - 2, cw - 1, vo_txop),
+    ]
 }
 
 /// `ieee80211_set_wmm_default(enable_qos = false)` (`util.c:1025-1135`):
@@ -504,13 +552,13 @@ pub unsafe fn set_bssid<I: AxIo + ?Sized>(
 }
 
 /// The association (M3 spec S10; see the module documentation), in Linux's
-/// order: with WMM, the AP's EDCA parameters with the long slot; the CMAC
-/// table, join info connected, the address CAM with the AID, the RA, the
-/// beacon filter when the firmware has it (`features`), DIG resumed when
-/// paused with spatial reuse off (`total_sta_assoc` counts this station
-/// only after `rtw89_core_sta_link_assoc` returns, `mac80211.c:569-575`);
-/// the INFRA port update; with WMM and the short slot, the EDCA parameters
-/// again. Refused with `Mac` before any access for what [`check`] refuses.
+/// order: the EDCA parameters of [`AssocInputs::params`] with the long
+/// slot; the CMAC table, join info connected, the address CAM with the AID,
+/// the RA, the beacon filter when the firmware has it (`features`), DIG
+/// resumed when paused with spatial reuse off (`total_sta_assoc` counts
+/// this station only after `rtw89_core_sta_link_assoc` returns,
+/// `mac80211.c:569-575`); the INFRA port update; with the short slot, the
+/// EDCA parameters again.
 ///
 /// # Safety
 /// As [`set_bssid`].
@@ -522,12 +570,10 @@ pub unsafe fn associate<I: AxIo + ?Sized>(
     dig: &mut Dig,
     sink: &mut dyn FnMut(Event<'_>),
 ) -> Result<(), AxError> {
-    check(assoc)?;
     let band = assoc.band;
-    if let Some(edca) = &assoc.edca {
-        // SAFETY: the caller's contract is `conf_tx`'s, word for word.
-        unsafe { conf_tx(io, session, edca, false, band, sink) }?;
-    }
+    let edca = assoc.params();
+    // SAFETY: the caller's contract is `conf_tx`'s, word for word.
+    unsafe { conf_tx(io, session, &edca, false, band, sink) }?;
     // Each H2C takes its seq right before its send, as
     // `rtw89_h2c_pkt_set_hdr` does: a failed send leaves the later ones
     // unnumbered.
@@ -551,11 +597,9 @@ pub unsafe fn associate<I: AxIo + ?Sized>(
     }
     dig.resume(io, false)?;
     vif::port_update(io, &PortConfig::infra(assoc.beacon_int, assoc.dtim))?;
-    if let Some(edca) = &assoc.edca
-        && assoc.short_slot()
-    {
+    if assoc.short_slot() {
         // SAFETY: as above, `conf_tx`'s.
-        unsafe { conf_tx(io, session, edca, true, band, sink) }?;
+        unsafe { conf_tx(io, session, &edca, true, band, sink) }?;
     }
     Ok(())
 }
@@ -564,10 +608,10 @@ pub unsafe fn associate<I: AxIo + ?Sized>(
 /// documentation), in Linux's order: the beacon filter off when the
 /// firmware has it; the beamformee's NDPA off on MAC 0; the CMAC table,
 /// join info disconnected, the address CAM with NO_LINK; the address CAM
-/// with the BSSID cleared; with WMM, the AP's EDCA parameters with the long
-/// slot, the GID table cleared, then [`wmm_defaults`] with the long slot;
-/// without, the GID table alone. Nothing of the port or DIG. Refused with
-/// `Mac` before any access for what [`check`] refuses.
+/// with the BSSID cleared; the association's EDCA parameters
+/// ([`AssocInputs::params`]) with the long slot (`BSS_CHANGED_ERP_SLOT`,
+/// which `ieee80211_reset_erp_info` always raises), the GID table cleared,
+/// then [`wmm_defaults`] with the long slot. Nothing of the port or DIG.
 ///
 /// # Safety
 /// As [`set_bssid`].
@@ -578,7 +622,6 @@ pub unsafe fn leave<I: AxIo + ?Sized>(
     features: Features,
     sink: &mut dyn FnMut(Event<'_>),
 ) -> Result<(), AxError> {
-    check(assoc)?;
     let band = assoc.band;
     if features.beacon_filter {
         let packet = session.h2c.bcn_fltr(MAC_ID, false, features.loss_count_v1);
@@ -599,20 +642,16 @@ pub unsafe fn leave<I: AxIo + ?Sized>(
     unsafe { session.send(io, packet, sink) }?;
     // SAFETY: as above, `clear_bssid`'s.
     unsafe { clear_bssid(io, session, assoc.mac, sink) }?;
-    if let Some(edca) = &assoc.edca {
-        // SAFETY: as above, `conf_tx`'s.
-        unsafe { conf_tx(io, session, edca, false, band, sink) }?;
-    }
+    // SAFETY: as above, `conf_tx`'s.
+    unsafe { conf_tx(io, session, &assoc.params(), false, band, sink) }?;
     // The membership and position tables, zeroed before the notify
     // (`mlme.c:4654-4657`), as plain writes.
     for reg in GID_TABLE {
         io.write32(reg, 0)?;
     }
-    if assoc.edca.is_some() {
-        let use_11b = band == HwBand::G2 && assoc.peer.legacy & 0xFC0 == 0;
-        // SAFETY: as above, `conf_tx`'s.
-        unsafe { conf_tx(io, session, &wmm_defaults(use_11b), false, band, sink) }?;
-    }
+    let defaults = wmm_defaults(assoc.use_11b());
+    // SAFETY: as above, `conf_tx`'s.
+    unsafe { conf_tx(io, session, &defaults, false, band, sink) }?;
     Ok(())
 }
 

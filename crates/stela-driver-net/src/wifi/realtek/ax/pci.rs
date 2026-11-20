@@ -1327,19 +1327,28 @@ pub struct Release {
     pub qsel: u8,
 }
 
+/// The release reports of one RPQ buffer ([`releases`]): the ones that name
+/// a page, in buffer order, and how many were skipped (M3 spec S6's
+/// `invalid`, saturating).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Releases {
+    pub reports: Vec<Release>,
+    pub invalid: u16,
+}
+
 /// The release reports of one whole RPQ buffer, as
 /// `rtw89_pci_release_tx_skbs` (`pci.c:644-695`) reads them: the RX BD info
 /// word, then the RX descriptor (16 bytes, or 32 when `LONG_RXD`) after
 /// `DRV_INFO_SIZE` 8-byte units (`rtw89_core_query_rxdesc`,
 /// `core.c:4140-4146`, the shift always 0), then one RPP dword every 4
 /// bytes while `offset + 4 <= WRITE_SIZE`. A report whose seq is past the
-/// pools (16) or whose qsel names no [`TxChannel`] is skipped, where Linux
-/// warns and skips seqs from 512 and channels it has no ring for
-/// (`pci.c:607-617`).
+/// pools (16) or whose qsel names no [`TxChannel`] is skipped and counted in
+/// [`Releases::invalid`], where Linux warns and skips seqs from 512 and
+/// channels it has no ring for (`pci.c:607-617`).
 ///
 /// A buffer that is not both FS and LS (`pci.c:672-675`), one too short
 /// for its descriptor, or one whose `WRITE_SIZE` runs past it is refused.
-pub fn releases(buffer: &[u8]) -> Result<Vec<Release>, AxError> {
+pub fn releases(buffer: &[u8]) -> Result<Releases, AxError> {
     let word = |at: usize| -> Option<u32> {
         Some(u32::from_le_bytes(buffer.get(at..at + 4)?.try_into().ok()?))
     };
@@ -1360,7 +1369,10 @@ pub fn releases(buffer: &[u8]) -> Result<Vec<Release>, AxError> {
     };
     let drv_info = ((d0 >> RXD_DRV_INFO_SHIFT) & RXD_DRV_INFO) as usize * 8;
     let mut offset = RXBD_INFO_BYTES + drv_info + rxd;
-    let mut out = Vec::new();
+    let mut out = Releases {
+        reports: Vec::new(),
+        invalid: 0,
+    };
     while offset + RPP_BYTES <= write_size {
         let rpp = word(offset).ok_or(SHORT)?;
         offset += RPP_BYTES;
@@ -1370,11 +1382,13 @@ pub fn releases(buffer: &[u8]) -> Result<Vec<Release>, AxError> {
             qsel: ((rpp >> RPP_QSEL_SHIFT) & RPP_QSEL) as u8,
         };
         if usize::from(release.seq) >= WD_PAGES || TxChannel::of_qsel(release.qsel).is_none() {
+            out.invalid = out.invalid.saturating_add(1);
             continue;
         }
-        out.try_reserve(1)
+        out.reports
+            .try_reserve(1)
             .map_err(|_| AxError::Tx("out of memory for release reports"))?;
-        out.push(release);
+        out.reports.push(release);
     }
     Ok(out)
 }
