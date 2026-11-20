@@ -201,7 +201,8 @@ fn network(bssid: [u8; 6], band: HwBand, channel: u8, signal: Option<i8>, ssid: 
 }
 
 /// What a live chip started on `bringup::tests::chip_hearing` with BOTH acks
-/// and `script` scanned with [`run_once`], with the trace once stopped.
+/// and `script` scanned with [`run_once`], with the receiver's mode and tag
+/// once `then` ran on it, and the trace once stopped.
 struct Ran {
     got: Result<ScanReport, ScanError>,
     h2c: H2c,
@@ -211,6 +212,10 @@ struct Ran {
 }
 
 fn run_once_hearing(script: &dyn Fn(&mut Firmware)) -> Ran {
+    run_once_then(script, &|_| {})
+}
+
+fn run_once_then(script: &dyn Fn(&mut Firmware), then: &dyn Fn(&mut Live<RegisterModel>)) -> Ran {
     let c = chip_hearing(efuse_with_mac(), 7, never, BOTH, script);
     let bytes = image_bytes();
     let fw = Rtw89::parse(&bytes, 2, Ce::Never).unwrap();
@@ -239,6 +244,7 @@ fn run_once_hearing(script: &dyn Fn(&mut Firmware)) -> Ran {
     };
     // SAFETY: as above; the live chip is this test's alone.
     let got = unsafe { run_once(&mut live) };
+    then(&mut live);
     let (h2c, mode, tag) = (live.h2c(), live.receiver().mode(), live.receiver().tag());
     // SAFETY: as above.
     let (io, _rings, _pools) = unsafe { live.stop() };
@@ -332,24 +338,27 @@ fn the_scan_steps_are_m2cs_with_set_txpwr_alone_inserted_before_help_exit() {
     );
 }
 
+/// A data frame on channel 6 during the scan: M2c's scan receiver counts it
+/// among its other frames, where a station receiver would deliver it and
+/// the scanner refuse it as dropped.
+fn home_and_data(fw: &mut Firmware) {
+    fw.beacon(CH6, HOME, b"Home", 0x70);
+    fw.buffers(
+        CH6,
+        vec![mgnt_frame(0x08, BROADCAST, HOME, b"data", None, 9)],
+    );
+}
+
 #[test]
-fn run_once_scans_with_the_scan_receiver_then_keeps_the_station_one() {
-    // A data frame on channel 6 during the scan: M2c's scan receiver counts
-    // it among its other frames, where a station receiver would deliver it
-    // and the scanner refuse it as dropped.
-    let s = run_once_hearing(&|fw| {
-        fw.beacon(CH6, HOME, b"Home", 0x70);
-        fw.buffers(
-            CH6,
-            vec![mgnt_frame(0x08, BROADCAST, HOME, b"data", None, 9)],
-        );
-    });
+fn run_once_scans_with_the_scan_receiver_and_leaves_the_restore_to_end_scan() {
+    let s = run_once_hearing(&home_and_data);
     let r = s.got.unwrap_or_else(|e| panic!("{e:?}"));
     assert_eq!((r.frames, r.dropped, r.networks_total), (1, 0, 1));
-    // Then the station receiver again, tagging with the channel the
-    // firmware left the radio on, the last ENTER_CH (5 GHz 165): run_once
-    // runs none of rtw89_hw_scan_complete's restores.
-    assert_eq!(s.mode, Mode::Station);
+    // run_once runs none of rtw89_hw_scan_complete's restores: the scan's RX
+    // filter is still on, so the scan's receiver stays, tagging with the
+    // channel the firmware left the radio on, the last ENTER_CH (5 GHz
+    // 165).
+    assert_eq!(s.mode, Mode::Scan);
     assert_eq!(
         s.tag,
         Tag {
@@ -357,6 +366,54 @@ fn run_once_scans_with_the_scan_receiver_then_keeps_the_station_one() {
             channel: 165
         }
     );
+}
+
+#[test]
+fn end_scan_after_run_once_restores_the_operating_channel_and_the_station_receiver() {
+    let s = run_once_then(&home_and_data, &|live| {
+        assert_eq!(live.scan_state(), Some(ScanEnd::Ok));
+        assert_eq!(live.io().get32(0xCE20), 0x0317_4438);
+        // SAFETY: the live chip is this test's alone, as in
+        // `run_once_then`.
+        unsafe { live.end_scan() }.unwrap();
+        assert_eq!(live.scan_state(), None);
+        // The station's RX filter again.
+        assert_eq!(live.io().get32(0xCE20), 0x0317_44BE);
+    });
+    s.got.unwrap_or_else(|e| panic!("{e:?}"));
+    // The address CAM of the restore took seq 20.
+    assert_eq!(s.h2c, H2c::at(21));
+    assert_eq!(s.mode, Mode::Station);
+    assert_eq!(s.tag, BOOT_CHANNEL);
+}
+
+#[test]
+fn scan_list_and_budget_follow_m2cs_rules() {
+    // Spec S8.1: 2 * n * 105 ms + 1 s; M2c's 38 channels give its 8 980 ms,
+    // the keeper's largest list (14 + 28) 9 820 ms.
+    assert_eq!(scan_budget_us(SCAN_CHANNELS.len()), SCAN_WAIT_US);
+    assert_eq!(SCAN_WAIT_US, 8_980_000);
+    assert_eq!(scan_budget_us(3), 1_630_000);
+    assert_eq!(scan_budget_us(42), 9_820_000);
+    // Each channel passive, as M2c's list has it.
+    let list = scan_list(&[(HwBand::G2, 1), (HwBand::G5, 36), (HwBand::G5, 165)]).unwrap();
+    assert_eq!(
+        list,
+        [SCAN_CHANNELS[0], SCAN_CHANNELS[13], SCAN_CHANNELS[37]]
+    );
+    let all: Vec<(HwBand, u8)> = SCAN_CHANNELS.iter().map(|c| (c.band, c.channel)).collect();
+    assert_eq!(scan_list(&all).unwrap(), SCAN_CHANNELS);
+    // Nothing to scan, and channels no 20 MHz switch here could tune.
+    assert_eq!(scan_list(&[]), Err(AxError::Scan("empty scan list")));
+    for bad in [(HwBand::G6, 37), (HwBand::G2, 15), (HwBand::G5, 32)] {
+        assert_eq!(
+            scan_list(&[(HwBand::G2, 1), bad]),
+            Err(AxError::Scan(
+                "scan channel not a 20 MHz 2.4 or 5 GHz channel"
+            )),
+            "{bad:?}"
+        );
+    }
 }
 
 #[test]
