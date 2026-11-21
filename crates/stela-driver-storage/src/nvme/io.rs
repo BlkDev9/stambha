@@ -304,6 +304,13 @@ impl Controller {
         words[1] = namespace;
         match command {
             Command::Read { lba, bytes } => {
+                // The pool may hand a read the pages a write just filled:
+                // the bytes it gathers are poison until the controller
+                // moves its data in, at every run of the command.
+                for index in 0..bytes.div_ceil(PAGE) {
+                    let part = (bytes - index * PAGE).min(PAGE);
+                    self.tag_page(tag, index).bytes_mut()[..part].fill(READ_POISON);
+                }
                 let pointers = self.data_pointers(tag, *bytes)?;
                 Ok(transfer_command(
                     IO_READ,

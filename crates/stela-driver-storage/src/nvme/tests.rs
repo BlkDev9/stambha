@@ -266,15 +266,16 @@ fn synchronous_read_changes_the_caller_only_after_success() {
     let mut data = [0x11; 512];
     {
         let mut controller = disk.controller.borrow_mut();
-        next_page(&mut controller).bytes_mut()[..512].fill(0x42);
         controller.io.completions.write(8, 1u32 << 16 | 1);
         controller.io.completions.write(12, 1u32 << 16 | 1);
     }
+    // The fixture moves no data: the caller is given what the read's page
+    // holds, the poison it was filled with.
     disk.read(0, &mut data).unwrap();
-    assert_eq!(data, [0x42; 512]);
+    assert_eq!(data, [READ_POISON; 512]);
+    data = [0x11; 512];
     {
         let mut controller = disk.controller.borrow_mut();
-        next_page(&mut controller).bytes_mut()[..512].fill(0x87);
         controller.io.completions.write(16 + 8, 1u32 << 16 | 2);
         controller
             .io
@@ -287,7 +288,40 @@ fn synchronous_read_changes_the_caller_only_after_success() {
             status: STATUS_DO_NOT_RETRY | 2
         })
     );
-    assert_eq!(data, [0x42; 512]);
+    assert_eq!(data, [0x11; 512]);
+}
+
+/// A read the controller reports done without moving its data reads as
+/// [`READ_POISON`], not as what an earlier command left in the pool's
+/// pages: read back after a write the disk did not take, it is not the
+/// write's.
+#[test]
+fn a_read_that_moves_no_data_does_not_echo_the_write_before_it() {
+    let _clock = crate::test_clock::virtualize();
+    let mut fixture = Fixture::new();
+    let disk = &mut fixture.disk;
+    // Three pages, and a PRP list.
+    let written: Vec<u8> = (0..3 * PAGE).map(|at| (at % 251) as u8).collect();
+    {
+        let mut controller = disk.controller.borrow_mut();
+        controller.io.completions.write(8, 1u32 << 16 | 1);
+        controller.io.completions.write(12, 1u32 << 16 | 1);
+    }
+    disk.write(0, &written).unwrap();
+    {
+        let mut controller = disk.controller.borrow_mut();
+        // The read takes the pages the write filled, which still hold it.
+        assert_eq!(
+            &next_page(&mut controller).bytes()[..PAGE],
+            &written[..PAGE]
+        );
+        controller.io.completions.write(16 + 8, 1u32 << 16 | 2);
+        controller.io.completions.write(16 + 12, 1u32 << 16 | 2);
+    }
+    let mut back = vec![0x11; written.len()];
+    disk.read(0, &mut back).unwrap();
+    assert_ne!(back, written);
+    assert!(back.iter().all(|&byte| byte == READ_POISON));
 }
 
 #[test]
@@ -1764,7 +1798,8 @@ fn a_rescan_sends_its_identify_without_waiting_and_a_later_start_takes_it() {
         let id = running_id(&c, read);
         post(&mut c, id, 0);
     }
-    assert_eq!(disk.finish(read), Some(Ok(Some(vec![0; 512]))));
+    // The fixture moves no data: the read holds its poison.
+    assert_eq!(disk.finish(read), Some(Ok(Some(vec![READ_POISON; 512]))));
     assert_eq!(disk.scanned, 0);
     let write = disk.start(write_command(0)).unwrap();
     assert_eq!(disk.scanned, 1);
@@ -1886,7 +1921,8 @@ fn a_namespace_notice_reads_its_log_without_waiting() {
         let id = running_id(&c, read);
         post(&mut c, id, 0);
     }
-    assert_eq!(disk.finish(read), Some(Ok(Some(vec![0; 512]))));
+    // The fixture moves no data: the read holds its poison.
+    assert_eq!(disk.finish(read), Some(Ok(Some(vec![READ_POISON; 512]))));
     let write = disk.start(write_command(0)).unwrap();
     let c = disk.controller.borrow();
     assert_eq!(c.scans, 1);
