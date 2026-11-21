@@ -953,6 +953,14 @@ fn load(
     // the firmware keeps that it got this far, for the next start to say.
     if checking {
         crate::stop_record::write_no_boot_next();
+        // Nor, after the exit, a stop record: a check writes no NVRAM
+        // there.
+        crate::stop_record::refuse_after_exit();
+        output::arguments(format_args!(
+            "FIRMWARE VARIABLE SERVICE not called after the exit in this boot: it only checks \
+             the disk chosen for macOS and writes nothing, so a stop keeps no record in the \
+             firmware\n"
+        ));
     }
     crate::stop_record::before_exit();
     crate::stop_record::mark_running(log.as_ref().map(|guid| guid.0));
