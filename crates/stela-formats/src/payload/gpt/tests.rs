@@ -516,3 +516,20 @@ fn entries_the_table_cannot_hold_are_refused_not_moved() {
         Err(PayloadError::Disk("two partitions in one entry"))
     );
 }
+
+#[test]
+fn a_protective_mbr_is_its_boot_signature_and_a_type_0xee_entry() {
+    let plan = plan(DISK, None, request(), counter()).unwrap();
+    let mut mbr = encode(DISK, &plan.table).unwrap().pop().unwrap().bytes;
+    assert!(protective(&mbr));
+    // Windows' own: a disk signature and other CHS bytes, the 0xEE entry
+    // second.
+    mbr[440..444].copy_from_slice(&[0xf4, 0x08, 0xdb, 0xc8]);
+    mbr.copy_within(446..462, 462);
+    mbr[446..462].fill(0);
+    assert!(protective(&mbr));
+    mbr[510] = 0;
+    assert!(!protective(&mbr));
+    assert!(!protective(&[0; 512]));
+    assert!(!protective(&[0x55; 511]));
+}

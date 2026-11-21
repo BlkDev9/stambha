@@ -200,7 +200,8 @@ pub struct Disk {
 }
 
 impl Disk {
-    fn entry_blocks(&self) -> u64 {
+    /// The blocks the 16 KiB entry array takes at each end.
+    pub fn entry_blocks(&self) -> u64 {
         ENTRY_ARRAY_BYTES.div_ceil(self.block_bytes)
     }
 
@@ -719,7 +720,7 @@ fn copy_at(
 }
 
 /// A protective (or hybrid) MBR: the boot signature and a type 0xEE entry.
-fn protective(block: &[u8]) -> bool {
+pub fn protective(block: &[u8]) -> bool {
     block.len() >= 512
         && block[510..512] == [0x55, 0xaa]
         && (0..4).any(|n| block[446 + 16 * n + 4] == 0xee)
