@@ -630,6 +630,11 @@ impl Command {
                 }
             }
             Self::Flush => Self::Flush,
+            // A discard of no ranges is none: a driver sends the ranges it
+            // is given, and an NVMe Deallocate's count cannot say none.
+            Self::Discard { extents } if extents.is_empty() => {
+                return Err(BlockError::Unsupported("a discard of no ranges"));
+            }
             Self::Discard { mut extents } => {
                 for extent in &mut extents {
                     let Extent { lba, blocks } = *extent;

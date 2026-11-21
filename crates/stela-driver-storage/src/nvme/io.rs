@@ -344,7 +344,7 @@ impl Controller {
                 words[0] = u32::from(IO_DATASET_MANAGEMENT);
                 words[6] = address as u32;
                 words[7] = (address >> 32) as u32;
-                words[10] = extents.len() as u32 - 1;
+                words[10] = deallocate_ranges(extents)?;
                 words[11] = ATTRIBUTE_DEALLOCATE;
                 Ok(words)
             }
@@ -393,6 +393,7 @@ impl Controller {
         command: Command,
         ring: bool,
     ) -> Result<u32, BlockError> {
+        refuse_unsendable(&command)?;
         self.ready()?;
         let tag = self
             .tags
@@ -428,6 +429,7 @@ impl Controller {
         command: Command,
         mut destination: Option<&mut [u8]>,
     ) -> Finished {
+        refuse_unsendable(&command)?;
         self.ready()?;
         self.settle()?;
         match self.registers.read32(STATUS)? {
@@ -814,5 +816,27 @@ impl Controller {
             }
         }
         self.recovery = None;
+    }
+}
+
+/// A Deallocate's Number of Ranges field: one less than its ranges, in its
+/// low byte. A command of no ranges would read as 256 of whatever its
+/// bounce page last held, and one of more than 256 overruns the page, so
+/// neither is sent.
+fn deallocate_ranges(extents: &[crate::block::Extent]) -> Result<u32, BlockError> {
+    match extents.len() {
+        count @ 1..=MAX_DEALLOCATE_RANGES => Ok(count as u32 - 1),
+        _ => Err(BlockError::Unsupported(
+            "an NVMe Deallocate holds 1 to 256 ranges",
+        )),
+    }
+}
+
+/// Refuse a command no NVMe command can carry before it takes a tag or
+/// reaches the controller, which an error at publishing would fault.
+fn refuse_unsendable(command: &Command) -> Result<(), BlockError> {
+    match command {
+        Command::Discard { extents } => deallocate_ranges(extents).map(drop),
+        _ => Ok(()),
     }
 }

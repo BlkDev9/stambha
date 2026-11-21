@@ -1898,3 +1898,53 @@ fn a_namespace_notice_reads_its_log_without_waiting() {
     ));
     running_id(&c, write);
 }
+
+/// A Deallocate's range count is one less than its ranges, in a byte: one
+/// of no ranges would be sent as 256 ranges of the stale bounce page, and
+/// one of more than 256 would overrun the page. Neither takes a tag, is
+/// published or faults the controller.
+#[test]
+fn a_deallocate_of_no_ranges_or_more_than_256_is_refused_unsent() {
+    let mut fixture = Fixture::new();
+    let disk = &mut fixture.disk;
+    let ranges = |count: u64| {
+        (0..count)
+            .map(|index| crate::block::Extent {
+                lba: index * 2,
+                blocks: 1,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        disk.start(Command::Discard {
+            extents: Vec::new()
+        })
+        .is_err()
+    );
+    {
+        let mut controller = disk.controller.borrow_mut();
+        for extents in [Vec::new(), ranges(257)] {
+            assert_eq!(
+                controller.start(1, 512, Command::Discard { extents }),
+                Err(BlockError::Unsupported(
+                    "an NVMe Deallocate holds 1 to 256 ranges"
+                ))
+            );
+        }
+        assert!(controller.fault.is_none());
+        assert!(controller.tags.iter().all(|tag| matches!(tag, Tag::Free)));
+        assert!(
+            controller.io.submissions.bytes()[..64]
+                .iter()
+                .all(|&byte| byte == 0)
+        );
+    }
+    // 256 ranges go as one command.
+    disk.start(Command::Discard {
+        extents: ranges(256),
+    })
+    .unwrap();
+    let controller = disk.controller.borrow();
+    let words = &controller.io.submissions.bytes()[40..44];
+    assert_eq!(u32::from_le_bytes(words.try_into().unwrap()), 255);
+}

@@ -1431,3 +1431,21 @@ fn a_failed_piece_ends_its_request_and_the_queue_goes_on() {
     assert_eq!(results[&next], Ok(None));
     assert_eq!(*calls.borrow(), [64 << 10, 64 << 10, 64 << 10, 512]);
 }
+
+#[test]
+fn a_discard_of_no_ranges_is_refused_where_a_command_meets_its_device() {
+    // A driver sends the ranges it is given; one of none is no discard,
+    // and an NVMe Deallocate's range count cannot say none.
+    let identity = RamDisk::new("d", 64, 512).identity;
+    assert_eq!(
+        Command::Discard {
+            extents: Vec::new()
+        }
+        .within(&identity, 8),
+        Err(BlockError::Unsupported("a discard of no ranges"))
+    );
+    assert_eq!(
+        Command::discard(4, 2).within(&identity, 8),
+        Ok(Command::discard(12, 2))
+    );
+}
