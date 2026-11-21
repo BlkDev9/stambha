@@ -190,8 +190,11 @@ struct Air {
     sae_confirm: Option<sae::Frame>,
     /// The AP sends its confirm with its commit, before the station's.
     sae_eager: bool,
-    /// The AP answers a commit with a deauthentication.
+    /// The AP sends a deauthentication before its answer to a commit.
     sae_deauth: bool,
+    /// The AP's commit to another station comes before its answer to the
+    /// station's commit.
+    sae_stray: bool,
     /// The AP's confirm does not verify, as under another passphrase.
     sae_wrong_confirm: bool,
 }
@@ -262,8 +265,15 @@ impl Air {
         assert_eq!(field(24), 3, "not SAE");
         let (transaction, status, data) = (field(26), field(28), &bytes[30..]);
         match transaction {
-            1 if self.sae_deauth => self.hear(management(0xc0, &[1, 0])),
             1 => {
+                if self.sae_deauth {
+                    self.hear(management(0xc0, &[1, 0]));
+                }
+                if self.sae_stray {
+                    let mut stray = sae_frame(&sae_ap_for(OTHER_STATION).commit());
+                    stray[4..10].copy_from_slice(&OTHER_STATION);
+                    self.hear(stray);
+                }
                 let mut ap = sae_ap();
                 let mut confirm = ap.receive(1, status, data).unwrap().unwrap();
                 if self.sae_wrong_confirm {
@@ -538,8 +548,16 @@ fn management(subtype: u8, body: &[u8]) -> Vec<u8> {
     frame
 }
 
+/// Another station of the AP's BSS.
+const OTHER_STATION: [u8; 6] = [0x02, 0x11, 0x22, 0x33, 0x44, 0x99];
+
 /// The AP's half of an SAE exchange with the station under [`PASSPHRASE`].
 fn sae_ap() -> Exchange {
+    sae_ap_for(LOCAL)
+}
+
+/// The AP's half of an SAE exchange with `station` under [`PASSPHRASE`].
+fn sae_ap_for(station: [u8; 6]) -> Exchange {
     let mut next = 0x30u8;
     let mut random = || {
         next += 1;
@@ -551,7 +569,7 @@ fn sae_ap() -> Exchange {
         None,
         None,
         Mac(AP),
-        Mac(LOCAL),
+        Mac(station),
         &mut random,
     )
     .unwrap()
@@ -1475,6 +1493,73 @@ fn under_pmf_an_unprotected_departure_is_ignored() {
     assert!(wifi.carrier());
 }
 
+/// The AP's deauthentication to every station, reason 7, under BIP with
+/// the IGTK of [`IGTK_KDE`] (key ID 4, the 0x77s) at IPN `ipn`, as
+/// `ieee80211_crypto_aes_cmac_encrypt` signs it: the MMIE last, its MIC the
+/// first 8 bytes of the CMAC over the AAD (the frame control without Retry,
+/// PwrMgt and MoreData, then the three addresses) and the body, the MIC
+/// zeroed.
+fn signed_group_deauthentication(ipn: u64) -> Vec<u8> {
+    let mut frame = management(0xc0, &[7, 0]);
+    frame[4..10].fill(0xff);
+    frame.extend([76, 16, 4, 0]);
+    frame.extend(&ipn.to_le_bytes()[..6]);
+    frame.extend([0; 8]);
+    let control = u16::from_le_bytes([frame[0], frame[1]]) & !0x3800;
+    let mut message = control.to_le_bytes().to_vec();
+    message.extend(&frame[4..22]);
+    message.extend(&frame[24..]);
+    let mic =
+        crate::wifi::mediatek::mailbox::key::bip::tests::rotation::cmac(&[0x77; 16], &message);
+    let end = frame.len();
+    frame[end - 8..].copy_from_slice(&mic[..8]);
+    frame
+}
+
+#[test]
+fn under_pmf_a_group_deauthentication_needs_its_mic_and_a_fresh_ipn() {
+    // The host checks a group robust frame's BIP (spec S1.2,
+    // `ieee80211_crypto_aes_cmac_decrypt`) under the IGTK message 3 gave,
+    // key ID 4 from IPN 9: one whose MIC fails, or whose IPN is not past
+    // the last, is dropped; a valid one ends the association as
+    // `ieee80211_rx_mgmt_deauth` does, without a frame of the station's own.
+    let (mut wifi, model) = connected_with_pmf();
+    let mut flipped = signed_group_deauthentication(10);
+    let end = flipped.len();
+    flipped[end - 1] ^= 1;
+    model.0.borrow_mut().hear(flipped);
+    model.0.borrow_mut().hear(signed_group_deauthentication(9));
+    for _ in 0..3 {
+        run(&mut wifi, &model, |_, _| true);
+    }
+    assert_eq!(model.0.borrow().count(|c| *c == Call::Disassociate), 0);
+    assert!(wifi.carrier());
+    let from = model.0.borrow().calls.len();
+    model.0.borrow_mut().hear(signed_group_deauthentication(10));
+    assert!(run(&mut wifi, &model, |_, air| {
+        air.position(|c| *c == Call::Disassociate).is_some()
+    }));
+    assert_eq!(
+        leaving(&model.0.borrow(), from),
+        [
+            "flush true",
+            "flush false",
+            "remove 0",
+            "flush false",
+            "remove 1",
+            "leave"
+        ]
+    );
+    assert!(!wifi.carrier());
+    let Err(LinkError::Adapter(failure)) = wifi.receive() else {
+        panic!("no failure")
+    };
+    assert!(
+        failure.contains("the AP ended the association"),
+        "{failure}"
+    );
+}
+
 #[test]
 fn a_tkip_or_ccmp256_key_is_unsupported() {
     let (mut wifi, model) = associated();
@@ -2274,37 +2359,42 @@ fn an_ap_confirming_first_authenticates_the_station_as_it_confirms() {
 }
 
 #[test]
-fn a_deauthentication_during_sae_ends_the_exchange() {
-    // `ieee80211_rx_mgmt_deauth` while authenticating destroys the exchange
-    // at once, where the station would otherwise wait out its tries.
+fn a_deauthentication_during_sae_is_ignored_and_the_exchange_completes() {
+    // `ieee80211_rx_mgmt_deauth` acts only with `ifmgd->associated` or
+    // `assoc_data` (`mlme.c:5646-5690` at the donor's mac80211): with only
+    // `auth_data` it returns, and the exchange runs on.
     let (mut wifi, model) = wifi_with(|air| {
         air.sae = true;
         air.sae_deauth = true;
     });
-    let mut committed = None;
-    let mut left = None;
-    assert!(run(&mut wifi, &model, |_, air| {
-        let now = CLOCK.now_us();
-        if committed.is_none() && !air.management(0xb0).is_empty() {
-            committed = Some(now);
-        }
-        if air.count(|c| *c == Call::Disassociate) == 1 {
-            left = Some(now);
-        }
-        left.is_some()
+    assert!(run(&mut wifi, &model, |wifi, _| {
+        wifi.radio().station().phase() == Peering::Associated
     }));
-    assert!(left.unwrap() - committed.unwrap() < 100_000);
     let air = model.0.borrow();
-    assert_eq!(sae_sent(&air), [(1, 0)]);
-    assert_eq!(air.count(|c| *c == Call::Authenticated), 0);
+    assert_eq!(sae_sent(&air), [(1, 0), (2, 0)]);
+    assert_eq!(air.count(|c| *c == Call::Disassociate), 0);
+    assert_eq!(air.count(|c| *c == Call::Authenticated), 1);
     drop(air);
-    let Err(LinkError::Adapter(failure)) = wifi.receive() else {
-        panic!("no failure")
-    };
-    assert!(
-        failure.contains("authentication or association failed"),
-        "{failure}"
-    );
+    assert_eq!(wifi.receive(), Ok(None));
+}
+
+#[test]
+fn an_sae_frame_to_another_station_is_not_the_exchanges() {
+    // `ieee80211_accept_frame` hands mlme only frames to the station's own
+    // address or a group address: the AP's commit to another station never
+    // reaches the keeper's exchange, which completes with the AP's answer.
+    let (mut wifi, model) = wifi_with(|air| {
+        air.sae = true;
+        air.sae_stray = true;
+    });
+    assert!(run(&mut wifi, &model, |wifi, _| {
+        wifi.radio().station().phase() == Peering::Associated
+    }));
+    let air = model.0.borrow();
+    assert_eq!(sae_sent(&air), [(1, 0), (2, 0)]);
+    assert_eq!(air.count(|c| *c == Call::Disassociate), 0);
+    drop(air);
+    assert_eq!(wifi.receive(), Ok(None));
 }
 
 #[test]
@@ -2377,8 +2467,9 @@ fn a_wrong_sae_confirm_deauthenticates_and_leaves() {
 
 #[test]
 fn a_deauthentication_from_another_ap_leaves_the_exchange_running() {
-    // `ieee80211_rx_mgmt_deauth` ends an authentication only for its AP's
-    // BSSID, and `ieee80211_rx_mgmt_auth` ignores another BSSID's frame.
+    // `ieee80211_rx_mgmt_deauth` takes no deauthentication while only
+    // authenticating, and `ieee80211_rx_mgmt_auth` ignores another BSSID's
+    // frame.
     let (mut wifi, model) = wifi_with(|air| air.sae = true);
     assert!(run(&mut wifi, &model, |_, air| !air
         .management(0xb0)

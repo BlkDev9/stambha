@@ -25,10 +25,13 @@
 //!   The AP's station goes to AUTH once the exchange ends authenticated,
 //!   with the AP's confirm of the station's or the station's confirm to an
 //!   AP that confirmed first (`ieee80211_mark_sta_auth`); the association
-//!   follows under the PMF SAE requires. A denied or timed-out exchange
-//!   ends, the keeper told; a deauthentication from its AP ends it at once
-//!   (`ieee80211_rx_mgmt_deauth`), and the keeper's own end of it leaves
-//!   with a deauthentication (`ieee80211_mgd_deauth`).
+//!   follows under the PMF SAE requires. Only the AP's authentication
+//!   frames addressed to the station reach the exchange
+//!   (`ieee80211_accept_frame`, `ieee80211_rx_mgmt_auth`). A denied or
+//!   timed-out exchange ends, the keeper told; a deauthentication does not
+//!   end it, as `ieee80211_rx_mgmt_deauth` takes one only once associated
+//!   or associating; and the keeper's own end of it leaves with a
+//!   deauthentication (`ieee80211_mgd_deauth`).
 //! - The association programs the chip with the negotiated peer as
 //!   `BSS_CHANGED_ASSOC` does (spec S10), on the channel the join switched
 //!   to.
@@ -1426,15 +1429,17 @@ impl<C: Chip> Rtl8852c<C> {
         Ok(())
     }
 
-    /// `ieee80211_rx_mgmt_auth` and `ieee80211_rx_mgmt_deauth` while the
-    /// keeper's SAE exchange runs (rtw88's `management_frame`,
-    /// `station.rs:1526`), each taking only its AP's frames (the BSSID
-    /// its `auth_data` names): an authentication frame goes to the
-    /// exchange, and one it takes to the keeper, which answers it. The AP's
-    /// confirm of the station's ends the exchange authenticated, and the
-    /// AP's station goes to AUTH on the chip (`ieee80211_mark_sta_auth`).
-    /// A deauthentication ends it at once, as mac80211 destroys its
-    /// authentication data; anything else is dropped.
+    /// `ieee80211_rx_mgmt_auth` while the keeper's SAE exchange runs
+    /// (rtw88's `management_frame`, `station.rs:1526`): an authentication
+    /// frame from its AP (the BSSID its `auth_data` names) to the station or
+    /// to a group address, as `ieee80211_accept_frame` lets one through to
+    /// mlme, goes to the exchange, and one it takes to the keeper, which
+    /// answers it. The AP's confirm of the station's ends the exchange
+    /// authenticated, and the AP's station goes to AUTH on the chip
+    /// (`ieee80211_mark_sta_auth`). Anything else is dropped, a
+    /// deauthentication too: `ieee80211_rx_mgmt_deauth` acts only once
+    /// associated or associating (`mlme.c:5646-5690` at the donor's
+    /// mac80211), and the exchange runs on to its end.
     fn exchange_frame(&mut self, frame: Mpdu, now: u64) -> Result<(), Error> {
         let session = self
             .station
@@ -1445,8 +1450,9 @@ impl<C: Chip> Rtl8852c<C> {
         let peer = session.peer();
         let from_peer =
             header.transmitter == Some(peer) && frame.bytes().get(16..22) == Some(&peer.0[..]);
+        let to_us = header.receiver == self.address || header.receiver.is_multicast();
         match header.control & 0xfc {
-            0xb0 if from_peer => {
+            0xb0 if from_peer && to_us => {
                 let received = self
                     .station
                     .receive_external_authentication(&session, frame, now)
@@ -1459,14 +1465,6 @@ impl<C: Chip> Rtl8852c<C> {
                     if self.station.external_authenticated() {
                         Self::chip(self.chip.authenticated())?;
                     }
-                }
-                Ok(())
-            }
-            0xc0 if from_peer
-                && (header.receiver == self.address || header.receiver.is_multicast()) =>
-            {
-                if let Ok(Action::Remove { ticket, .. }) = self.station.disconnect() {
-                    self.depart(ticket);
                 }
                 Ok(())
             }
