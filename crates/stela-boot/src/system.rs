@@ -811,6 +811,12 @@ fn load(
              nothing was written to it"
         ));
     }
+    // A boot that only checks the disk picker's plan writes nothing, the
+    // firmware's BootNext included.
+    let checking = pending
+        .plan
+        .as_ref()
+        .is_some_and(|plan| plan.mode == pc::disk_plan::Mode::Check);
     let disk_writes = if pending.is_empty() {
         Vec::new()
     } else {
@@ -945,6 +951,9 @@ fn load(
     }
     // From here a boot that ends without a stop leaves no line of its own:
     // the firmware keeps that it got this far, for the next start to say.
+    if checking {
+        crate::stop_record::write_no_boot_next();
+    }
     crate::stop_record::before_exit();
     crate::stop_record::mark_running(log.as_ref().map(|guid| guid.0));
     crate::status::begin("Taking control of the other processors");

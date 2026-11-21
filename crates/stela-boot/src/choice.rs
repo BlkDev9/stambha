@@ -33,7 +33,10 @@ use stela_contracts::refuse;
 use stela_loader::mount_interface::{
     CHOICES_FILE, CHOSEN_DISK, ChoiceKind, Choices, DISK_FILE, Opening, opening, with_disk,
 };
-use stela_runtime::pc::{disk_plan::Plan, disk_writes::Pending};
+use stela_runtime::pc::{
+    disk_plan::{Mode, Plan},
+    disk_writes::Pending,
+};
 use uefi::{
     CString16,
     boot::{self, EventType, TimerTrigger, Tpl},
@@ -585,6 +588,17 @@ fn menu(volume: &mut FileSystem, choices: &Choices, mut menu: Menu<'_>) -> Optio
             continue;
         };
         let disk = format!("{}:{}", plan.serial, plan.partition.guid);
+        // A check writes nothing, the USB's record included: the partition
+        // recorded, if any, stays the one macOS starts from.
+        if plan.mode == Mode::Check {
+            output::arguments(format_args!(
+                "CHOSEN DISK not recorded: Check only writes nothing, the record included\n"
+            ));
+            return Some(Chosen {
+                options: chosen(choices, n, Some(&disk)),
+                plan: Some(plan),
+            });
+        }
         // The record goes to the USB before the disk is changed: a boot
         // that stops in between finds no such partition and chooses again
         // (`chosen_disk::Stale`).

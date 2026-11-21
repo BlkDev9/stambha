@@ -399,6 +399,20 @@ pub(crate) fn refuse_after_exit() {
     AFTER_EXIT_REFUSED.store(true, Ordering::Relaxed);
 }
 
+/// This boot writes no `BootNext`, before the firmware's exit
+/// ([`before_exit`]) or at a restart ([`return_at_restart`]): it only
+/// checks the disk Install macOS chose, and writes nothing. Called before
+/// [`before_exit`].
+pub(crate) fn write_no_boot_next() {
+    if let Return::AtRestart(entry) = Return::decode(RESTART.load(Ordering::Relaxed)) {
+        output::arguments(format_args!(
+            "FIRMWARE BootNext for Boot{entry:04X} is not written: this boot only checks the \
+             disk chosen for macOS and writes nothing\n"
+        ));
+    }
+    RESTART.store(Return::Unnamed.encode(), Ordering::Relaxed);
+}
+
 /// Before the firmware's exit, on a PC whose runtime variable service
 /// faulted in an earlier boot under this version: call it only while boot
 /// services run. A restart that needs `BootNext` has it written now, while
