@@ -45,7 +45,9 @@
 //!   port opens on both, and under PMF on the IGTK too, which stays on the
 //!   host (`BipKey`, spec S1.2); a rekey while it is open authorizes it
 //!   again on the keys then held, as mac80211's station stays authorized
-//!   across one. rtw89 puts the IGTK in the CAM as BIP_CCMP128
+//!   across one, but a replacement closes it from the old key's delete
+//!   until the new key is installed, so one the chip refuses leaves it
+//!   closed. rtw89 puts the IGTK in the CAM as BIP_CCMP128
 //!   (`cam.c:516-517`), but reads neither BIP bit of the RX descriptor
 //!   (`AX_RXD_BIP_KEYID`, `AX_RXD_BIP_ENC`, `txrx.h:427-428`), and mac80211
 //!   checks a group robust frame's MIC itself unless the hardware marked it
@@ -62,8 +64,11 @@
 //! - Received data the hardware decrypted (its CCMP header and MIC kept,
 //!   spec S7.3) is taken under the key its key ID names, through the
 //!   station's replay and port checks, fragments reassembled and A-MSDUs
-//!   split as rtw88 takes them; protected management frames are opened on
-//!   the host when the hardware left them sealed. A retried unicast frame
+//!   split as rtw88 takes them; protected data the station cannot open is
+//!   dropped where mac80211 decrypts, past the reorder buffer, so it still
+//!   takes its place in its agreement's window. Protected management
+//!   frames are opened on the host when the hardware left them sealed. A
+//!   retried unicast frame
 //!   of the AP's station repeating the last sequence control its counter
 //!   saw is a duplicate, dropped (`ieee80211_rx_h_check_dup`). Frames heard
 //!   after an accepted association response wait until the keeper
@@ -109,8 +114,15 @@
 //! link, the probe of the AP mac80211 sends on a beacon loss before it
 //! gives the AP up (`ieee80211_mgd_probe_ap`), A-MSDU or aggregated TX,
 //! power save, templates, the watchdog, SA Query requests of its own, or
-//! following the AP's beacons and channel switches. Of RX Block Ack it
-//! does not grant: an agreement's inactivity timeout
+//! following the AP's beacons and channel switches. Under PMF an
+//! unprotected deauthentication or disassociation is dropped
+//! (`ieee80211_drop_unencrypted_mgmt`), and the SA Query wpa_supplicant
+//! then starts for one of reason 6 or 7, to learn whether the AP still
+//! knows the station (`sme_event_unprot_disconnect`), is the shared
+//! keeper's to send, which sends none for any radio: a station whose AP
+//! lost its state keeps a link that carries nothing until the keeper
+//! leaves it. Of RX Block Ack it does not grant: an agreement's inactivity
+//! timeout
 //! (`sta_rx_agg_session_timer_expired`); the DELBA mac80211 sends for an
 //! aggregate on a TID without an agreement (`unexpected_agg`); ending an
 //! agreement for a fragment under it (fragments are reassembled, never
@@ -516,6 +528,9 @@ pub struct Rtl8852c<C: Chip> {
     ap: Option<Mac>,
     last_sequence: [u16; SEQUENCES],
     port_open: bool,
+    /// The keeper authorized the port in this association; a replaced
+    /// key's delete closes it until a key is installed again.
+    authorized: bool,
     departing: Option<Ticket>,
     left: bool,
     reported: Vec<&'static str>,
@@ -559,6 +574,7 @@ impl<C: Chip> Rtl8852c<C> {
             ap: None,
             last_sequence: FRESH_SEQUENCES,
             port_open: false,
+            authorized: false,
             departing: None,
             left: false,
             reported: Vec::new(),
@@ -679,6 +695,7 @@ impl<C: Chip> Rtl8852c<C> {
             self.keep_earlier(report);
         }
         self.port_open = false;
+        self.authorized = false;
         self.outbox.clear();
         self.held.clear();
         self.keys.clear();
@@ -1055,12 +1072,18 @@ impl<C: Chip> Rtl8852c<C> {
     /// scan's beacons and probe responses to the scanner; then a duplicate
     /// dropped ([`Self::duplicate`]); a Block Ack Request to the agreement it
     /// names; management frames to [`Self::management_frame`]; and data with
-    /// a body to the station, a protected frame under the key its key ID
-    /// names (pairwise for unicast, a group key for a group address),
-    /// dropped without one, failing its ICV, or left encrypted by the
-    /// hardware (mac80211 would decrypt it in software; no Stela station
-    /// does). Fragments are reassembled; other data goes through its
-    /// agreement's reorder buffer ([`Self::order`]).
+    /// a body to the station. A protected frame failing its ICV is dropped
+    /// at once, as rtw89 marks it `RX_FLAG_FAILED_FCS_CRC`
+    /// (`core.c:4396-4397`) and mac80211 drops it before any handler; one
+    /// the hardware decrypted goes under the key its key ID names
+    /// (pairwise for unicast, a group key for a group address). One left
+    /// encrypted (mac80211 would decrypt it in software; no Stela station
+    /// does), or under a key ID without a key, goes on keyless and is
+    /// dropped as it is delivered ([`Self::deliver`]): mac80211 decrypts in
+    /// `ieee80211_rx_h_decrypt`, after `ieee80211_rx_reorder_ampdu`, so such
+    /// a frame still takes its place in its agreement's window. Fragments
+    /// are reassembled, a keyless protected one dropped at once; other data
+    /// goes through its agreement's reorder buffer ([`Self::order`]).
     fn frame(&mut self, mut frame: Mpdu, now: u64) -> Result<(), Error> {
         let header = *frame.header();
         if let Some(ticket) = self.scanning
@@ -1085,22 +1108,23 @@ impl<C: Chip> Rtl8852c<C> {
             return Ok(());
         }
         if header.protected() {
+            if frame.security.icv_error {
+                return Ok(());
+            }
             let multicast = header.receiver.is_multicast();
             let index = frame.bytes().get(header.length + 3).map(|byte| byte >> 6);
-            let Some(key) = self
+            let decrypted = frame.security.decrypted;
+            frame.security.key = self
                 .keys
                 .iter()
                 .find(|key| key.pairwise != multicast && Some(key.index) == index)
                 .and_then(|key| key.slot.installed())
-            else {
-                return Ok(());
-            };
-            if frame.security.icv_error || !frame.security.decrypted {
-                return Ok(());
-            }
-            frame.security.key = Some(key);
+                .filter(|_| decrypted);
         }
         if header.fragmented() {
+            if header.protected() && frame.security.key.is_none() {
+                return Ok(());
+            }
             self.reassemble(&frame, now);
             return Ok(());
         }
@@ -1323,16 +1347,24 @@ impl<C: Chip> Rtl8852c<C> {
 
     /// rtw88's `deliver` (`station.rs:1451`): `frame`, an MSDU or an
     /// A-MSDU, to the station; mac80211 drops what its replay and port
-    /// checks refuse. EAPOL goes to the keeper.
+    /// checks refuse. EAPOL goes to the keeper. A protected frame without
+    /// the key that opened it ([`Self::frame`]) is dropped first, as
+    /// `ieee80211_rx_h_decrypt` drops it once the reorder buffer released
+    /// it.
     fn deliver(&mut self, frame: Mpdu) {
+        if frame.header().protected() && frame.security.key.is_none() {
+            return;
+        }
         let ingress = if frame.header().amsdu {
             let Some(context) = self.context.clone() else {
                 return;
             };
             let key = frame.security.key;
-            // SAFETY: an A-MSDU is one record here, delivered as received
-            // (no reorder buffer holds it), and `clear` drops what an
-            // older association left.
+            // SAFETY: an A-MSDU is one whole MPDU, one RX queue record, and
+            // comes here once its agreement's reorder buffer, if any,
+            // released it in order (`Self::order`); `clear` closes every
+            // agreement and drops what an older association left, so none
+            // reaches a newer one.
             let group =
                 unsafe { OrderedGroup::new(context, alloc::vec![frame], Shape::WholeMpdu, ()) };
             let slot = self
@@ -2009,7 +2041,10 @@ impl<C: Chip> Rtl8852c<C> {
     /// key counts as installed only once the chip's `add_key` returned its
     /// CAM entry, the firmware having acknowledged it; otherwise its slot
     /// is never completed and goes. An open port is authorized again on the
-    /// keys then held.
+    /// keys then held. A replacement closes it from the old key's delete
+    /// on, so it opens again only on the new key installed: where the chip
+    /// refuses that, mac80211 would go on under a software key, which no
+    /// Stela station has, and nothing of that kind and index is left.
     fn install(
         &mut self,
         pairwise: bool,
@@ -2036,6 +2071,7 @@ impl<C: Chip> Rtl8852c<C> {
                 return Ok(identity);
             }
             let old = self.keys.remove(at);
+            self.port_open = false;
             // What still waits under the old key goes with it: its CAM
             // entry may hold the new key by the time the chip has room.
             self.held
@@ -2083,7 +2119,7 @@ impl<C: Chip> Rtl8852c<C> {
         // newer key leaves behind, so the port is authorized again on the
         // keys now held. The keeper installs a key only from an
         // authenticated handshake.
-        if self.port_open {
+        if self.authorized {
             let epoch = self
                 .station
                 .association_epoch()
@@ -2143,6 +2179,7 @@ impl<C: Chip> Rtl8852c<C> {
         }
         .map_err(Error::Station)?;
         self.port_open = true;
+        self.authorized = true;
         Ok(())
     }
 }

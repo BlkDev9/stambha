@@ -336,6 +336,53 @@ fn a_pairwise_key_starts_the_checks_over() {
 }
 
 #[test]
+fn a_frame_the_poll_drains_is_checked_as_it_arrives() {
+    // RXQ's own drain (rtw89_pci_poll_rxq_dma to rtw89_core_rx): the three
+    // frames right after the agreement's BA CAM H2C reach the next polls.
+    let (mut live, _m) = live_hearing(&|fw| {
+        fw.after(
+            0xC,
+            0,
+            vec![decrypted(10, 5), decrypted(9, 6), decrypted(11, 7)],
+        )
+    });
+    // The core start's dynamic BA CAM H2Cs brought theirs while nothing was
+    // associated, which the check passes.
+    heard_sns(&mut live);
+    heard_sns(&mut live);
+    // SAFETY: as in `start_on`.
+    unsafe { live.set_bssid(AP) }.unwrap();
+    let a = association(&live);
+    // SAFETY: as above.
+    unsafe { live.associate(&a) }.unwrap();
+    // SAFETY: as above.
+    unsafe { live.add_key(&ptk()) }.unwrap();
+    // SAFETY: as above.
+    unsafe { live.start_rx_block_ack(0, 10, 64) }.unwrap();
+    assert_eq!(heard_sns(&mut live), [10, 11]);
+    let d = StationChip::diagnostic(&live);
+    assert!(d.contains(", pn dropped 1"), "{d}");
+}
+
+#[test]
+fn a_frame_an_install_drains_is_checked_before_the_install_starts_over() {
+    // rtw89_core_rx runs the PN check as a frame arrives (core.c:4551): one
+    // that add_key's waits drain is checked before rtw89_ops_set_key's reset
+    // after the install (mac80211.c:1007-1008), which then forgets it, and
+    // it is not checked again when the next poll hands it on.
+    let (mut live, _m) = associated(&|fw| fw.after(0xA, 1, vec![decrypted(20, 5)]));
+    // SAFETY: as in `start_on`.
+    unsafe { live.start_rx_block_ack(0, 10, 64) }.unwrap();
+    // SAFETY: as above.
+    unsafe { live.add_key(&ptk()) }.unwrap();
+    assert_eq!(heard_sns(&mut live), [20]);
+    // TID 0 started over after SN 20: an earlier SN under a later PN is the
+    // first the check sees.
+    assert!(live.pn_valid(&received(15, 6)));
+    assert!(!StationChip::diagnostic(&live).contains("pn dropped"));
+}
+
+#[test]
 fn a_powered_off_chip_holds_no_agreement() {
     let (mut live, _m) = associated(&|_| {});
     // SAFETY: as in `start_on`.

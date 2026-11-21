@@ -113,10 +113,12 @@
 //! RX_STOP, a static BA CAM entry and its H2C, sent without a wait as
 //! Linux's, and the TID's PN check started or stopped; [`Live::leave`]
 //! stops what is left before the key deletes, as mac80211 tears the
-//! agreements down first. Every frame [`Live::service`] hands on passes
-//! `rtw89_core_skb_pn_valid` first, as `rtw89_core_rx` runs it before
-//! mac80211 (`core.c:4551`), and a pairwise key's install starts the
-//! started TIDs' checks over (`mac80211.c:1007-1008`).
+//! agreements down first. Every frame the chip drains passes
+//! `rtw89_core_skb_pn_valid` as it is drained, by [`Live::drain`] or by an
+//! operation that holds it, as `rtw89_core_rx` runs it on reception before
+//! mac80211 (`core.c:4551`), and is not checked again when handed on; so a
+//! pairwise key's install starts the started TIDs' checks over
+//! (`mac80211.c:1007-1008`) after the frames its own waits drained.
 //!
 //! The beacon filter the association arms reports the AP's beacons lost
 //! (M3 spec S15, ruling R2): [`Live::service`] takes each BCNFLTR_RPT as
@@ -621,6 +623,19 @@ fn failed(step: &str, error: AxError) -> String {
     format!("{step}: {error}")
 }
 
+/// Whether `event` goes on from the drain that brought it: a frame only
+/// when `rtw89_core_skb_pn_valid` passes it ([`RxStats::valid`] under
+/// `stats`, `associated` saying whether MAC ID 0 is the associated
+/// station's), as `rtw89_core_rx` runs it on reception (`core.c:4551`),
+/// whichever drain brought it and whatever the operation then changes;
+/// every C2H.
+fn checked(stats: &mut RxStats, associated: bool, event: &Event<'_>) -> bool {
+    match event {
+        Event::Frame(frame) => stats.valid(associated, frame),
+        Event::C2h(_) => true,
+    }
+}
+
 impl<I: AxIo> Live<I> {
     /// What the bring-up reported (M2b2's report, no scan).
     pub fn running(&self) -> &Running {
@@ -789,15 +804,13 @@ impl<I: AxIo> Live<I> {
         scan::check_firmware(self.running.firmware)?;
         let mac = self.running.mac;
         let budget_us = scan::scan_budget_us(list.len());
-        let mut held = core::mem::take(&mut self.held);
         let mut dig = self.dig;
-        let started = self.session(|io, session| {
+        let started = self.holding(|io, session, held| {
             // SAFETY: the caller's contract is `start`'s, which
             // `hw_scan_start`'s is, for the live chip's own window and rings.
-            let edcca =
-                unsafe { scan::hw_scan_start(io, session, mac, &mut dig, &mut |e| held.keep(e)) }?;
+            let edcca = unsafe { scan::hw_scan_start(io, session, mac, &mut dig, held) }?;
             session.rx.set_mode(Mode::Scan);
-            session.rx.flush(&mut |e| held.keep(e));
+            session.rx.flush(held);
             let mut scan = LiveScan {
                 edcca,
                 deadline_us: u64::MAX,
@@ -809,13 +822,12 @@ impl<I: AxIo> Live<I> {
             let offloaded = unsafe {
                 scan::offload(io, session, list, &mut |e| {
                     scan.track(&e);
-                    held.keep(e)
+                    held(e)
                 })
             }
             .and_then(|()| io.now_us());
             Ok((scan, offloaded))
         });
-        self.held = held;
         self.dig = dig;
         let (mut scan, offloaded) = match started {
             Ok(Ok(started)) => started,
@@ -842,9 +854,11 @@ impl<I: AxIo> Live<I> {
 
     /// One RXQ poll for `sink` (the RXQ step of the radio's poll): first the
     /// frames and beacon filter reports an operation held, oldest first
-    /// (see [`Live::service`]), then every RXQ
-    /// entry through the receiver and the session's ledger, as
-    /// `rtw89_pci_poll_rxq_dma` hands them to `rtw89_core_rx`. A running
+    /// (see [`Live::service`]), then every RXQ entry through the receiver,
+    /// the session's ledger and `rtw89_core_skb_pn_valid` ([`checked`]: a
+    /// frame it drops is counted, not handed on), as `rtw89_pci_poll_rxq_dma`
+    /// hands them to `rtw89_core_rx`; a held frame passed that check as it
+    /// was drained. A running
     /// scan's first END_SCAN ends it: the same call then drains what
     /// followed END_SCAN and flushes the receiver into `sink`
     /// ([`scan::tail`]), so every frame the scan heard is handed on before
@@ -860,7 +874,7 @@ impl<I: AxIo> Live<I> {
         }
         self.release(sink);
         let mut scan = self.scan.take();
-        let drained = self.session(|io, session| {
+        let drained = self.passing(sink, |io, session, sink| {
             // SAFETY: the caller's contract is `start`'s, which `drain`'s
             // is, for the live chip's own window and rings.
             unsafe {
@@ -890,8 +904,9 @@ impl<I: AxIo> Live<I> {
     /// The scan budget (the radio poll's last step, M3 spec S8.1): a scan
     /// without END_SCAN at its deadline is stopped as `rtw89_hw_scan_abort`
     /// does ([`scan::stop`]: SCANOFLD stop, then up to `STOP_WAIT_US` for
-    /// END_SCAN), what followed drained into `sink` ([`scan::tail`]), after
-    /// the frames held, and it ends [`ScanEnd::Stopped`], `ended` when
+    /// END_SCAN), what followed drained into `sink` ([`scan::tail`]) as
+    /// [`Live::drain`] drains it, after the frames held, and it ends
+    /// [`ScanEnd::Stopped`], `ended` when
     /// END_SCAN came in the stop's wait or its tail. A stop or tail that
     /// fails still ends it so, as Linux completes an abort whatever the
     /// stop returned (`fw.c:10502-10510`), and returns its error; the stop
@@ -914,7 +929,7 @@ impl<I: AxIo> Live<I> {
         }
         self.release(sink);
         let mut scan = self.scan.take();
-        let stopped = self.session(|io, session| {
+        let stopped = self.passing(sink, |io, session, sink| {
             let mut track = |e: Event<'_>| {
                 if let Some(scan) = scan.as_mut() {
                     scan.track(&e);
@@ -989,12 +1004,9 @@ impl<I: AxIo> Live<I> {
     /// # Safety
     /// [`start`]'s contract, still holding for this chip.
     unsafe fn abort(&mut self) {
-        let mut held = core::mem::take(&mut self.held);
         // SAFETY: the caller's contract is `start`'s, which `stop`'s is, for
         // the live chip's own window and rings.
-        let _ =
-            self.session(|io, session| unsafe { scan::stop(io, session, &mut |e| held.keep(e)) });
-        self.held = held;
+        let _ = self.holding(|io, session, held| unsafe { scan::stop(io, session, held) });
         if let Some(scan) = self.scan.take() {
             // SAFETY: as above, `restore`'s.
             let _ = unsafe { self.restore(&scan.edcca) };
@@ -1012,16 +1024,12 @@ impl<I: AxIo> Live<I> {
         // SAFETY: the caller's contract is `tune`'s, word for word.
         unsafe { self.tune(&chan) }?;
         let mac = self.running.mac;
-        let mut held = core::mem::take(&mut self.held);
         let mut dig = self.dig;
-        let completed = self.session(|io, session| {
+        let completed = self.holding(|io, session, held| {
             // SAFETY: as above, `hw_scan_complete`'s, for the live chip's own
             // window and rings.
-            unsafe {
-                scan::hw_scan_complete(io, session, mac, edcca, &mut dig, &mut |e| held.keep(e))
-            }
+            unsafe { scan::hw_scan_complete(io, session, mac, edcca, &mut dig, held) }
         });
-        self.held = held;
         self.dig = dig;
         match completed {
             Ok(Ok(())) => Ok(()),
@@ -1053,14 +1061,12 @@ impl<I: AxIo> Live<I> {
             return Err(AxError::Mac("a new BSSID while associated"));
         }
         let mac = self.running.mac;
-        let mut held = core::mem::take(&mut self.held);
         let mut dig = self.dig;
-        let done = self.session(|io, session| {
+        let done = self.holding(|io, session, held| {
             // SAFETY: the caller's contract is `start`'s, which `set_bssid`'s
             // is, for the live chip's own window and rings.
-            unsafe { assoc::set_bssid(io, session, mac, bssid, &mut dig, &mut |e| held.keep(e)) }
+            unsafe { assoc::set_bssid(io, session, mac, bssid, &mut dig, held) }
         });
-        self.held = held;
         self.dig = dig;
         self.done(done)?;
         self.bssid = Some(bssid);
@@ -1114,18 +1120,12 @@ impl<I: AxIo> Live<I> {
             return Err(AxError::Mac("an association on a band not tuned"));
         }
         let features = Features::of(self.running.firmware);
-        let mut held = core::mem::take(&mut self.held);
         let mut dig = self.dig;
-        let done = self.session(|io, session| {
+        let done = self.holding(|io, session, held| {
             // SAFETY: the caller's contract is `start`'s, which `associate`'s
             // is, for the live chip's own window and rings.
-            unsafe {
-                assoc::associate(io, session, inputs, features, &mut dig, &mut |e| {
-                    held.keep(e)
-                })
-            }
+            unsafe { assoc::associate(io, session, inputs, features, &mut dig, held) }
         });
-        self.held = held;
         self.dig = dig;
         self.done(done)?;
         self.associated = Some(*inputs);
@@ -1171,9 +1171,7 @@ impl<I: AxIo> Live<I> {
         let features = Features::of(self.running.firmware);
         let mac = self.running.mac;
         let band = self.chan.band;
-        let mut held = core::mem::take(&mut self.held);
-        let done = self.session(|io, session| {
-            let sink = &mut |e: Event<'_>| held.keep(e);
+        let done = self.holding(|io, session, sink| {
             match (&associated, bssid) {
                 (Some(inputs), _) => {
                     for tid in agreements.tids() {
@@ -1204,7 +1202,6 @@ impl<I: AxIo> Live<I> {
                 (None, _) => unsafe { assoc::clear_bssid(io, session, mac, cam.keys(), sink) },
             }
         });
-        self.held = held;
         self.done(done)
     }
 
@@ -1241,8 +1238,7 @@ impl<I: AxIo> Live<I> {
         let addr = AddrCam::connected(inputs.mac, inputs.bssid, inputs.aid);
         keys::check(&self.keys, key.pairwise, key.index)?;
         let mut cam = self.keys;
-        let mut held = core::mem::take(&mut self.held);
-        let done = self.session(|io, session| {
+        let done = self.holding(|io, session, held| {
             // SAFETY: the caller's contract is `start`'s, which `install`'s
             // is, for the live chip's own window and rings.
             unsafe {
@@ -1254,11 +1250,10 @@ impl<I: AxIo> Live<I> {
                     key.pairwise,
                     key.index,
                     key.material,
-                    &mut |e| held.keep(e),
+                    held,
                 )
             }
         });
-        self.held = held;
         self.keys = cam;
         let installed = done.and_then(|done| done)?;
         if key.pairwise {
@@ -1286,13 +1281,11 @@ impl<I: AxIo> Live<I> {
         };
         let addr = AddrCam::connected(inputs.mac, inputs.bssid, inputs.aid);
         let mut state = self.keys;
-        let mut held = core::mem::take(&mut self.held);
-        let done = self.session(|io, session| {
+        let done = self.holding(|io, session, held| {
             // SAFETY: the caller's contract is `start`'s, which `delete`'s
             // is, for the live chip's own window and rings.
-            unsafe { keys::delete(io, session, &mut state, &addr, cam, &mut |e| held.keep(e)) }
+            unsafe { keys::delete(io, session, &mut state, &addr, cam, held) }
         });
-        self.held = held;
         self.keys = state;
         done.and_then(|done| done)
     }
@@ -1328,17 +1321,11 @@ impl<I: AxIo> Live<I> {
         }
         self.rx_stats.control(tid, true);
         let mut cam = self.ba;
-        let mut held = core::mem::take(&mut self.held);
-        let done = self.session(|io, session| {
+        let done = self.holding(|io, session, held| {
             // SAFETY: the caller's contract is `start`'s, which
             // `ba::start`'s is, for the live chip's own window and rings.
-            unsafe {
-                ba::start(io, session, &mut cam, tid, ssn, window, &mut |e| {
-                    held.keep(e)
-                })
-            }
+            unsafe { ba::start(io, session, &mut cam, tid, ssn, window, held) }
         });
-        self.held = held;
         self.ba = cam;
         done.and_then(|done| done)?;
         bump(&mut self.ba_counts.started);
@@ -1364,13 +1351,11 @@ impl<I: AxIo> Live<I> {
         }
         self.rx_stats.control(tid, false);
         let mut cam = self.ba;
-        let mut held = core::mem::take(&mut self.held);
-        let done = self.session(|io, session| {
+        let done = self.holding(|io, session, held| {
             // SAFETY: the caller's contract is `start`'s, which `ba::stop`'s
             // is, for the live chip's own window and rings.
-            unsafe { ba::stop(io, session, &mut cam, tid, &mut |e| held.keep(e)) }
+            unsafe { ba::stop(io, session, &mut cam, tid, held) }
         });
-        self.held = held;
         self.ba = cam;
         done.and_then(|done| done)?;
         bump(&mut self.ba_counts.stopped);
@@ -1418,21 +1403,19 @@ impl<I: AxIo> Live<I> {
         if self.bssid.is_none() {
             return Ok(());
         }
-        let mut held = core::mem::take(&mut self.held);
-        let sent = self.session(|io, session| {
+        let sent = self.holding(|io, session, held| {
             let mut first = Ok(());
             for sel in PKT_DROP_SELS {
                 let packet = session.h2c.pkt_drop(sel, vif::MAC_ID, vif::PORT);
                 // SAFETY: the caller's contract is `start`'s, which `send`'s
                 // is, for the live chip's own window and rings.
-                let result = unsafe { session.send(io, packet, &mut |e| held.keep(e)) };
+                let result = unsafe { session.send(io, packet, held) };
                 if first.is_ok() {
                     first = result.map(|_| ());
                 }
             }
             first
         });
-        self.held = held;
         sent.and_then(|sent| sent)
     }
 
@@ -1564,9 +1547,10 @@ impl<I: AxIo> Live<I> {
     /// each release report returning its page ([`TxPools::release`]) and
     /// handed on as [`Incoming::Transmitted`], acknowledged for
     /// `RTW89_TX_DONE`; the TX reclaim of every channel with TXBDs
-    /// outstanding; RXQ ([`Live::drain`]), its frames handed on but those
-    /// `rtw89_core_skb_pn_valid` drops ([`RxStats::valid`], counted); the
-    /// scan budget ([`Live::expire_scan`]); then each beacon filter report
+    /// outstanding; RXQ ([`Live::drain`]), its frames handed on, each past
+    /// `rtw89_core_skb_pn_valid` as it was drained ([`RxStats::valid`], a
+    /// drop counted); the scan budget ([`Live::expire_scan`]); then each
+    /// beacon filter report
     /// the drains brought, held ones first, as `rtw89_mac_bcn_fltr_rpt`
     /// takes it ([`Live::beacon_filter`]); then, once,
     /// [`Incoming::ScanEnded`] when the scan begun has ended, after every
@@ -1590,15 +1574,9 @@ impl<I: AxIo> Live<I> {
             let reclaimed = unsafe { self.rings.txq(&mut self.pools, ch).reclaim(&mut self.io) };
             keep(&mut first, reclaimed);
         }
-        let associated = self.associated.is_some();
-        let mut stats = core::mem::take(&mut self.rx_stats);
         let mut filter = Vec::new();
         let mut frames = |e: Event<'_>| match e {
-            Event::Frame(frame) => {
-                if stats.valid(associated, &frame) {
-                    sink(Incoming::Frame(heard(frame)));
-                }
-            }
+            Event::Frame(frame) => sink(Incoming::Frame(heard(frame))),
             Event::C2h(C2h::BeaconFilter(report)) => filter.push(report),
             Event::C2h(_) => {}
         };
@@ -1606,7 +1584,6 @@ impl<I: AxIo> Live<I> {
         keep(&mut first, unsafe { self.drain(&mut frames) });
         // SAFETY: as above, `expire_scan`'s.
         keep(&mut first, unsafe { self.expire_scan(&mut frames) });
-        self.rx_stats = stats;
         for report in filter {
             // SAFETY: as above, `beacon_filter`'s.
             keep(&mut first, unsafe { self.beacon_filter(report, sink) });
@@ -1708,16 +1685,14 @@ impl<I: AxIo> Live<I> {
         if !features.beacon_filter {
             return Ok(());
         }
-        let mut held = core::mem::take(&mut self.held);
-        let sent = self.session(|io, session| {
+        let sent = self.holding(|io, session, held| {
             let packet = session
                 .h2c
                 .bcn_fltr(vif::MAC_ID, true, features.loss_count_v1);
             // SAFETY: the caller's contract is `start`'s, which `send`'s is,
             // for the live chip's own window and rings.
-            unsafe { session.send(io, packet, &mut |e| held.keep(e)) }.map(|_| ())
+            unsafe { session.send(io, packet, held) }.map(|_| ())
         });
-        self.held = held;
         sent.and_then(|sent| sent)
     }
 
@@ -1755,6 +1730,39 @@ impl<I: AxIo> Live<I> {
         self.keys = KeyCam::default();
         self.ba = BaCam::default();
         self.rx_stats.forget();
+    }
+
+    /// [`Live::session`] for an operation's `f`, with a sink that holds what
+    /// it drains for the next [`Live::drain`] ([`Held`]), each frame past
+    /// the PN check first ([`Live::passing`]).
+    fn holding<R>(
+        &mut self,
+        f: impl FnOnce(&mut I, &mut Session<'_>, &mut dyn FnMut(Event<'_>)) -> R,
+    ) -> Result<R, AxError> {
+        let mut held = core::mem::take(&mut self.held);
+        let result = self.passing(&mut |e| held.keep(e), f);
+        self.held = held;
+        result
+    }
+
+    /// [`Live::session`] for a drain's `f`, with `sink` behind the PN check
+    /// ([`checked`]).
+    fn passing<R>(
+        &mut self,
+        sink: &mut dyn FnMut(Event<'_>),
+        f: impl FnOnce(&mut I, &mut Session<'_>, &mut dyn FnMut(Event<'_>)) -> R,
+    ) -> Result<R, AxError> {
+        let mut stats = core::mem::take(&mut self.rx_stats);
+        let associated = self.associated.is_some();
+        let result = self.session(|io, session| {
+            f(io, session, &mut |e| {
+                if checked(&mut stats, associated, &e) {
+                    sink(e);
+                }
+            })
+        });
+        self.rx_stats = stats;
+        result
     }
 
     /// Run `f` on the command session, resumed from where the last one was

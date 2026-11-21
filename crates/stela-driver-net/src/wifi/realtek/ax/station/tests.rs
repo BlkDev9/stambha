@@ -1594,6 +1594,10 @@ fn under_pmf_an_unprotected_departure_is_ignored() {
     }
     assert_eq!(model.0.borrow().count(|c| *c == Call::Disassociate), 0);
     assert!(wifi.carrier());
+    // No SA Query request follows: starting one is wpa_supplicant's
+    // (`sme_event_unprot_disconnect`), which the shared keeper does not
+    // port (the module documentation's gap).
+    assert!(model.0.borrow().management(0xd0).is_empty());
 }
 
 /// The AP's deauthentication to every station, reason 7, under BIP with
@@ -1838,6 +1842,47 @@ fn a_group_rekey_replaces_the_key_of_its_index() {
         .unwrap();
     assert_eq!(model.0.borrow().calls.len(), from);
     assert!(progress(&mut wifi).contains("keys 4"));
+}
+
+#[test]
+fn a_rekey_the_firmware_refuses_closes_the_port_until_its_key_is_installed() {
+    // ieee80211_key_replace deletes the old key first: when the chip then
+    // refuses the new one, no key of that index is left, so the port
+    // closes, and opens again only on an installed key.
+    let (mut wifi, model) = connected();
+    model.0.borrow_mut().refuse_keys = true;
+    let got = wifi
+        .radio_mut()
+        .install_key(false, 1, &[0x66; 16], ReplaySeed::ZERO);
+    assert!(matches!(got, Err(Error::Chip(_))), "{got:?}");
+    assert!(!wifi.radio_mut().carrier());
+    assert_eq!(wifi.radio_mut().transmit(&ip(1)), Err(LinkError::NoCarrier));
+    model.0.borrow_mut().refuse_keys = false;
+    wifi.radio_mut()
+        .install_key(false, 1, &[0x66; 16], ReplaySeed::ZERO)
+        .unwrap();
+    assert!(wifi.radio_mut().carrier());
+    // A key of a new index deletes nothing: refused, the port stays open.
+    model.0.borrow_mut().refuse_keys = true;
+    let got = wifi
+        .radio_mut()
+        .install_key(false, 2, &[0x67; 16], ReplaySeed::ZERO);
+    assert!(got.is_err(), "{got:?}");
+    assert!(wifi.radio_mut().carrier());
+    // A pairwise rekey alike: the old PTK gone, nothing leaves under it.
+    let got = wifi
+        .radio_mut()
+        .install_key(true, 0, &[0x99; 16], ReplaySeed::ZERO);
+    assert!(got.is_err(), "{got:?}");
+    assert!(!wifi.radio_mut().carrier());
+    model.0.borrow_mut().refuse_keys = false;
+    wifi.radio_mut()
+        .install_key(true, 0, &[0x99; 16], ReplaySeed::ZERO)
+        .unwrap();
+    assert!(wifi.radio_mut().carrier());
+    let before = model.0.borrow().data().len();
+    wifi.radio_mut().transmit(&ip(2)).unwrap();
+    assert_eq!(model.0.borrow().data()[before].1, Some((0, 0, 1)));
 }
 
 /// Fragment `number` of frame `sequence` under the PTK at packet number
@@ -2308,6 +2353,43 @@ fn only_the_aps_acknowledged_qos_data_is_reordered() {
     model.0.borrow_mut().hear(bar(0, 102));
     wifi.carrier();
     assert_eq!(delivered(&mut wifi), [0x52]);
+}
+
+#[test]
+fn a_frame_the_station_cannot_open_still_takes_its_place_in_the_window() {
+    // mac80211 reorders before it decrypts (ieee80211_rx_reorder_ampdu,
+    // then ieee80211_rx_h_decrypt): an agreement's frame the hardware left
+    // encrypted, or one under a key ID with no key, fills its slot and is
+    // dropped as it leaves the buffer, so what follows waits for no hole.
+    let (mut wifi, model) = aggregating();
+    let mut air = model.0.borrow_mut();
+    air.hear_as(qos(0, 100, 10, 0x50), false, false);
+    let mut keyless = qos(0, 101, 11, 0x51);
+    keyless[29] = 0x20 | 2 << 6;
+    air.hear_as(keyless, true, false);
+    air.hear_as(qos(0, 102, 12, 0x52), true, false);
+    drop(air);
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x52]);
+    // The window moved past them: 104 waits for 103 alone.
+    let mut air = model.0.borrow_mut();
+    air.hear_as(qos(0, 104, 14, 0x54), true, false);
+    air.hear_as(qos(0, 103, 13, 0x53), true, false);
+    drop(air);
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x53, 0x54]);
+    // A frame failing its ICV is no frame to mac80211 (rtw89's
+    // RX_FLAG_FAILED_FCS_CRC, core.c:4396-4397): it leaves a hole, which
+    // what follows waits behind until the BAR.
+    let mut air = model.0.borrow_mut();
+    air.hear_as(qos(0, 105, 15, 0x55), true, true);
+    air.hear_as(qos(0, 106, 16, 0x56), true, false);
+    drop(air);
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), []);
+    model.0.borrow_mut().hear(bar(0, 106));
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x56]);
 }
 
 /// The (transaction, status) of each SAE frame the station sent.
