@@ -1072,21 +1072,25 @@ impl<C: Chip> Rtl8852c<C> {
     }
 
     /// rtw88's `frame` (`station.rs:1344`) without TKIP (spec S13.3): a
-    /// scan's beacons and probe responses to the scanner; then a duplicate
-    /// dropped ([`Self::duplicate`]); a Block Ack Request to the agreement it
-    /// names; management frames to [`Self::management_frame`]; and data with
-    /// a body to the station. A protected frame failing its ICV is dropped
-    /// at once, as rtw89 marks it `RX_FLAG_FAILED_FCS_CRC`
-    /// (`core.c:4396-4397`) and mac80211 drops it before any handler; one
-    /// the hardware decrypted goes under the key its key ID names
-    /// (pairwise for unicast, a group key for a group address). One left
-    /// encrypted (mac80211 would decrypt it in software; no Stela station
-    /// does), or under a key ID without a key, goes on keyless and is
-    /// dropped as it is delivered ([`Self::deliver`]): mac80211 decrypts in
-    /// `ieee80211_rx_h_decrypt`, after `ieee80211_rx_reorder_ampdu`, so such
-    /// a frame still takes its place in its agreement's window. Fragments
-    /// are reassembled, a keyless protected one dropped at once; other data
-    /// goes through its agreement's reorder buffer ([`Self::order`]).
+    /// scan's beacons and probe responses to the scanner, which refuses one
+    /// failing its FCS; then a frame failing its FCS or ICV dropped, as
+    /// rtw89 marks either `RX_FLAG_FAILED_FCS_CRC` (`core.c:4396-4397`) and
+    /// mac80211's `should_drop_frame` (`rx.c:93-105`, from
+    /// `ieee80211_rx_monitor`, `rx.c:913-918`, at the donor's mac80211)
+    /// drops it before any handler, so the duplicate check never records
+    /// its sequence control; then a duplicate dropped
+    /// ([`Self::duplicate`]); a Block Ack Request to the agreement it names;
+    /// management frames to [`Self::management_frame`]; and data with a
+    /// body to the station. A protected frame the hardware decrypted goes
+    /// under the key its key ID names (pairwise for unicast, a group key for
+    /// a group address). One left encrypted (mac80211 would decrypt it in
+    /// software; no Stela station does), or under a key ID without a key,
+    /// goes on keyless and is dropped as it is delivered
+    /// ([`Self::deliver`]): mac80211 decrypts in `ieee80211_rx_h_decrypt`,
+    /// after `ieee80211_rx_reorder_ampdu`, so such a frame still takes its
+    /// place in its agreement's window. Fragments are reassembled, a
+    /// keyless protected one dropped at once; other data goes through its
+    /// agreement's reorder buffer ([`Self::order`]).
     fn frame(&mut self, mut frame: Mpdu, now: u64) -> Result<(), Error> {
         let header = *frame.header();
         if let Some(ticket) = self.scanning
@@ -1096,6 +1100,9 @@ impl<C: Chip> Rtl8852c<C> {
             if let Ok(bss) = self.scanner.observe(ticket, &frame, &mut policy) {
                 self.hear(bss, now);
             }
+            return Ok(());
+        }
+        if frame.fcs_error || frame.security.icv_error {
             return Ok(());
         }
         if self.duplicate(&frame) {
@@ -1111,9 +1118,6 @@ impl<C: Chip> Rtl8852c<C> {
             return Ok(());
         }
         if header.protected() {
-            if frame.security.icv_error {
-                return Ok(());
-            }
             let multicast = header.receiver.is_multicast();
             let index = frame.bytes().get(header.length + 3).map(|byte| byte >> 6);
             let decrypted = frame.security.decrypted;
@@ -1552,9 +1556,6 @@ impl<C: Chip> Rtl8852c<C> {
         let Some(key) = self.keys.iter_mut().find(|key| key.pairwise) else {
             return Ok(());
         };
-        if frame.security.icv_error {
-            return Ok(());
-        }
         if !frame.security.decrypted {
             let number = frame
                 .bytes()

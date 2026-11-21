@@ -1560,6 +1560,42 @@ fn an_undecrypted_protected_frame_is_dropped() {
 }
 
 #[test]
+fn a_frame_failing_its_icv_or_fcs_leaves_no_sequence_for_its_retry() {
+    // mac80211's `should_drop_frame` drops RX_FLAG_FAILED_FCS_CRC, which
+    // rtw89 sets for a CRC32 or ICV error (core.c:4396-4397), before any
+    // handler: `ieee80211_rx_h_check_dup` never records its sequence
+    // control, so the AP's good retry of it is no duplicate.
+    let (mut wifi, model) = connected();
+    let retried = |sequence: u16, pn: u64, fill: u8| {
+        let mut frame = protected(LOCAL, sequence, 0, pn, &[fill; 46]);
+        frame[1] |= 0x08;
+        frame
+    };
+    let mut air = model.0.borrow_mut();
+    air.hear_as(protected(LOCAL, 10, 0, 1, &[0x45; 46]), true, true);
+    air.hear_as(retried(10, 1, 0x45), true, false);
+    drop(air);
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x45]);
+    // A frame failing its FCS, as the chip hands one on while it scans.
+    let mut air = model.0.borrow_mut();
+    let channel = air.channel.unwrap();
+    air.incoming.push_back(Incoming::Frame(Received {
+        bytes: protected(LOCAL, 11, 0, 2, &[0x46; 46]),
+        channel,
+        signal_dbm: None,
+        tsf: 0,
+        decrypted: true,
+        icv_error: false,
+        fcs_error: true,
+    }));
+    air.hear_as(retried(11, 2, 0x46), true, false);
+    drop(air);
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x46]);
+}
+
+#[test]
 fn a_robust_management_frame_is_sealed_on_the_host() {
     // Spec S1.2: sealed under the PTK with `realtek::ccmp`, handed to the
     // chip as any management frame (no hardware key).
