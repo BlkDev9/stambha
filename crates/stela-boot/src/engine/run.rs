@@ -1079,7 +1079,9 @@ pub(super) fn run<H: Host>(
                 service.parts.lap(ServiceParts::PUMP, host::rdtsc());
                 // An install's progress, and its screen while macOS draws
                 // nothing new, before the frames that may take it back.
-                super::install_progress::slice_end(host::rdtsc(), tsc_hz, quiet);
+                if super::install_progress::active() {
+                    super::install_progress::slice_end(host::rdtsc(), tsc_hz, quiet);
+                }
                 super::display::flush(turn);
                 service.parts.lap(ServiceParts::DISPLAY, host::rdtsc());
                 // A staged guest disk nobody else stepped lately: one step

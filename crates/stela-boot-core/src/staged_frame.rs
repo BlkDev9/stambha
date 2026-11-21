@@ -149,6 +149,13 @@ impl StagedFrame {
         core::mem::replace(&mut self.pending, 0..0)
     }
 
+    /// The screen refused `rows`, which [`Self::take`] gave it: they are
+    /// pending again, with any that changed since, so a later turn gives
+    /// them to it.
+    pub fn put_back(&mut self, rows: Range<usize>) {
+        self.add(rows.start.min(self.rows)..rows.end.min(self.rows));
+    }
+
     /// Row `y`, for the screen.
     pub fn row(&self, y: usize) -> &[u8] {
         &self.frame[y * self.row_bytes..(y + 1) * self.row_bytes]
@@ -219,6 +226,26 @@ mod tests {
         });
         assert_eq!(refused, Err("unreachable"));
         assert_eq!(frame.take(), 2..5);
+    }
+
+    #[test]
+    fn rows_the_screen_refused_are_pending_again_with_those_changed_since() {
+        let mut frame = StagedFrame::new(1, 8);
+        frame.take();
+        filled(&mut frame, Some(2..4), 1);
+        let taken = frame.take();
+        assert!(!frame.pending());
+        // The screen refused them, as a console busy elsewhere refuses the
+        // frame that takes the screen from it: due again for a later turn.
+        frame.put_back(taken);
+        assert!(frame.pending() && frame.due(0));
+        assert_eq!(frame.take(), 2..4);
+        // Rows changed since merge with them; rows past the frame go.
+        filled(&mut frame, Some(6..7), 2);
+        frame.put_back(1..20);
+        assert_eq!(frame.take(), 1..8);
+        frame.put_back(0..0);
+        assert!(!frame.pending());
     }
 
     #[test]

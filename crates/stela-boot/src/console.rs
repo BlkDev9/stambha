@@ -935,15 +935,22 @@ pub fn write(segments: &[(&str, Color)]) {
 /// TSC at most (0 for no bound): a change of
 /// many cells, such as lines that scrolled, reaches the screen over the
 /// next [`present_some`] calls instead of holding the boot CPU for one long
-/// draw.
-pub fn running(segments: &[(&str, Color)], lines: Option<(&[String], usize, Color)>, ticks: u64) {
+/// draw. Whether the text took them: not while it is kept for [`reclaim`],
+/// whose screen then shows what it held before, or another console
+/// operation was active.
+pub fn running(
+    segments: &[(&str, Color)],
+    lines: Option<(&[String], usize, Color)>,
+    ticks: u64,
+) -> bool {
     with(|text| {
         text.rewrite(segments);
         if let Some((lines, indent, color)) = lines {
             text.below(lines, indent, color);
         }
         text.present_within(ticks);
-    });
+    })
+    .is_some()
 }
 
 /// Replace the cursor's line with `segments` and carry on under it: a word

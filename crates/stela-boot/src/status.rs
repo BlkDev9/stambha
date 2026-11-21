@@ -249,12 +249,15 @@ impl State {
         }
         let gap = if running.detail.is_empty() { "" } else { "  " };
         // The lines under the step scroll as each new one comes: what that
-        // changes reaches the screen over the next ticks.
+        // changes reaches the screen over the next ticks. They count as
+        // shown only once the console's text took them: text kept while the
+        // guest's frames have the screen still holds what it held, which a
+        // stop's reclaim shows, so the lines are drawn again after it.
         let below = (!self.streamed).then_some(match &self.panel {
             Some(panel) => (panel.as_slice(), TEXT_INDENT.len(), Color::Text),
             None => (self.stream.as_slice(), TEXT_INDENT.len(), Color::Dim),
         });
-        console::running(
+        let drawn = console::running(
             &[
                 (" [", Color::Dim),
                 (marker, Color::Busy),
@@ -268,7 +271,7 @@ impl State {
             below,
             self.present_ticks(),
         );
-        self.streamed = true;
+        self.streamed |= drawn;
     }
 
     /// TSC ticks one present of the running step may draw for
@@ -309,7 +312,10 @@ impl State {
     }
 
     fn line(&mut self, mark: Mark, text: &str) {
-        if !self.stream.is_empty() {
+        // The lines under the running step go with it: the stream's, a
+        // panel's, or those the console's kept text still holds of either,
+        // such as an install's progress a stop's reclaim shows again.
+        if !self.stream.is_empty() || self.panel.is_some() || !self.streamed {
             self.stream.clear();
             console::below(&[], 0, Color::Dim);
         }

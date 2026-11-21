@@ -1011,10 +1011,11 @@ impl Experiment {
         self.waiting = Some((serial, since, next));
     }
 
-    /// The system image's bytes sent and its size, while the restore sends
-    /// one.
-    pub fn asr_progress(&self) -> Option<(u64, u64)> {
-        self.driver.asr().map(|asr| asr.progress())
+    /// The system image's ASR job's phase, and its offset and the image's
+    /// size, while the restore runs one: only the payload's phases' offset
+    /// is the image sent.
+    pub fn asr_progress(&self) -> Option<(stela_runtime::restore::asr::Phase, (u64, u64))> {
+        self.driver.asr().map(|asr| (asr.phase(), asr.progress()))
     }
 
     /// The image sent so far and the share of polls the host was behind

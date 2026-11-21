@@ -463,10 +463,10 @@ impl Service {
                 lap.part(Part::Restore);
             }
             // How much of the system image has gone, for the install's
-            // progress, which the boot PE reports.
-            if let Some((sent, size)) = experiment.asr_progress() {
-                install_progress::image(sent, size);
-            }
+            // progress, which the boot PE reports: all of it once its job
+            // is gone, as this turn's polls may have sent its last chunk
+            // and then ended it.
+            install_progress::image(experiment.asr_progress());
         }
         if stamp.wrapping_sub(*reported) >= REPORT_SECONDS * host::COUNTER_HZ {
             if let Some(line) = restore

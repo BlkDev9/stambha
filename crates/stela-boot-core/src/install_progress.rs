@@ -1,7 +1,7 @@
 //! An install's progress, for the boot log and the screen: the restore step
 //! the guest's installer is on (its `CHECKPOINT BEGIN` lines), how much of
-//! the system image the restore host has sent it (the ASR stream's offset
-//! and size), and since when.
+//! the system image the restore host has sent it (the ASR stream's payload
+//! offset and size, [`asr_image`]), and since when.
 //!
 //! macOS's own progress bar can stand still for an hour while the image
 //! streams (upstream issues #127 and #168). So an install's boot log carries
@@ -10,6 +10,7 @@
 //! last minutes still says where it got to. And while macOS draws nothing
 //! new, Stela's console takes the screen back to show the same ([`Screen`]).
 use alloc::{format, string::String, vec, vec::Vec};
+use stela_runtime::restore::asr;
 
 /// Seconds between two `INSTALL PROGRESS` lines.
 pub const LOG_SECONDS: u64 = 60;
@@ -217,6 +218,25 @@ impl Progress {
 
     fn seconds(&self, now: u64) -> u64 {
         now.saturating_sub(self.started) / self.hz
+    }
+}
+
+/// The system image's bytes sent and its size after one look at the
+/// restore host's ASR job, from what the last look left (`last`, a size of
+/// 0 before any image) and the job's phase, offset and size (`job`), none
+/// once it is gone.
+///
+/// Only the payload's offset is the image sent: before the payload the job
+/// answers the guest's out-of-band reads, whose offsets say nothing of it,
+/// and a failed job's says no more, so the last look's stands. A job goes
+/// only once it has sent its whole image (a failed one stays, and fails the
+/// restore), maybe in the turn that sent its last chunk: the image is then
+/// all sent, though the last look saw that chunk still to go.
+pub fn asr_image(last: (u64, u64), job: Option<(asr::Phase, (u64, u64))>) -> (u64, u64) {
+    match job {
+        Some((asr::Phase::Payload | asr::Phase::Complete, progress)) => progress,
+        Some(_) => last,
+        None => (last.1, last.1),
     }
 }
 
@@ -563,6 +583,102 @@ mod tests {
         progress.image(11 * MIB, 300 * MIB, at(12));
         assert_eq!(progress.snapshot(at(12)).rate, Rate::Unknown);
         assert_eq!(progress.snapshot(at(12)).image, Some((11 * MIB, 300 * MIB)));
+    }
+
+    /// One look at the restore host's ASR job, as the service makes it,
+    /// fed to the model as the boot PE reads it.
+    fn look(
+        progress: &mut Progress,
+        last: &mut (u64, u64),
+        job: Option<(asr::Phase, (u64, u64))>,
+        second: u64,
+    ) {
+        *last = asr_image(*last, job);
+        progress.image(last.0, last.1, at(second));
+    }
+
+    #[test]
+    fn an_image_whose_job_went_with_its_last_chunk_is_all_sent_and_finishing() {
+        const CHUNK: u64 = 128 << 10;
+        let size = 1000 * MIB;
+        assert_eq!(asr_image((0, 0), None), (0, 0), "no job yet, no image");
+        let mut progress = Progress::new(0, HZ);
+        progress.step("restore image", at(0));
+        let mut last = (0, 0);
+        let start = Some((asr::Phase::Payload, (0, size)));
+        look(&mut progress, &mut last, start, 0);
+        // The last look that found the job saw its last chunk still to go.
+        let before = Some((asr::Phase::Payload, (size - CHUNK, size)));
+        look(&mut progress, &mut last, before, 100);
+        // One turn then sent that chunk and, at its second poll, removed
+        // the finished job: every look since finds none, for as long as
+        // the installer takes to finish.
+        for second in 101..=1100 {
+            look(&mut progress, &mut last, None, second);
+        }
+        assert_eq!(last, (size, size));
+        let finishing = progress.snapshot(at(1100));
+        assert_eq!(finishing.phase, Phase::Finishing);
+        assert_eq!(finishing.percent, Some(100));
+        assert_eq!(finishing.eta, Some(0));
+        assert!(!matches!(finishing.rate, Rate::Waiting { .. }));
+        let line = finishing.log_line();
+        assert!(line.contains(" image=1000/1000 MiB (100%) "), "{line}");
+        assert!(!line.contains("waiting"), "{line}");
+        let panel = finishing.panel();
+        for expected in [
+            "System image:  1000 of 1000 MiB (100%), all sent",
+            "Time left:     the installer is finishing",
+        ] {
+            assert!(
+                panel.iter().any(|line| line == expected),
+                "{expected:?} in {panel:?}"
+            );
+        }
+        let waiting = panel.iter().any(|line| line.contains("waiting"));
+        assert!(!waiting, "{panel:?}");
+    }
+
+    #[test]
+    fn only_the_payload_offset_is_image_sent_not_the_guest_out_of_band_reads() {
+        let size = 100 * MIB;
+        // Before its payload the job answers the guest's out-of-band reads,
+        // here the image's last MiB: none of the payload is sent yet.
+        for phase in [
+            asr::Phase::Initiate,
+            asr::Phase::Validation,
+            asr::Phase::Oob,
+        ] {
+            assert_eq!(
+                asr_image((0, 0), Some((phase, (size - MIB, size)))),
+                (0, 0),
+                "{phase:?}"
+            );
+        }
+        let mut progress = Progress::new(0, HZ);
+        let mut last = (0, 0);
+        let oob = Some((asr::Phase::Oob, (size - MIB, size)));
+        look(&mut progress, &mut last, oob, 0);
+        assert_eq!(progress.snapshot(at(0)).phase, Phase::Preparing);
+        // The read ended at the image's end, back in validation.
+        let validation = Some((asr::Phase::Validation, (size, size)));
+        look(&mut progress, &mut last, validation, 1);
+        let validating = progress.snapshot(at(1));
+        assert_eq!(validating.phase, Phase::Preparing);
+        assert_eq!((validating.percent, validating.eta), (None, None));
+        // The payload starts from 0: its rate is its own.
+        let start = Some((asr::Phase::Payload, (0, size)));
+        look(&mut progress, &mut last, start, 2);
+        let payload = Some((asr::Phase::Payload, (10 * MIB, size)));
+        look(&mut progress, &mut last, payload, 7);
+        let sending = progress.snapshot(at(7));
+        assert_eq!(sending.percent, Some(10));
+        assert_eq!(sending.rate, Rate::BytesPerSecond(2 * MIB));
+        // A failed job's offset says no more: the last look's stands.
+        let failed = Some((asr::Phase::Failed, (11 * MIB, size)));
+        assert_eq!(asr_image(last, failed), (10 * MIB, size));
+        let complete = Some((asr::Phase::Complete, (size, size)));
+        assert_eq!(asr_image(last, complete), (size, size));
     }
 
     #[test]

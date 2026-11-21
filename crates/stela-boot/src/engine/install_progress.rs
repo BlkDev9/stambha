@@ -10,8 +10,9 @@
 use super::display;
 use crate::output;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use stela_boot_core::install_progress::{Action, IDLE_SECONDS, Progress, Screen};
+use stela_boot_core::install_progress::{self, Action, IDLE_SECONDS, Progress, Screen};
 use stela_boot_core::screen::Exclusive;
+use stela_runtime::restore::asr;
 
 /// This run installs macOS.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -40,8 +41,12 @@ pub(super) fn active() -> bool {
     ACTIVE.load(Ordering::Relaxed)
 }
 
-/// The restore host has sent `sent` of the system image's `size` bytes.
-pub(super) fn image(sent: u64, size: u64) {
+/// The restore host's ASR job, at one look: its phase, the bytes it has
+/// sent and the image's size, none once it is gone, which leaves the image
+/// all sent ([`install_progress::asr_image`]).
+pub(super) fn image(job: Option<(asr::Phase, (u64, u64))>) {
+    let last = (SENT.load(Ordering::Relaxed), SIZE.load(Ordering::Relaxed));
+    let (sent, size) = install_progress::asr_image(last, job);
     SIZE.store(size, Ordering::Relaxed);
     SENT.store(sent, Ordering::Relaxed);
 }

@@ -114,6 +114,9 @@ struct Staged {
     /// For each of the screen's two frames, the rows that differ from the
     /// kept frame as the screen last took it ([`StagedFrame::take`]).
     stale: [Range<usize>; 2],
+    /// The rows the frame being written took from the kept one, which a
+    /// refused frame puts back ([`StagedFrame::put_back`]).
+    taken: Range<usize>,
     /// Whether the hidden frame is being brought up to the kept one, since
     /// when, and the ticks that has taken so far.
     writing: bool,
@@ -224,9 +227,16 @@ pub fn flush(turn: Turn) -> u64 {
                     None
                 }
                 Err(reason) => {
-                    // The frame stays hidden; a later present tries again.
+                    // The frame stays hidden, and its rows pending for a
+                    // later turn, as the boot PE's at its next slice's end
+                    // for one a busy console refused; a screen gone for
+                    // good takes none.
                     staged.writing = false;
                     staged.spent = 0;
+                    let taken = core::mem::take(&mut staged.taken);
+                    if staged.screen.available() {
+                        staged.frame.put_back(taken);
+                    }
                     if !core::mem::replace(&mut staged.refused, true) {
                         output::arguments(format_args!("DISPLAY refused a frame: {reason}\n"));
                     }
@@ -285,6 +295,7 @@ impl Staged {
             for stale in &mut self.stale {
                 *stale = union(stale.clone(), pending.clone());
             }
+            self.taken = pending;
         } else if turn == Turn::Home && now.wrapping_sub(self.started) < late {
             // Another PE writes it.
             return Ok(Step::Idle);
@@ -515,6 +526,7 @@ impl GopScanout {
                 screen,
                 frame,
                 stale: [0..height, 0..height],
+                taken: 0..0,
                 writing: false,
                 started: 0,
                 spent: 0,
