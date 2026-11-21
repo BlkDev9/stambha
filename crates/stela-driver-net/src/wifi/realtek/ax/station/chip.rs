@@ -12,7 +12,9 @@
 //! [`Chip::poll`]), `rtw89_ops_hw_scan` and its completion
 //! ([`Chip::begin_scan`], [`Chip::end_scan`]), the channel context's
 //! `rtw89_set_channel` ([`Chip::tune`]), `BSS_CHANGED_BSSID`
-//! ([`Chip::set_bssid`]), `BSS_CHANGED_ASSOC` ([`Chip::associate`]), the
+//! ([`Chip::set_bssid`]), the AP's station moved from NONE to AUTH
+//! (`__rtw89_ops_sta_state`, [`Chip::authenticated`]),
+//! `BSS_CHANGED_ASSOC` ([`Chip::associate`]), the
 //! station's way down to NOTEXIST and the channel context's release
 //! ([`Chip::disassociate`]), `rtw89_ops_set_key` ([`Chip::add_key`],
 //! [`Chip::remove_key`]) and `rtw89_ops_ampdu_action`'s RX half
@@ -129,7 +131,10 @@ pub trait Chip {
     /// The chip's own address.
     fn mac(&self) -> Mac;
     /// What arrived since the last poll, in Linux's NAPI order: RPQ's
-    /// release reports first, then RXQ's frames and reports.
+    /// release reports first, then RXQ's frames and reports. An error is
+    /// not fatal: every step of the poll ran, every event before the
+    /// error was handed on, and the chip stays as it was; the next poll
+    /// tries again.
     fn poll(&mut self, sink: &mut dyn FnMut(Incoming)) -> Result<(), String>;
     /// Switch to `channel`, 20 MHz (M3 spec S9.1).
     fn tune(&mut self, channel: Channel) -> Result<(), String>;
@@ -142,13 +147,19 @@ pub trait Chip {
     fn end_scan(&mut self) -> Result<(), String>;
     /// Point the chip at `bssid` before authentication (M3 spec S9.2-S9.3).
     fn set_bssid(&mut self, bssid: Mac) -> Result<(), String>;
+    /// The AP accepted the authentication: mac80211 moves the AP's station
+    /// from NONE to AUTH (`ieee80211_mark_sta_auth`), which rtw89 programs
+    /// nothing for, so a [`Chip::disassociate`] before an association runs
+    /// AUTH to NONE's disconnect (M3 spec S11) instead of NONE's nothing.
+    fn authenticated(&mut self) -> Result<(), String>;
     /// Queue a management frame; `Ok(None)` when there is no room now.
     fn transmit_management(&mut self, frame: &Management<'_>) -> Result<Option<Token>, String>;
     /// Queue a data frame; `Ok(None)` when there is no room now.
     fn transmit_data(&mut self, frame: &Data<'_>) -> Result<Option<Token>, String>;
     /// Program the association (M3 spec S10).
     fn associate(&mut self, association: &Association) -> Result<(), String>;
-    /// Leave the BSS set or associated (M3 spec S11).
+    /// Leave the BSS set, authenticated to or associated with (M3 spec
+    /// S11), and release its channel.
     fn disassociate(&mut self) -> Result<(), String>;
     /// Install a key; its security CAM entry (M3 spec S12).
     fn add_key(&mut self, key: &HardwareKey<'_>) -> Result<u8, String>;

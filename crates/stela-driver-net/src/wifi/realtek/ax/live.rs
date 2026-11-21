@@ -217,6 +217,9 @@ pub struct Live<I: AxIo> {
     held: Held,
     /// `rtwvif_link->bssid`, from [`Live::set_bssid`] until [`Live::leave`].
     bssid: Option<[u8; 6]>,
+    /// The AP's station is AUTH or past it, from [`Live::authenticated`]
+    /// until [`Live::leave`] or the next [`Live::set_bssid`].
+    authenticated: bool,
     /// The association made, until [`Live::leave`].
     associated: Option<AssocInputs>,
     /// DIG's pause.
@@ -450,6 +453,7 @@ pub unsafe fn start<I: AxIo>(
         scan: None,
         held: Held::default(),
         bssid: None,
+        authenticated: false,
         associated: None,
         dig: Dig::default(),
         tx: TxCounts::default(),
@@ -927,7 +931,8 @@ impl<I: AxIo> Live<I> {
     /// Set the BSSID before authentication (M3 spec S9.2-S9.3,
     /// [`assoc::set_bssid`]): its address CAM, then DIG suspended unless it
     /// already is. A station that has not associated may set another: the
-    /// CAM follows the last. Refused before any I/O, changing nothing: on a
+    /// CAM follows the last, whose AP's station is new and not
+    /// [`Live::authenticated`]. Refused before any I/O, changing nothing: on a
     /// chip off ([`POWERED_OFF`]), while a scan has not been ended
     /// ([`SCAN_NOT_ENDED`]), for a zero BSSID (Linux's "no BSSID"), and
     /// while associated (`Mac`). Any later failure powers the chip off.
@@ -954,6 +959,24 @@ impl<I: AxIo> Live<I> {
         self.dig = dig;
         self.done(done)?;
         self.bssid = Some(bssid);
+        self.authenticated = false;
+        Ok(())
+    }
+
+    /// The AP of the BSSID set accepted the authentication: mac80211's
+    /// NONE to AUTH (`__rtw89_ops_sta_state`, `mac80211.c:939-971`), which
+    /// rtw89 programs nothing for. [`Live::leave`] then runs AUTH to NONE's
+    /// disconnect even when the station never associated. No I/O. Refused,
+    /// changing nothing, on a chip off ([`POWERED_OFF`]) and with `Mac`
+    /// while no BSSID is set.
+    pub fn authenticated(&mut self) -> Result<(), AxError> {
+        if self.off {
+            return Err(POWERED_OFF);
+        }
+        if self.bssid.is_none() {
+            return Err(AxError::Mac("an authentication without a BSSID set"));
+        }
+        self.authenticated = true;
         Ok(())
     }
 
@@ -1005,9 +1028,12 @@ impl<I: AxIo> Live<I> {
     }
 
     /// Leave (M3 spec S11): from an association, [`assoc::leave`] for it;
-    /// from a BSSID set without one, [`assoc::clear_bssid`]; with neither,
-    /// nothing, without I/O. Either way the BSSID and the association are
-    /// gone afterwards; DIG is left as it is. Refused before any I/O,
+    /// from a BSSID set without one, [`assoc::clear_bssid`], after
+    /// [`assoc::disconnect`] when the AP's station was
+    /// [`Live::authenticated`] (`ieee80211_destroy_assoc_data` destroys it
+    /// from AUTH); with neither, nothing, without I/O. Either way the BSSID,
+    /// the authentication and the association are gone afterwards; DIG is
+    /// left as it is. Refused before any I/O,
     /// changing nothing, on a chip off ([`POWERED_OFF`]) and while a scan
     /// has not been ended ([`SCAN_NOT_ENDED`]). A failure powers the chip
     /// off.
@@ -1020,18 +1046,26 @@ impl<I: AxIo> Live<I> {
             return Ok(());
         }
         let associated = self.associated.take();
-        self.bssid = None;
+        let bssid = self.bssid.take();
+        let authenticated = core::mem::take(&mut self.authenticated);
         let features = Features::of(self.running.firmware);
         let mac = self.running.mac;
+        let band = self.chan.band;
         let mut held = core::mem::take(&mut self.held);
         let done = self.session(|io, session| {
             let sink = &mut |e: Event<'_>| held.keep(e);
-            match &associated {
+            match (&associated, bssid) {
                 // SAFETY: the caller's contract is `start`'s, which `leave`'s
                 // is, for the live chip's own window and rings.
-                Some(inputs) => unsafe { assoc::leave(io, session, inputs, features, sink) },
+                (Some(inputs), _) => unsafe { assoc::leave(io, session, inputs, features, sink) },
+                (None, Some(bssid)) if authenticated => {
+                    // SAFETY: as above, `disconnect`'s and `clear_bssid`'s.
+                    unsafe { assoc::disconnect(io, session, mac, bssid, band, sink) }?;
+                    // SAFETY: as above.
+                    unsafe { assoc::clear_bssid(io, session, mac, sink) }
+                }
                 // SAFETY: as above, `clear_bssid`'s.
-                None => unsafe { assoc::clear_bssid(io, session, mac, sink) },
+                (None, _) => unsafe { assoc::clear_bssid(io, session, mac, sink) },
             }
         });
         self.held = held;
@@ -1166,7 +1200,9 @@ impl<I: AxIo> Live<I> {
     /// budget ([`Live::expire_scan`]); then, once, [`Incoming::ScanEnded`]
     /// when the scan begun has ended, after every frame it heard. Every step
     /// runs whatever an earlier one returned, and the first error is
-    /// returned. Beacon filter reports are not handed on (M3 Task 18).
+    /// returned. Such an error is not fatal: no step powers the chip off,
+    /// every event before the error was handed on, and the next poll tries
+    /// again. Beacon filter reports are not handed on (M3 Task 18).
     /// Refused with [`POWERED_OFF`] on a chip off.
     ///
     /// # Safety
@@ -1280,6 +1316,7 @@ impl<I: AxIo> Live<I> {
         self.off = true;
         self.scan = None;
         self.bssid = None;
+        self.authenticated = false;
         self.associated = None;
     }
 
@@ -1384,6 +1421,11 @@ impl<I: AxIo> Chip for Live<I> {
         unsafe { Live::set_bssid(self, bssid.0) }.map_err(|e| e.to_string())
     }
 
+    /// [`Live::authenticated`].
+    fn authenticated(&mut self) -> Result<(), String> {
+        Live::authenticated(self).map_err(|e| e.to_string())
+    }
+
     /// [`Live::queue_management`].
     fn transmit_management(&mut self, frame: &Management<'_>) -> Result<Option<Token>, String> {
         // SAFETY: `start`'s contract holds for the live chip's every use.
@@ -1436,8 +1478,9 @@ impl<I: AxIo> Chip for Live<I> {
         unsafe { Live::associate(self, &inputs) }.map_err(|e| e.to_string())
     }
 
-    /// [`Live::leave`], then, when a BSSID was set, the channel context
-    /// released ([`Live::release_channel`]).
+    /// [`Live::leave`] (AUTH to NONE's disconnect too after
+    /// [`Chip::authenticated`]), then, when a BSSID was set, the channel
+    /// context released ([`Live::release_channel`]).
     fn disassociate(&mut self) -> Result<(), String> {
         let joined = self.bssid.is_some();
         // SAFETY: `start`'s contract holds for the live chip's every use.

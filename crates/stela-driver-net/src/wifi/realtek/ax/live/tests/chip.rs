@@ -444,7 +444,8 @@ fn disassociate_releases_the_channel_to_the_default() {
     unsafe { live.end_scan() }.unwrap();
     assert_eq!(live.chan(), g2(1));
     assert_eq!(live.receiver().tag().channel, 1);
-    // A join that never associated releases it too.
+    // A join that never authenticated releases it too: the AP's station
+    // goes from NONE to NOTEXIST, which touches nothing on this chip.
     Chip::tune(&mut live, ch36).unwrap();
     Chip::set_bssid(&mut live, Mac(AP)).unwrap();
     let mut next = live.h2c();
@@ -458,6 +459,130 @@ fn disassociate_releases_the_channel_to_the_default() {
     let (seq, cleared) = next.addr_cam(MAC, 0, 0);
     assert_eq!(live.h2c(), next);
     assert_eq!(h2c_of(&m, 1, 6, 0, seq)[24..], cleared[24..]);
+    // One whose AP authenticated the station, and that never associated:
+    // AUTH to NONE's `rtw89_core_sta_link_disconnect` (core.c:5818-5859),
+    // the beamformee off, the CMAC table, join info disconnected and the
+    // CAM without the link; then the BSSID cleared and the switch.
+    Chip::tune(&mut live, ch36).unwrap();
+    Chip::set_bssid(&mut live, Mac(AP)).unwrap();
+    Chip::authenticated(&mut live).unwrap();
+    let mut next = live.h2c();
+    let before = live.io().trace.len();
+    Chip::disassociate(&mut live).unwrap();
+    let t = &live.io().trace[before..];
+    assert_eq!(kicks(t), 4);
+    let bfee = first_of(t, |o| matches!(o, Op::W32(0xCD80, _)));
+    let first_kick = first_of(t, |o| matches!(o, Op::W16(0x1080, _)));
+    let last_kick = t
+        .iter()
+        .rposition(|o| matches!(o, Op::W16(0x1080, _)))
+        .unwrap();
+    let switch = first_of(t, |o| matches!(o, Op::W32(0xC398, _)));
+    assert!(bfee < first_kick && last_kick < switch);
+    // No beacon filter, port or EDCA: none was programmed.
+    let (s0, cmac) = next.assoc_cmac_tbl(0, 0, HwBand::G5);
+    let (s1, join) = next.join_info(0, 0, false);
+    let (s2, cam) = next.addr_cam_with(&AddrCam::with_bssid(MAC, AP), 0, 0);
+    let (s3, cleared) = next.addr_cam(MAC, 0, 0);
+    assert_eq!(live.h2c(), next);
+    for (class, func, seq, want) in [
+        (5, 0x0A, s0, cmac),
+        (8, 0, s1, join),
+        (6, 0, s2, cam),
+        (6, 0, s3, cleared),
+    ] {
+        assert_eq!(
+            h2c_of(&m, 1, class, func, seq)[24..],
+            want[24..],
+            "seq {seq}"
+        );
+    }
+    assert_eq!(live.bssid(), None);
+    // The next join starts unauthenticated again.
+    Chip::set_bssid(&mut live, Mac(AP)).unwrap();
+    let before = live.io().trace.len();
+    Chip::disassociate(&mut live).unwrap();
+    assert_eq!(kicks(&live.io().trace[before..]), 1);
+}
+
+#[test]
+fn authenticated_needs_a_bssid_and_touches_nothing() {
+    let (mut live, _m, _air) = on_air(&|_| {});
+    let before = live.io().trace.len();
+    assert!(Chip::authenticated(&mut live).is_err());
+    Chip::set_bssid(&mut live, Mac(AP)).unwrap();
+    let set = live.io().trace.len();
+    assert!(set > before);
+    Chip::authenticated(&mut live).unwrap();
+    assert_eq!(live.io().trace.len(), set);
+    // Another BSSID is another AP's station, not authenticated yet: leaving
+    // it only clears the BSSID.
+    Chip::set_bssid(&mut live, Mac(AP)).unwrap();
+    let before = live.io().trace.len();
+    Chip::disassociate(&mut live).unwrap();
+    assert_eq!(kicks(&live.io().trace[before..]), 1);
+}
+
+#[test]
+fn a_failed_reclaim_still_drains_rxq_and_says_so() {
+    let frame = rx_buffer(
+        0,
+        false,
+        0,
+        3,
+        &mgnt_frame(0x08, MAC, AP, b"m1", None, 3)[4 + 32..],
+    );
+    let (mut live, _m, _air) = on_air(&move |fw| fw.after(6, 0, vec![frame.clone()]));
+    Chip::set_bssid(&mut live, Mac(AP)).unwrap();
+    let request = auth(1);
+    let mgmt = Management {
+        bytes: &request,
+        basic_rates: 0,
+    };
+    assert!(
+        Chip::transmit_management(&mut live, &mgmt)
+            .unwrap()
+            .is_some()
+    );
+    // CH8's index cannot be read: its TXBD stays outstanding.
+    live.io_mut().fail_reads_of(0x1078);
+    let (mut frames, mut reports) = (0, 0);
+    for _ in 0..4 {
+        let polled = Chip::poll(&mut live, &mut |e| match e {
+            Incoming::Frame(_) => frames += 1,
+            Incoming::Transmitted { .. } => reports += 1,
+            _ => {}
+        });
+        assert_eq!(polled, Err(READ_FAILED.to_string()));
+    }
+    // RPQ before the reclaim and RXQ after it went on: the frame's report
+    // and the AP's frame came, and the chip is still on.
+    assert_eq!((frames, reports), (1, 1));
+    assert!(!Chip::diagnostic(&live).contains("powered off"));
+}
+
+#[test]
+fn a_malformed_rxq_buffer_fails_the_poll_after_the_scans_end() {
+    // After END_SCAN, a buffer too short for its descriptor: the drain that
+    // brings the end fails on it, and the end is still handed on.
+    let (mut live, _m, _air) = on_air(&|fw| fw.after_end(vec![vec![0x08, 0xC0, 0, 0, 0, 0, 0, 0]]));
+    let list = [channel(HwBand::G2, 1), channel(HwBand::G2, 6)];
+    Chip::begin_scan(&mut live, &list).unwrap();
+    for _ in 0..100 {
+        let mut seen = Vec::new();
+        let polled = Chip::poll(&mut live, &mut |e| seen.push(e));
+        if let Err(error) = polled {
+            let short = AxError::Rx("RX buffer shorter than its descriptor");
+            assert_eq!(error, short.to_string());
+            assert_eq!(seen.last(), Some(&Incoming::ScanEnded { completed: true }));
+            assert!(!Chip::diagnostic(&live).contains("powered off"));
+            Chip::end_scan(&mut live).unwrap();
+            assert!(poll(&mut live).is_empty());
+            return;
+        }
+        assert!(!seen.iter().any(|e| matches!(e, Incoming::ScanEnded { .. })));
+    }
+    panic!("the tail never failed");
 }
 
 #[test]
@@ -814,6 +939,7 @@ fn a_powered_off_chip_refuses_every_call() {
     assert_eq!(Chip::begin_scan(&mut live, &[ch]), Err(dead.clone()));
     assert_eq!(Chip::end_scan(&mut live), Err(dead.clone()));
     assert_eq!(Chip::set_bssid(&mut live, Mac(AP)), Err(dead.clone()));
+    assert_eq!(Chip::authenticated(&mut live), Err(dead.clone()));
     let mgmt = Management {
         bytes: &frame,
         basic_rates: 0,

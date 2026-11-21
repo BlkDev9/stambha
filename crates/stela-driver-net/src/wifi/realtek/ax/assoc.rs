@@ -44,8 +44,12 @@
 //!   1025-1135`). Linux runs neither `rtw89_fw_h2c_role_maintain` nor a port
 //!   update here: 0xC400 stays as the association set it (spec S11.6).
 //! - [`clear_bssid`], a join that never associated: the BSSID cleared
-//!   (`ieee80211_destroy_auth_data`'s `BSS_CHANGED_BSSID`); DIG stays
-//!   suspended, as Linux resumes it only at association or after a scan.
+//!   (`ieee80211_destroy_auth_data`'s and `ieee80211_destroy_assoc_data`'s
+//!   `BSS_CHANGED_BSSID`); DIG stays suspended, as Linux resumes it only at
+//!   association or after a scan. When the AP had authenticated the
+//!   station, [`disconnect`] comes first: mac80211 destroys the AP's
+//!   station from AUTH (`sta_info_destroy_addr`), through AUTH to NONE's
+//!   `rtw89_core_sta_link_disconnect`, before it clears the BSSID.
 //!
 //! Every H2C goes through the command session with no wait, as
 //! `rtw89_h2c_tx` sends them (spec S10); their acks are recorded, not waited
@@ -628,18 +632,8 @@ pub unsafe fn leave<I: AxIo + ?Sized>(
         // SAFETY: the caller's contract is `send`'s, word for word.
         unsafe { session.send(io, packet, sink) }?;
     }
-    // `rtw89_mac_bf_disassoc`: `rtw89_mac_bfee_ctrl(false)`.
-    clear32(io, R_AX_BFMEE_RESP_OPTION, B_AX_BFMEE_NDPA_EN)?;
-    let packet = session.h2c.assoc_cmac_tbl(MAC_ID, PORT, band);
-    // SAFETY: as above.
-    unsafe { session.send(io, packet, sink) }?;
-    let packet = session.h2c.join_info(MAC_ID, PORT, false);
-    // SAFETY: as above.
-    unsafe { session.send(io, packet, sink) }?;
-    let cam = AddrCam::with_bssid(assoc.mac, assoc.bssid);
-    let packet = session.h2c.addr_cam_with(&cam, MAC_ID, PORT);
-    // SAFETY: as above.
-    unsafe { session.send(io, packet, sink) }?;
+    // SAFETY: as above, `disconnect`'s.
+    unsafe { disconnect(io, session, assoc.mac, assoc.bssid, band, sink) }?;
     // SAFETY: as above, `clear_bssid`'s.
     unsafe { clear_bssid(io, session, assoc.mac, sink) }?;
     // SAFETY: as above, `conf_tx`'s.
@@ -653,6 +647,39 @@ pub unsafe fn leave<I: AxIo + ?Sized>(
     // SAFETY: as above, `conf_tx`'s.
     unsafe { conf_tx(io, session, &defaults, false, band, sink) }?;
     Ok(())
+}
+
+/// The AP's station at `bssid` moved from AUTH to NONE,
+/// `rtw89_core_sta_link_disconnect` (`core.c:5818-5859`), on `band`: the
+/// beamformee's NDPA off on MAC 0 (`rtw89_mac_bf_disassoc`), the CMAC
+/// table, join info disconnected, and the address CAM of `mac` with the
+/// BSSID and NO_LINK. [`leave`] runs it after the beacon filter; a join
+/// whose station authenticated and never associated runs it alone, before
+/// [`clear_bssid`], as `ieee80211_destroy_assoc_data` destroys that station
+/// before clearing the BSSID.
+///
+/// # Safety
+/// As [`set_bssid`].
+pub unsafe fn disconnect<I: AxIo + ?Sized>(
+    io: &mut I,
+    session: &mut Session<'_>,
+    mac: [u8; 6],
+    bssid: [u8; 6],
+    band: HwBand,
+    sink: &mut dyn FnMut(Event<'_>),
+) -> Result<(), AxError> {
+    // `rtw89_mac_bf_disassoc`: `rtw89_mac_bfee_ctrl(false)`.
+    clear32(io, R_AX_BFMEE_RESP_OPTION, B_AX_BFMEE_NDPA_EN)?;
+    let packet = session.h2c.assoc_cmac_tbl(MAC_ID, PORT, band);
+    // SAFETY: the caller's contract is `send`'s, word for word.
+    unsafe { session.send(io, packet, sink) }?;
+    let packet = session.h2c.join_info(MAC_ID, PORT, false);
+    // SAFETY: as above.
+    unsafe { session.send(io, packet, sink) }?;
+    let cam = AddrCam::with_bssid(mac, bssid);
+    let packet = session.h2c.addr_cam_with(&cam, MAC_ID, PORT);
+    // SAFETY: as above.
+    unsafe { session.send(io, packet, sink) }.map(|_| ())
 }
 
 /// The BSSID cleared on a station that is not associated: the address CAM
