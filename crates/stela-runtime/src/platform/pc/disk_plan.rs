@@ -501,15 +501,19 @@ struct Span {
 }
 
 impl fmt::Display for Span {
+    /// A plan's blocks are said before it is checked ([`Plan::check`]), so
+    /// a damaged plan's are said too: its last block and its bytes in
+    /// `u128`, where any `u64` count and size fit.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.blocks {
-            1 => write!(f, "LBA {} (1 block, {} bytes)", self.lba, self.block),
-            blocks => write!(
+        let (lba, blocks, block) = (self.lba, self.blocks, self.block);
+        match blocks {
+            0 => write!(f, "LBA {lba} (0 blocks, 0 bytes)"),
+            1 => write!(f, "LBA {lba} (1 block, {block} bytes)"),
+            _ => write!(
                 f,
-                "LBA {}-{} ({blocks} blocks, {} bytes)",
-                self.lba,
-                self.lba + blocks - 1,
-                blocks * self.block
+                "LBA {lba}-{} ({blocks} blocks, {} bytes)",
+                u128::from(lba) + u128::from(blocks) - 1,
+                u128::from(blocks) * u128::from(block)
             ),
         }
     }
@@ -700,13 +704,15 @@ impl Plan {
     /// The write that tries Stela's driver in the new partition before
     /// any of the table is written: as many blocks as an entry array, from
     /// the partition's first, each holding its block number; the first
-    /// MiB's zeroing clears it.
+    /// MiB's zeroing clears it. A damaged plan's, said before the check
+    /// refuses a partition past the last LBA, numbers its blocks wrapping.
     fn probe(&self) -> Write {
         let block = self.geometry.block_bytes as usize;
         let mut bytes = vec![0x5a; self.geometry.entry_blocks() as usize * block];
         for (index, part) in bytes.chunks_mut(block).enumerate() {
+            let lba = self.partition.first_lba.wrapping_add(index as u64);
             part[..8].copy_from_slice(b"STELATRY");
-            part[8..16].copy_from_slice(&(self.partition.first_lba + index as u64).to_le_bytes());
+            part[8..16].copy_from_slice(&lba.to_le_bytes());
         }
         Write {
             lba: self.partition.first_lba,
@@ -726,6 +732,12 @@ impl Plan {
             "PLAN the disk: {} blocks of {block} bytes",
             self.geometry.blocks
         ));
+        // Every plan [`plan`] makes names a disk a GPT here uses, whose
+        // writes the lines below can name; a damaged one is refused next.
+        if Ends::spans(self.geometry).is_none() {
+            say("PLAN no GPT here uses such a disk: the plan is refused");
+            return;
+        }
         let whole = self.span(partition.first_lba, partition.blocks);
         say(&if self.table.is_empty() {
             format!("PLAN the macOS partition: the Stela partition at {whole}, blanked")
@@ -1200,6 +1212,11 @@ impl Plan {
                         Some(geometry.last_usable() + 1),
                         Cause::ReadBack,
                     ));
+                }
+                // And the backup's writes landed nowhere in the primary's
+                // blocks, from LBA 0: they read as the picker read them.
+                if let Some(lba) = first_difference(&back.head, &self.ends.head, block) {
+                    return Err(error(Step::Table, Some(lba), Cause::Changed));
                 }
                 say(
                     "PASS the backup GPT on the disk is the new table, whole, and the primary is \

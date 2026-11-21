@@ -670,6 +670,37 @@ fn a_write_that_lands_in_another_copy_too_is_found() {
 }
 
 #[test]
+fn a_backup_write_that_changes_the_primary_stops_before_the_primary_is_written() {
+    let table = layout(512);
+    let made = planned(&Sparse::with(512, &table), &table, free(512), Mode::Install);
+    let last = BYTES / 512 - 1;
+    // The backup entries' write lands in the MBR's boot code too, the
+    // backup header's in the primary header or in an unused primary
+    // entry: the backup reads back whole and the new table, and the
+    // primary is not what the picker read.
+    for (at, victim) in [(last - 32, 0), (last, 1), (last, 20)] {
+        let mut disk = Sparse::with(512, &table);
+        disk.scribble = Some((at, victim));
+        assert_eq!(
+            made.apply(&mut disk),
+            Err(ApplyError {
+                step: Step::Table,
+                lba: Some(victim),
+                cause: Cause::Changed,
+            }),
+            "{victim}"
+        );
+        // Nothing was written to the primary's blocks, and nothing zeroed.
+        assert!(
+            disk.changes()
+                .iter()
+                .all(|done| matches!(done, Done::Write { lba, .. } if *lba >= 34)),
+            "{victim}"
+        );
+    }
+}
+
+#[test]
 fn a_disk_unlike_what_the_picker_read_is_not_written() {
     let table = layout(512);
     let made = planned(&Sparse::with(512, &table), &table, free(512), Mode::Install);
@@ -948,6 +979,79 @@ fn a_plan_that_writes_what_no_plan_writes_writes_nothing() {
         );
         assert_eq!(disk.done, [], "{cause:?}");
     }
+}
+
+#[test]
+fn blocks_of_no_length_or_past_the_last_lba_are_said_without_overflow() {
+    let span = |lba, blocks| {
+        Span {
+            lba,
+            blocks,
+            block: 512,
+        }
+        .to_string()
+    };
+    assert_eq!(span(0, 0), "LBA 0 (0 blocks, 0 bytes)");
+    assert_eq!(span(7, 1), "LBA 7 (1 block, 512 bytes)");
+    assert_eq!(
+        span(u64::MAX, 2),
+        "LBA 18446744073709551615-18446744073709551616 (2 blocks, 1024 bytes)"
+    );
+    assert_eq!(
+        span(1, u64::MAX),
+        "LBA 1-18446744073709551615 (18446744073709551615 blocks, 9444732965739290426880 bytes)"
+    );
+    // A damaged plan's lines are said before it is checked; it is said
+    // whole, refused, and nothing is written.
+    let table = layout(512);
+    let mut disk = Sparse::with(512, &table);
+    let made = planned(&disk, &table, free(512), Mode::Check);
+    let outside = "a range to zero lies outside the macOS partition";
+    for zero in [(0, 0), (u64::MAX, u64::MAX), (1, u64::MAX)] {
+        let damaged = Plan {
+            zero: vec![Extent {
+                lba: zero.0,
+                blocks: zero.1,
+            }],
+            ..made.clone()
+        };
+        let (result, lines) = checked(&damaged, &mut disk);
+        assert_eq!(
+            result,
+            Err(error(Step::Check, Some(zero.0), Cause::Refused(outside))),
+            "{zero:?}"
+        );
+        assert!(lines.iter().any(|line| line.starts_with("PLAN zero 1:")));
+    }
+    // A partition at the last LBAs, whose trial write's block numbers pass
+    // the last.
+    let damaged = Plan {
+        partition: Planned {
+            first_lba: u64::MAX - 1,
+            ..made.partition
+        },
+        ..made.clone()
+    };
+    assert_eq!(
+        checked(&damaged, &mut disk).0.unwrap_err().step,
+        Step::Check
+    );
+    // A disk of no blocks of no bytes, which no GPT here uses.
+    let damaged = Plan {
+        geometry: Disk {
+            block_bytes: 0,
+            blocks: 0,
+        },
+        ..made.clone()
+    };
+    let (result, lines) = checked(&damaged, &mut disk);
+    assert_eq!(result.unwrap_err().step, Step::Identify);
+    assert!(
+        lines
+            .iter()
+            .all(|line| !line.starts_with("PLAN write") && !line.starts_with("PLAN zero"))
+    );
+    assert_eq!(disk.done, []);
 }
 
 #[test]
