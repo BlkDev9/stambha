@@ -23,6 +23,7 @@ use core::{
     cell::{Cell, RefCell},
     mem::ManuallyDrop,
 };
+use stela_boot_core::network_link;
 use stela_contracts::refuse;
 use stela_drivers::{
     Clock,
@@ -163,7 +164,7 @@ impl RootLink {
     fn hidden(&self, error: LinkError) -> LinkError {
         match error {
             LinkError::Adapter(why) => {
-                LinkError::Adapter(stela_boot_core::network_link::hide_ssid(&why, &self.ssid))
+                LinkError::Adapter(network_link::hide_ssid(&why, &self.ssid))
             }
             error => error,
         }
@@ -172,7 +173,7 @@ impl RootLink {
     /// The adapter's state line (`Link::diagnostic`) with the network's
     /// name hidden, as in [`Self::hidden`].
     fn state(&self, state: Option<String>) -> Option<String> {
-        state.map(|state| stela_boot_core::network_link::hide_ssid(&state, &self.ssid))
+        state.map(|state| network_link::hide_ssid(&state, &self.ssid))
     }
 
     /// Send `frame` inside the host drivers.
@@ -293,21 +294,31 @@ impl Link for RootLink {
 /// The PC's clock, moving the screen's running step as the stack waits. It
 /// reads the device clock (`host::device_counter`) on whichever processor
 /// serves the host, so the stack's time never goes back when its calls move
-/// between processors.
-struct Ticking(Clock);
+/// between processors. A read past `cut` fails, which ends a Wi-Fi
+/// adapter's wait for an address (`network_link::Cut`); a wired adapter's
+/// is never cut.
+struct Ticking {
+    clock: Clock,
+    cut: Rc<network_link::Cut>,
+}
 
 impl stela_runtime::net::Clock for Ticking {
     fn now_us(&self) -> Result<u64, stela_runtime::net::ClockError> {
         crate::status::tick();
-        self.0
+        let now = self
+            .clock
             .try_now_us()
-            .map_err(stela_runtime::net::ClockError::Calibration)
+            .map_err(stela_runtime::net::ClockError::Calibration)?;
+        if self.cut.passed(now) {
+            return Err(stela_runtime::net::ClockError::Unavailable);
+        }
+        Ok(now)
     }
     /// The adapter's completion signal wakes the boot processor, which runs
     /// the stack.
     fn sleep(&self, until_us: u64) -> Result<(), stela_runtime::net::ClockError> {
         let now = self
-            .0
+            .clock
             .try_now_us()
             .map_err(stela_runtime::net::ClockError::Calibration)?;
         if until_us > now {
@@ -326,9 +337,12 @@ pub struct HostNetwork {
 
 impl HostNetwork {
     /// Try each native adapter, those with carrier first, until DHCPv4 or
-    /// IPv6 SLAAC provides a usable address. A failed adapter keeps its
-    /// diagnostic while the next is tried, and stays in `links` with every
-    /// adapter not tried, for the guest network ([`GuestNetwork::open`]).
+    /// IPv6 SLAAC provides a usable address. A Wi-Fi adapter's wait goes on
+    /// past its connection keeper's failures until its carrier wait and the
+    /// DHCP wait have passed (`network_link::address`). A failed adapter
+    /// keeps its diagnostic while the next is tried, and stays in `links`
+    /// with every adapter not tried, for the guest network
+    /// ([`GuestNetwork::open`]).
     pub fn open(
         links: &mut Links,
         clock: Clock,
@@ -367,7 +381,12 @@ impl HostNetwork {
             let mut seed = [0u8; 8];
             crate::random::fill(&mut seed)
                 .map_err(|_| refuse!("secure host entropy is unavailable for the network stack"))?;
-            let mut stack = Stack::new(link, Ticking(clock), u64::from_le_bytes(seed))
+            let cut = Rc::new(network_link::Cut::new(wireless, link.carrier_wait_us()));
+            let ticking = Ticking {
+                clock,
+                cut: Rc::clone(&cut),
+            };
+            let mut stack = Stack::new(link, ticking, u64::from_le_bytes(seed))
                 .map_err(|error| refuse!("host network stack: {error}", %error))?;
             if let Some(ipv4) = options.ipv4 {
                 stack
@@ -379,12 +398,21 @@ impl HostNetwork {
                     .set_dns(&options.dns)
                     .map_err(|error| refuse!("host network --dns: {error}", %error))?;
             }
-            let waiting = |seconds: u64| {
+            let mut waiting = |seconds: u64| {
                 crate::status::progress(&format!(
                     "adapter {location}: waiting for the link, {seconds} s"
                 ));
             };
-            match stack.automatic_waiting(waiting) {
+            // A Wi-Fi adapter's keeper fails and tries again on its own,
+            // and its failure reaches the stack as the link's: the wait is
+            // driven past it until its cut. A wired adapter's ends at its
+            // first failure.
+            let (addressed, retried) =
+                network_link::address(&cut, || stack.automatic_waiting(&mut waiting));
+            if !retried.is_empty() {
+                output::arguments(format_args!("NETWORK adapter {location} {retried}\n"));
+            }
+            match addressed {
                 Ok(config) => {
                     output::arguments(format_args!("NETWORK driver={driver}\n"));
                     output::arguments(format_args!(
