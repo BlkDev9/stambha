@@ -293,7 +293,10 @@ impl Pending {
 #[cfg(test)]
 mod tests {
     use super::super::{
-        disk_plan::{self, Decision, Place, SEEN_BLOCKS},
+        disk_plan::{
+            self, Decision, Ends, Mode, Place,
+            tests::{GIB, Sparse},
+        },
         gpt, machine_state,
     };
     use super::*;
@@ -537,37 +540,58 @@ mod tests {
         }
     }
 
-    /// The plan that makes an 18 MiB partition [`NEW`] at 4 MiB of `disk`.
-    fn plan(disk: &RamDisk) -> Plan {
-        let block = u64::from(disk.identity.block_size);
-        let table = table(block);
+    /// The decision for a partition [`NEW`] of `bytes` at `first_lba` of a
+    /// disk of `geometry` holding [`table`] in `ends`.
+    fn decided(geometry: shared::Disk, ends: &Ends, first_lba: u64, bytes: u64) -> Plan {
+        let table = table(geometry.block_bytes);
         disk_plan::plan(
             &Decision {
                 serial: SERIAL,
-                geometry: gpt::geometry(&disk.identity),
-                seen: disk_plan::seen(&disk.bytes[..(SEEN_BLOCKS * block) as usize]),
+                geometry,
+                ends,
                 table: Some(&table),
-                deleted: &[],
-                erased: false,
-                place: Place::Free {
-                    first_lba: 4 * MIB / block,
-                    bytes: 18 * MIB,
-                },
+                place: Place::Free { first_lba, bytes },
                 name: "Stela macOS",
+                mode: Mode::Install,
             },
             &mut || guid(NEW),
         )
         .unwrap()
     }
 
+    /// The plan that makes an 18 MiB partition [`NEW`] at 4 MiB of `disk`.
+    fn plan(disk: &RamDisk) -> Plan {
+        let block = u64::from(disk.identity.block_size);
+        let geometry = gpt::geometry(&disk.identity);
+        let [head, tail] = Ends::spans(geometry).unwrap();
+        let at = |span: stela_drivers::block::Extent| {
+            disk.bytes[(span.lba * block) as usize..((span.lba + span.blocks) * block) as usize]
+                .to_vec()
+        };
+        let ends = Ends {
+            head: at(head),
+            tail: at(tail),
+        };
+        decided(geometry, &ends, 4 * MIB / block, 18 * MIB)
+    }
+
     #[test]
     fn an_update_of_the_partition_the_plan_makes_follows_the_plan() {
-        let disk = disk(512);
-        let state = state_offset(18);
+        // A disk large enough for macOS: [`table`]'s partition, and the
+        // new one of 61 GiB from 1 GiB.
+        let disk = Sparse::with(512, &table(512));
+        let partition_mib = 61 * 1024;
+        let made = decided(
+            gpt::geometry(&disk.identity),
+            &disk.ends(),
+            GIB / 512,
+            partition_mib * MIB,
+        );
+        let state = state_offset(partition_mib);
         let mut pending = Pending::default();
-        pending.replace_plan(Some(plan(&disk)));
+        pending.replace_plan(Some(made));
         pending.updates.push(save(NEW, state));
-        let mut devices = boxed(disk);
+        let mut devices: Vec<Box<dyn BlockDevice>> = vec![Box::new(disk)];
         // Before the plan the partition is not there to update.
         assert_eq!(
             pending.updates[0].apply(&mut devices).unwrap_err(),
@@ -583,7 +607,7 @@ mod tests {
         // The machine state the plan zeroed holds the save and nothing
         // else.
         assert_eq!(
-            held(&mut devices, 4, state, 0x5000),
+            held(&mut devices, 1024, state, 0x5000),
             [
                 vec![0; 0x2000],
                 vec![0x22; 4096],

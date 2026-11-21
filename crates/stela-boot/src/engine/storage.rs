@@ -41,7 +41,7 @@ use stela_drivers::{
 };
 use stela_runtime::pc::{
     device_starts,
-    disk_plan::{LocateError, Plan},
+    disk_plan::{LocateError, Mode, Plan, ReadOnly, Step},
     disk_writes::{Pending, Purpose, Update},
     gpt::{Guid, PartitionDevice},
     storage::{self, Named, Target},
@@ -2413,9 +2413,16 @@ fn prepare(
     look: &mut dyn FnMut() -> storage::Arrival,
     pause: &mut dyn FnMut(u64),
 ) -> Result<()> {
-    crate::status::begin("Preparing the chosen disk");
+    crate::status::begin(match plan.mode {
+        Mode::Install => "Preparing the chosen disk",
+        Mode::Check => "Checking the chosen disk, writing nothing",
+    });
     output::arguments(format_args!(
-        "INSTALLER preparing {}:{} first_lba={} blocks={} table_writes={} zeroed_ranges={}\n",
+        "INSTALLER {} {}:{} first_lba={} blocks={} table_writes={} zeroed_ranges={}\n",
+        match plan.mode {
+            Mode::Install => "preparing",
+            Mode::Check => "checking, writing nothing,",
+        },
         plan.serial,
         plan.partition.guid,
         plan.partition.first_lba,
@@ -2425,6 +2432,13 @@ fn prepare(
     ));
     let stop = |refusal: crate::Refusal| {
         output::arguments(format_args!("INSTALLER prepare refused: {refusal}\n"));
+        // A check that could not reach the disk failed as one.
+        if plan.mode == Mode::Check {
+            output::arguments(format_args!(
+                "INSTALL CHECK FAIL {refusal}\nINSTALL CHECK RESULT FAIL: do not install. \
+                 Nothing was written\n"
+            ));
+        }
         crate::status::fail("the disk was not prepared");
         refusal
     };
@@ -2467,7 +2481,11 @@ fn prepare(
     }
     let name = storage::describe(&identity);
     crate::status::progress(&name);
-    match plan.apply(&mut *disks[index]) {
+    if plan.mode == Mode::Check {
+        return Err(check(plan, &mut *disks[index], &name));
+    }
+    let mut say = |line: &str| output::arguments(format_args!("INSTALLER {line}\n"));
+    match plan.apply_saying(&mut *disks[index], &mut say) {
         Ok(()) => {
             output::arguments(format_args!(
                 "INSTALLER prepared {}:{} on {name}\n",
@@ -2482,12 +2500,65 @@ fn prepare(
             crate::status::begin("Finding the partitions this boot uses");
             Ok(())
         }
-        Err(error) => Err(stop(refuse!(
-            "the disk chosen for macOS ({name}) could not be prepared: {error}. Start again \
-             and choose Install macOS",
-            name,
-            %error
-        ))),
+        Err(error) => {
+            let advice = match error.step {
+                Step::Identify | Step::Check => {
+                    "Nothing was written. Start again and choose Install macOS"
+                }
+                Step::Probe => {
+                    "Only a trial write in its free space was made, and the partition table was \
+                     not written. Keep the log before starting again"
+                }
+                Step::Zero | Step::Flush => {
+                    "Its partition table holds the new partition. Start again and choose \
+                     Install macOS"
+                }
+                Step::Table | Step::Verify => {
+                    "Its partition table may be written only in part. Do not start again: turn \
+                     the PC off and keep the log"
+                }
+            };
+            Err(stop(refuse!(
+                "the disk chosen for macOS ({name}) could not be prepared: {error}. {advice}",
+                name,
+                %error,
+                advice
+            )))
+        }
+    }
+}
+
+/// Check the plan on `disk` with Stela's own driver, writing nothing
+/// (`disk_plan::Plan::check`, which is given the disk only to read), each
+/// step an `INSTALL CHECK` line of the log, the last its `RESULT`. The
+/// refusal that ends the boot there, as a check ends whatever it found:
+/// nothing after it writes the disk, or the firmware's `BootNext`.
+fn check(plan: &Plan, disk: &mut dyn BlockDevice, name: &str) -> crate::Refusal {
+    let mut say = |line: &str| output::arguments(format_args!("INSTALL CHECK {line}\n"));
+    match plan.check(&mut ReadOnly::new(disk), &mut say) {
+        Ok(_) => {
+            say(
+                "RESULT PASS: the plan is safe to install. Nothing was written: no partition \
+                 table, no zeroes, no TRIM, no BootNext",
+            );
+            crate::status::done("PASS, nothing was written");
+            refuse!(
+                "Install check PASSED on {name}: nothing was written. Turn the PC off; to \
+                 install, choose Install macOS again and then Install",
+                name
+            )
+        }
+        Err(error) => {
+            say(&format!("FAIL {error}"));
+            say("RESULT FAIL: do not install. Nothing was written");
+            crate::status::fail("FAIL, nothing was written");
+            refuse!(
+                "Install check FAILED on {name}: {error}. Nothing was written. Do not install; \
+                 keep the log",
+                name,
+                %error
+            )
+        }
     }
 }
 

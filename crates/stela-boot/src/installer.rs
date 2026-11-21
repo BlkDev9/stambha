@@ -2,24 +2,28 @@
 //! on the firmware's framebuffer where the user chooses the PC disk macOS
 //! is installed on and the space it takes, as a Linux installer's
 //! partitioner does. Each disk shows its partitions as a bar; macOS can
-//! take free space or a Stela partition already there, a partition can be
-//! deleted, the whole disk erased, and the new partition's size set.
+//! take free space beside them or a Stela partition already there, and the
+//! new partition's size is set. No partition is deleted and no disk erased:
+//! this build has no key for either.
 //!
 //! The picker writes nothing to any disk: it reads the disks through the
 //! firmware and, when the last page confirms a choice, makes a plan of the
-//! change (`pc::disk_plan`). Stela's own drivers make that change after the
-//! firmware has exited, before the engine looks the partition up: the
-//! disk's GPT gains the partition (the Stela Apple region type,
-//! `payload::gpt`), which holds the Mac's internal SSD and, in its tail,
-//! the machine state (`pc::machine_state`); its first MiB and that tail are
-//! zeroed, so the restore and the NOR start blank. The caller records the
-//! choice (`mount_interface::DISK_FILE`) and hands the plan on. A boot
-//! that stops before the plan is applied leaves the disk as it was.
+//! change (`pc::disk_plan`), or of a check of it that writes nothing
+//! (Check only, `disk_plan::Mode::Check`). Stela's own drivers make that
+//! change after the firmware has exited, before the engine looks the
+//! partition up: the disk's GPT gains the partition (the Stela Apple region
+//! type, `payload::gpt`), which holds the Mac's internal SSD and, in its
+//! tail, the machine state (`pc::machine_state`); its first MiB and that
+//! tail are zeroed, so the restore and the NOR start blank. The caller
+//! records the choice (`mount_interface::DISK_FILE`), but not a check's,
+//! and hands the plan on. A boot that stops before the plan is applied
+//! leaves the disk as it was.
 //!
 //! Disks are listed as the engine finds them after boot (`pc::storage`): by
 //! serial number, so one without a serial cannot be chosen, and the USB
-//! Stela started from is left out. Filesystems are never resized: another
-//! system's space is freed only by deleting its partition.
+//! Stela started from is left out. Filesystems are never resized, and
+//! another system's space is never taken: free space is made in that
+//! system, as Windows' Disk Management shrinks a volume.
 use crate::Refusal;
 use crate::Result;
 use crate::{
@@ -50,10 +54,9 @@ use {
 
 const MIB: u64 = 1 << 20;
 const GB: u64 = 1_000_000_000;
-/// The least partition macOS is given: the system's minimum
-/// (`gpt::DEFAULT_MIN_APPLE_BYTES`, which setup also checks) and the
-/// machine state's tail after it.
-const MIN_BYTES: u64 = gpt::DEFAULT_MIN_APPLE_BYTES + machine_state::MINIMUM_BYTES;
+/// The least partition macOS is given, which a plan of less is refused for.
+const MIN_BYTES: u64 = disk_plan::MIN_BYTES;
+const _: () = assert!(MIN_BYTES == gpt::DEFAULT_MIN_APPLE_BYTES + machine_state::MINIMUM_BYTES);
 /// The messages name the system's minimum, in decimal GB as disks are sold.
 const _: () = assert!(gpt::DEFAULT_MIN_APPLE_BYTES == 60 * GB);
 /// The new partition's GPT name.
@@ -133,10 +136,16 @@ impl Disk {
         )
     }
 
-    /// The digest of the disk's first blocks as they are now, which the
-    /// plan's disk is told by (`disk_plan::seen`).
-    fn seen(&mut self) -> Result<[u8; 32]> {
-        Ok(disk_plan::seen(&self.read(0, disk_plan::SEEN_BLOCKS)?))
+    /// The disk's partition table blocks at both its ends as they are now
+    /// (`disk_plan::Ends`), which Stela's own driver must read too before
+    /// the plan writes anything.
+    fn ends(&mut self) -> Result<disk_plan::Ends> {
+        let [head, tail] = disk_plan::Ends::spans(self.geometry)
+            .ok_or(refuse!("the disk is too small for a partition table"))?;
+        Ok(disk_plan::Ends {
+            head: self.read(head.lba, head.blocks)?,
+            tail: self.read(tail.lba, tail.blocks)?,
+        })
     }
 
     /// GUIDs for a new partition or table on this disk.
@@ -196,8 +205,18 @@ enum Page {
 enum Step {
     Stay,
     Leave,
-    /// The last page confirmed the choice.
-    Confirm,
+    /// The last page confirmed the choice, to install or only to check.
+    Confirm(disk_plan::Mode),
+}
+
+/// The confirmation's buttons, left to right.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    /// Check only: Stela's own driver reads the disk and checks the plan,
+    /// and the boot stops having written nothing.
+    Check,
+    Back,
+    Install,
 }
 
 struct Picker {
@@ -206,14 +225,11 @@ struct Picker {
     disk: usize,
     /// The highlighted row of the partitions page.
     row: usize,
-    /// Partitions of the chosen disk to delete, in the order deleted.
-    deleted: Vec<usize>,
-    erased: bool,
     place: Option<Place>,
     /// The new partition's size.
     size: u64,
-    /// Whether the confirmation's install button has the focus.
-    install: bool,
+    /// The confirmation's button with the focus.
+    focus: Focus,
     notice: Option<Refusal>,
 }
 
@@ -252,11 +268,9 @@ pub fn choose() -> Option<Plan> {
         page: Page::Disks,
         disk: 0,
         row: 0,
-        deleted: Vec::new(),
-        erased: false,
         place: None,
         size: 0,
-        install: false,
+        focus: Focus::Back,
         notice: None,
     };
     for disk in &picker.disks {
@@ -286,7 +300,7 @@ pub fn choose() -> Option<Plan> {
         match picker.press(press) {
             Step::Stay => {}
             Step::Leave => return None,
-            Step::Confirm => match picker.plan() {
+            Step::Confirm(mode) => match picker.plan(mode) {
                 Ok(plan) => return Some(plan),
                 Err(error) => {
                     output::arguments(format_args!("INSTALLER plan refused: {error}\n"));
@@ -302,9 +316,9 @@ impl Picker {
         &self.disks[self.disk]
     }
 
-    /// The chosen disk as it will be.
+    /// The chosen disk's partitions and free space.
     fn segments(&self) -> Vec<Segment> {
-        segments_of(self.chosen(), &self.deleted, self.erased)
+        segments_of(self.chosen())
     }
 
     /// A free segment's MiB-aligned span.
@@ -321,8 +335,6 @@ impl Picker {
     }
 
     fn open_disk(&mut self) {
-        self.deleted.clear();
-        self.erased = false;
         self.place = None;
         self.page = Page::Partitions;
         let segments = self.segments();
@@ -362,27 +374,20 @@ impl Picker {
         let count = segments.len();
         self.row = self.row.min(count.saturating_sub(1));
         let segment = segments.get(self.row).copied();
+        // No key deletes a partition or erases the disk.
         match press {
             Press::Escape => self.page = Page::Disks,
             Press::Up if count > 0 => self.row = (self.row + count - 1) % count,
             Press::Down if count > 0 => self.row = (self.row + 1) % count,
-            Press::Character('e' | 'E') => {
-                self.erased = true;
-                self.row = 0;
-            }
-            Press::Character('u' | 'U') => {
-                if self.erased {
-                    self.erased = false;
-                } else {
-                    self.deleted.pop();
-                }
-            }
-            Press::Delete | Press::Character('d' | 'D') => match segment.map(|s| s.content) {
-                Some(Content::Partition(n)) => self.deleted.push(n),
-                Some(Content::Foreign) => self.erased = true,
-                _ => {}
-            },
             Press::Enter => match segment {
+                Some(Segment {
+                    content: Content::Free,
+                    ..
+                }) if self.chosen().table.is_none() => {
+                    self.notice = Some(refuse!(
+                        "This disk has no partition table, and this build never writes a new one"
+                    ));
+                }
                 Some(
                     segment @ Segment {
                         content: Content::Free,
@@ -404,21 +409,24 @@ impl Picker {
                     ..
                 }) if self.chosen().partition(n).role() == Some(Role::AppleRegion) => {
                     self.place = Some(Place::Reuse(n));
-                    self.install = false;
+                    self.focus = Focus::Back;
                     self.page = Page::Confirm;
                 }
                 Some(Segment {
                     content: Content::Partition(_),
                     ..
                 }) => {
-                    self.notice =
-                        Some(refuse!("Choose free space, or delete this partition first"));
+                    self.notice = Some(refuse!(
+                        "Choose free space: this build never deletes a partition"
+                    ));
                 }
                 Some(Segment {
                     content: Content::Foreign,
                     ..
                 }) => {
-                    self.notice = Some(refuse!("Erase the disk first"));
+                    self.notice = Some(refuse!(
+                        "This disk has another partition scheme, and this build never erases a disk"
+                    ));
                 }
                 None => {}
             },
@@ -449,7 +457,7 @@ impl Picker {
             Press::Home => self.size = least,
             Press::End => self.size = most,
             Press::Enter => {
-                self.install = false;
+                self.focus = Focus::Back;
                 self.page = Page::Confirm;
             }
             _ => {}
@@ -457,6 +465,8 @@ impl Picker {
         Step::Stay
     }
 
+    /// Focus starts on Back; Left reaches Check only and Right Install, so
+    /// the keys that installed before still do.
     fn press_confirm(&mut self, press: Press) -> Step {
         let back = match self.place {
             Some(Place::Free { .. }) => Page::Size,
@@ -464,24 +474,38 @@ impl Picker {
         };
         match press {
             Press::Escape => self.page = back,
-            Press::Left | Press::Right | Press::Character('\t') => self.install = !self.install,
-            Press::Enter if self.install => return Step::Confirm,
-            Press::Enter => self.page = back,
+            Press::Left => {
+                self.focus = match self.focus {
+                    Focus::Install => Focus::Back,
+                    _ => Focus::Check,
+                }
+            }
+            Press::Right => {
+                self.focus = match self.focus {
+                    Focus::Check => Focus::Back,
+                    _ => Focus::Install,
+                }
+            }
+            Press::Character('\t') => {
+                self.focus = match self.focus {
+                    Focus::Back => Focus::Install,
+                    Focus::Install => Focus::Check,
+                    Focus::Check => Focus::Back,
+                }
+            }
+            Press::Enter => match self.focus {
+                Focus::Back => self.page = back,
+                Focus::Check => return Step::Confirm(disk_plan::Mode::Check),
+                Focus::Install => return Step::Confirm(disk_plan::Mode::Install),
+            },
             _ => {}
         }
         Step::Stay
     }
 
-    /// The partitions the confirmed change deletes.
-    fn deleting(&self) -> Vec<usize> {
-        match (&self.chosen().table, self.erased) {
-            (Some(table), true) => (0..table.partitions.len()).collect(),
-            _ => self.deleted.clone(),
-        }
-    }
-
-    /// The plan of the confirmed change. Nothing is written here.
-    fn plan(&mut self) -> Result<Plan> {
+    /// The plan of the confirmed change, or of its check. Nothing is
+    /// written here.
+    fn plan(&mut self, mode: disk_plan::Mode) -> Result<Plan> {
         let place = match self.place.ok_or(refuse!("nothing was chosen"))? {
             Place::Reuse(n) => disk_plan::Place::Reuse(n),
             Place::Free { first, .. } => disk_plan::Place::Free {
@@ -489,20 +513,17 @@ impl Picker {
                 bytes: self.size,
             },
         };
-        let deleted = self.deleted.clone();
-        let erased = self.erased;
         let disk = &mut self.disks[self.disk];
-        let seen = disk.seen()?;
+        let ends = disk.ends()?;
         let plan = disk_plan::plan(
             &disk_plan::Decision {
                 serial: disk.serial.as_deref().unwrap_or_default(),
                 geometry: disk.geometry,
-                seen,
+                ends: &ends,
                 table: disk.table.as_ref(),
-                deleted: &deleted,
-                erased,
                 place,
                 name: NAME,
+                mode,
             },
             &mut disk.entropy(),
         )
@@ -512,16 +533,25 @@ impl Picker {
     }
 }
 
-/// Log `plan`, which Stela's drivers apply after the firmware has exited.
+/// Log `plan`, which Stela's drivers apply, or only check, after the
+/// firmware has exited.
 fn log(plan: &Plan, how: &str) {
     output::arguments(format_args!(
-        "INSTALLER plan for {}:{} ({how}) first_lba={} blocks={} table_writes={}: nothing is \
-         written now; Stela's drivers write it after the firmware has exited\n",
+        "INSTALLER plan for {}:{} ({how}, {}) first_lba={} blocks={} table_writes={}: nothing is \
+         written now; Stela's drivers {} after the firmware has exited\n",
         stela_contracts::masked::Tail(&plan.serial),
         plan.partition.guid,
+        match plan.mode {
+            disk_plan::Mode::Install => "install",
+            disk_plan::Mode::Check => "check only",
+        },
         plan.partition.first_lba,
         plan.partition.blocks,
-        plan.table.len()
+        plan.table.len(),
+        match plan.mode {
+            disk_plan::Mode::Install => "write it",
+            disk_plan::Mode::Check => "check it and write nothing",
+        },
     ));
 }
 
@@ -785,11 +815,11 @@ impl Picker {
             canvas.text_centred(width / 2, height - 76, &notice.to_string(), 1, ui::ORANGE);
         }
         let keys: &[(&str, &str)] = match self.page {
-            Page::Partitions => &[
-                ("Enter", "Install here"),
-                ("D", "Delete"),
-                ("E", "Erase disk"),
-                ("U", "Undo"),
+            Page::Partitions => &[("Enter", "Install in free space"), ("Esc", "Back")],
+            Page::Confirm => &[
+                ("Left", "Check only"),
+                ("Right", "Install"),
+                ("Enter", "Choose"),
                 ("Esc", "Back"),
             ],
             _ => &[],
@@ -855,7 +885,7 @@ impl Picker {
                 width: right - inner,
                 height: 10,
             };
-            let segments = segments_of(disk, &[], false);
+            let segments = segments_of(disk);
             self.draw_bar(canvas, n, &segments, &bar, None, None);
             match (disk.refusal, &disk.caution) {
                 (Some(refusal), _) => canvas.text(inner, y + 64, refusal, 1, ui::ORANGE),
@@ -1049,22 +1079,13 @@ impl Picker {
             );
         }
         let y = top + fits.min(segments.len()) * ROW + 12;
-        let deleting = self.deleting();
-        let pending = if self.erased {
-            String::from("Erasing the whole disk")
-        } else if deleting.is_empty() {
-            return;
-        } else {
-            let names: Vec<&str> = deleting
-                .iter()
-                .map(|&n| match disk.partition(n).name.trim() {
-                    "" => kind(disk.partition(n)).0,
-                    name => name,
-                })
-                .collect();
-            format!("Deleting {}", names.join(", "))
-        };
-        canvas.text(layout.left + 22, y, &pending, 1, ui::ORANGE);
+        canvas.text(
+            layout.left + 22,
+            y,
+            "Installs only in free space: never deletes a partition or erases a disk",
+            1,
+            ui::DIM,
+        );
     }
 
     fn draw_size(&self, canvas: &mut Canvas, layout: &Layout) {
@@ -1090,9 +1111,8 @@ impl Picker {
     }
 
     fn draw_confirm(&self, canvas: &mut Canvas, layout: &Layout) {
-        let deleting = self.deleting();
-        let destructive =
-            self.erased || !deleting.is_empty() || matches!(self.place, Some(Place::Reuse(_)));
+        // Only a Stela partition chosen again is erased.
+        let destructive = matches!(self.place, Some(Place::Reuse(_)));
         let title = if destructive {
             "Erase and install macOS?"
         } else {
@@ -1121,23 +1141,6 @@ impl Picker {
             },
             ui::TEXT,
         ));
-        if self.erased {
-            rows.push((
-                "Erases",
-                String::from("Everything on this disk"),
-                ui::ORANGE,
-            ));
-        } else {
-            for &n in &deleting {
-                let partition = disk.partition(n);
-                let name = match partition.name.trim() {
-                    "" => kind(partition).0,
-                    name => name,
-                };
-                let line = format!("{name}, {}", size(partition.blocks() * block));
-                rows.push(("Deletes", line, ui::ORANGE));
-            }
-        }
         let card = 24 + rows.len().min(9) * 28;
         let top = layout.top + 36;
         canvas.panel(layout.left, top, layout.column, card, 8, ui::CARD);
@@ -1160,7 +1163,7 @@ impl Picker {
             buttons,
             action_width,
             action,
-            self.install,
+            self.focus == Focus::Install,
         );
         let back_width = canvas.text_width("Back", 1) + 48;
         Self::button(
@@ -1169,7 +1172,24 @@ impl Picker {
             buttons,
             back_width,
             "Back",
-            !self.install,
+            self.focus == Focus::Back,
+        );
+        let check = "Check only";
+        let check_width = canvas.text_width(check, 1) + 48;
+        Self::button(
+            canvas,
+            layout.left,
+            buttons,
+            check_width,
+            check,
+            self.focus == Focus::Check,
+        );
+        canvas.text(
+            layout.left,
+            buttons + 56,
+            "Check only reads the disk with Stela's driver and writes nothing",
+            1,
+            ui::DIM,
         );
     }
 
@@ -1184,28 +1204,22 @@ impl Picker {
     }
 }
 
-/// `disk` as it will be: its partitions but the `deleted` ones, or none
-/// when it is `erased`, and the free space of a MiB or more between them.
-fn segments_of(disk: &Disk, deleted: &[usize], erased: bool) -> Vec<Segment> {
+/// `disk`'s partitions and the free space of a MiB or more between them.
+fn segments_of(disk: &Disk) -> Vec<Segment> {
     let (first, end) = (
         disk.geometry.first_usable(),
         disk.geometry.last_usable() + 1,
     );
-    if disk.foreign && !erased {
+    if disk.foreign {
         return vec![Segment {
             first,
             end,
             content: Content::Foreign,
         }];
     }
-    let mut kept: Vec<(usize, &gpt::Partition)> = match (&disk.table, erased) {
-        (Some(table), false) => table
-            .partitions
-            .iter()
-            .enumerate()
-            .filter(|(n, _)| !deleted.contains(n))
-            .collect(),
-        _ => Vec::new(),
+    let mut kept: Vec<(usize, &gpt::Partition)> = match &disk.table {
+        Some(table) => table.partitions.iter().enumerate().collect(),
+        None => Vec::new(),
     };
     kept.sort_by_key(|(_, p)| p.first_lba);
     let mut segments = Vec::new();

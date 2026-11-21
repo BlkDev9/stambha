@@ -11,6 +11,19 @@
 //! before the partition is looked up, the engine finds the disk
 //! ([`Plan::locate`]) and makes the change ([`Plan::apply`]).
 //!
+//! A plan only adds a partition in free space beside the disk's own, or
+//! blanks a Stela partition already there: no decision deletes a partition
+//! or erases a disk, a disk without a GPT is left as it is, and a valid
+//! protective MBR stays byte for byte. Before anything is written the plan
+//! is checked against the disk as Stela's own driver reads it
+//! ([`Plan::check`]): both copies of the GPT whole, alike and byte for byte
+//! what the picker read through the firmware, every partition's entry the
+//! same after the change, and every write in the GPT's own blocks or in the
+//! new partition. A plan that only checks ([`Mode::Check`]) stops there: the
+//! check is given a disk it can only read ([`ReadOnly`]). Otherwise each
+//! write is read back before the next, so the backup GPT is whole and read
+//! back before the primary is touched.
+//!
 //! A plan is made for one boot and never stored. A boot that stops before
 //! it is applied leaves the disk as it was, and the next one finds no
 //! chosen partition and chooses again.
@@ -19,7 +32,7 @@ use super::{
     machine_state,
     storage::Target,
 };
-use alloc::{boxed::Box, string::String, vec, vec::Vec};
+use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
 use core::fmt;
 use stela_crypto::Sha256;
 use stela_crypto::digest::Digest;
@@ -29,6 +42,8 @@ use stela_formats::payload::{
     gpt::{self as shared, Disk, Partition, Role, Table, Write},
 };
 
+pub use read_only::ReadOnly;
+
 const MIB: u64 = 1 << 20;
 /// The blocks from the disk's start whose bytes tell the disk the picker
 /// saw from another ([`seen`]): the MBR, with its disk signature, and the
@@ -37,10 +52,87 @@ pub const SEEN_BLOCKS: u64 = 2;
 /// The most bytes one zeroing request covers, so a failure names a block
 /// near it and no single request runs long.
 const ZERO_BYTES: u64 = MIB;
+/// The least partition macOS is given: the system's minimum
+/// (`gpt::DEFAULT_MIN_APPLE_BYTES`, which setup also checks) and the
+/// machine state's tail after it. The picker offers no less, and a plan of
+/// less is not applied.
+pub const MIN_BYTES: u64 = shared::DEFAULT_MIN_APPLE_BYTES + machine_state::MINIMUM_BYTES;
+/// One GPT entry, of the 128 [`shared::encode`] writes.
+const ENTRY_BYTES: usize = 128;
+/// The bytes of a GPT header a rewrite of the same layout changes: the
+/// header's checksum and its entries'.
+const CHECKSUMS: [core::ops::Range<usize>; 2] = [16..20, 88..92];
 
 /// The digest of a disk's first [`SEEN_BLOCKS`] blocks.
 pub fn seen(first_blocks: &[u8]) -> [u8; 32] {
     Sha256::digest(first_blocks).into()
+}
+
+mod read_only {
+    use stela_drivers::block::{BlockDevice, BlockError, Identity};
+
+    /// A disk that can only be read, which [`super::Plan::check`] is
+    /// given: whatever the check does, it has no way to write, flush,
+    /// discard or zero the disk. The device is out of reach of everything
+    /// but this module.
+    pub struct ReadOnly<'a>(&'a mut dyn BlockDevice);
+
+    impl<'a> ReadOnly<'a> {
+        pub fn new(device: &'a mut dyn BlockDevice) -> Self {
+            Self(device)
+        }
+
+        pub fn identity(&self) -> &Identity {
+            self.0.identity()
+        }
+
+        pub fn read(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
+            self.0.read(lba, buffer)
+        }
+    }
+}
+
+/// What a disk holds where its GPT lives: from block 0 to the first usable
+/// block (the protective MBR, the primary header and entries), and after
+/// the last usable block (the backup entries and header). A plan's table
+/// writes go nowhere else.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ends {
+    pub head: Vec<u8>,
+    pub tail: Vec<u8>,
+}
+
+impl Ends {
+    /// The head's and the tail's blocks on a disk of `geometry`; `None` for
+    /// a block size or a size no GPT here uses.
+    pub fn spans(geometry: Disk) -> Option<[Extent; 2]> {
+        if !matches!(geometry.block_bytes, 512 | 1024 | 2048 | 4096)
+            || geometry.blocks <= 2 * geometry.first_usable()
+        {
+            return None;
+        }
+        let tail = geometry.last_usable() + 1;
+        Some([
+            Extent {
+                lba: 0,
+                blocks: geometry.first_usable(),
+            },
+            Extent {
+                lba: tail,
+                blocks: geometry.blocks - tail,
+            },
+        ])
+    }
+}
+
+/// What the boot does with a plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Make the change.
+    Install,
+    /// Check it against the disk, say every write it would make and write
+    /// nothing ([`Plan::check`]).
+    Check,
 }
 
 /// The partition macOS gets, as the disk holds it once the plan is applied.
@@ -61,8 +153,13 @@ pub struct Plan {
     pub geometry: Disk,
     /// [`seen`] of the disk's first blocks, as the picker read them.
     pub seen: [u8; 32],
+    /// The disk's GPT blocks as the picker read them through the firmware,
+    /// which Stela's driver must read too before anything is written.
+    pub ends: Ends,
+    pub mode: Mode,
     /// The partition table's blocks in the order to write them
-    /// ([`shared::encode`]); none when the table stays as it is.
+    /// ([`shared::encode`]'s, without its protective MBR where the disk
+    /// has one); none when the table stays as it is.
     pub table: Vec<Write>,
     /// The blocks to zero: the partition's first MiB and the machine
     /// state's tail, so the restore and the NOR start blank.
@@ -84,17 +181,15 @@ pub enum Place {
 pub struct Decision<'a> {
     pub serial: &'a str,
     pub geometry: Disk,
-    /// [`seen`] of the disk's first blocks.
-    pub seen: [u8; 32],
-    /// The disk's GPT; `None` on a blank disk or one with another scheme.
+    /// The disk's GPT blocks ([`Ends`]), as the picker read them.
+    pub ends: &'a Ends,
+    /// The disk's GPT; `None` on a blank disk or one with another scheme,
+    /// which no plan changes.
     pub table: Option<&'a Table>,
-    /// The table's partitions to delete, by index.
-    pub deleted: &'a [usize],
-    /// Every partition goes, as does another scheme's data.
-    pub erased: bool,
     pub place: Place,
     /// A new partition's GPT name.
     pub name: &'a str,
+    pub mode: Mode,
 }
 
 /// Why a decision makes no plan.
@@ -103,11 +198,14 @@ pub enum PlanError {
     NoSerial,
     /// The block size does not divide a MiB.
     Blocks(u64),
-    /// The reused partition is not in the table, is deleted too, or is not
-    /// a Stela partition.
+    /// The picker's read of the disk's GPT blocks is not of their size.
+    Ends,
+    /// The disk has no GPT: only a table that stays beside the new
+    /// partition is written, never a new one.
+    NoTable,
+    /// The reused partition is not in the table, or is not a Stela
+    /// partition.
     NotReusable,
-    /// A deleted partition is not in the table.
-    NoPartition(usize),
     /// The new partition is not whole blocks, or overlaps one that stays.
     Overlap,
     /// The partition cannot hold a namespace and the machine state.
@@ -121,8 +219,12 @@ impl fmt::Display for PlanError {
         match self {
             Self::NoSerial => f.write_str("the disk reports no serial number"),
             Self::Blocks(bytes) => write!(f, "the disk's {bytes}-byte blocks do not divide a MiB"),
+            Self::Ends => f.write_str("the disk's partition table blocks were not read whole"),
+            Self::NoTable => f.write_str(
+                "the disk has no partition table to add macOS to, and this build never writes a \
+                 new one",
+            ),
             Self::NotReusable => f.write_str("the partition chosen is not a Stela partition"),
-            Self::NoPartition(index) => write!(f, "the disk has no partition {index} to delete"),
             Self::Overlap => f.write_str("the new partition overlaps one that stays"),
             Self::TooSmall => f.write_str("the partition is too small"),
             Self::Table(why) => write!(f, "the new partition table is invalid: {why}"),
@@ -131,19 +233,21 @@ impl fmt::Display for PlanError {
 }
 
 /// The plan that carries out `decision`. `entropy` gives the new
-/// partition's GUID, and the disk's on one without a table. The table is
-/// written only when it changes: a reused partition with nothing deleted
-/// has its blocks zeroed and nothing else.
+/// partition's GUID. The table is written only for a new partition, which
+/// takes the first unused entry, every other partition keeping its own;
+/// the disk's protective MBR is written only when it has none. A reused
+/// partition has its blocks zeroed and nothing else. That the partition
+/// is as large as macOS needs ([`MIN_BYTES`]) is the picker's to offer
+/// and [`Plan::check`]'s to require.
 pub fn plan(decision: &Decision<'_>, entropy: &mut dyn FnMut() -> Guid) -> Result<Plan, PlanError> {
     let Decision {
         serial,
         geometry,
-        seen,
+        ends,
         table,
-        deleted,
-        erased,
         place,
         name,
+        mode,
     } = *decision;
     if serial.is_empty() {
         return Err(PlanError::NoSerial);
@@ -152,21 +256,19 @@ pub fn plan(decision: &Decision<'_>, entropy: &mut dyn FnMut() -> Guid) -> Resul
     if block == 0 || !MIB.is_multiple_of(block) {
         return Err(PlanError::Blocks(block));
     }
-    let mut new = match table {
-        Some(table) => table.clone(),
-        None => Table {
-            disk_guid: entropy(),
-            slots: Default::default(),
-            partitions: Vec::new(),
-        },
-    };
+    let [head, tail] = Ends::spans(geometry).ok_or(PlanError::Table("the disk is too small"))?;
+    if ends.head.len() as u64 != head.blocks * block
+        || ends.tail.len() as u64 != tail.blocks * block
+    {
+        return Err(PlanError::Ends);
+    }
+    let mut new = table.ok_or(PlanError::NoTable)?.clone();
     let (guid, first_lba, blocks) = match place {
         Place::Reuse(index) => {
             let partition = new
                 .partitions
                 .get(index)
                 .filter(|partition| partition.role() == Some(Role::AppleRegion))
-                .filter(|_| !erased && !deleted.contains(&index))
                 .ok_or(PlanError::NotReusable)?;
             (
                 partition.unique_guid,
@@ -178,57 +280,55 @@ pub fn plan(decision: &Decision<'_>, entropy: &mut dyn FnMut() -> Guid) -> Resul
             if bytes == 0 || !bytes.is_multiple_of(block) {
                 return Err(PlanError::Overlap);
             }
-            (entropy(), first_lba, bytes / block)
+            let blocks = bytes / block;
+            let last_lba = first_lba
+                .checked_add(blocks - 1)
+                .ok_or(PlanError::Overlap)?;
+            if new
+                .partitions
+                .iter()
+                .any(|kept| kept.first_lba <= last_lba && first_lba <= kept.last_lba)
+            {
+                return Err(PlanError::Overlap);
+            }
+            let guid = entropy();
+            // In the first unused entry, the others left in theirs: the
+            // partitions' numbers stay what the systems on the disk know
+            // them by.
+            new.add(Partition {
+                type_guid: Role::AppleRegion.type_guid(),
+                unique_guid: guid,
+                first_lba,
+                last_lba,
+                attributes: 0,
+                name: name.into(),
+            });
+            (guid, first_lba, blocks)
         }
     };
-    if erased {
-        new.partitions.clear();
-        new.slots.clear();
-    } else {
-        let mut deleted = deleted.to_vec();
-        deleted.sort_unstable();
-        deleted.dedup();
-        for &index in deleted.iter().rev() {
-            if index >= new.partitions.len() {
-                return Err(PlanError::NoPartition(index));
-            }
-            new.remove(index);
-        }
-    }
-    let changed = erased || !deleted.is_empty() || matches!(place, Place::Free { .. });
-    if let Place::Free { .. } = place {
-        let last_lba = first_lba + blocks - 1;
-        if new
-            .partitions
-            .iter()
-            .any(|kept| kept.first_lba <= last_lba && first_lba <= kept.last_lba)
-        {
-            return Err(PlanError::Overlap);
-        }
-        // In the first unused entry, the others left in theirs: the
-        // partitions' numbers stay what the systems on the disk know them by.
-        new.add(Partition {
-            type_guid: Role::AppleRegion.type_guid(),
-            unique_guid: guid,
-            first_lba,
-            last_lba,
-            attributes: 0,
-            name: name.into(),
-        });
-    }
     let split = machine_state::split(blocks * block).map_err(|_| PlanError::TooSmall)?;
-    let table = if changed {
-        shared::encode(geometry, &new).map_err(|error| match error {
-            PayloadError::Disk(why) => PlanError::Table(why),
-            _ => PlanError::Table("it cannot be encoded"),
-        })?
-    } else {
-        Vec::new()
+    let table = match place {
+        Place::Reuse(_) => Vec::new(),
+        Place::Free { .. } => {
+            let mut writes = shared::encode(geometry, &new).map_err(|error| match error {
+                PayloadError::Disk(why) => PlanError::Table(why),
+                _ => PlanError::Table("it cannot be encoded"),
+            })?;
+            // The disk's own protective MBR stays: the one `encode` builds
+            // drops its disk signature and other bytes the systems on the
+            // disk wrote.
+            if shared::protective(&ends.head[..block as usize]) {
+                writes.retain(|write| write.lba != 0);
+            }
+            writes
+        }
     };
     Ok(Plan {
         serial: serial.into(),
         geometry,
-        seen,
+        seen: seen(&ends.head[..(SEEN_BLOCKS * block) as usize]),
+        ends: ends.clone(),
+        mode,
         table,
         zero: vec![
             Extent {
@@ -253,6 +353,10 @@ pub fn plan(decision: &Decision<'_>, entropy: &mut dyn FnMut() -> Guid) -> Resul
 pub enum Step {
     /// Telling that the disk is the one the picker saw.
     Identify,
+    /// Checking the plan against the disk ([`Plan::check`]).
+    Check,
+    /// The trial write in the new partition, before the table's.
+    Probe,
     /// Writing the partition table.
     Table,
     /// Zeroing the partition's first MiB and the machine state.
@@ -267,6 +371,8 @@ impl Step {
     fn name(self) -> &'static str {
         match self {
             Self::Identify => "checking that it is the disk chosen",
+            Self::Check => "checking the plan against the disk",
+            Self::Probe => "trying a write in the new partition",
             Self::Table => "writing the partition table",
             Self::Zero => "zeroing the partition's first MiB and machine state",
             Self::Flush => "making the writes durable",
@@ -283,8 +389,24 @@ pub enum Cause {
     /// The disk has another block size or count than the picker saw: a
     /// different disk answers to the serial.
     Geometry { found: Disk },
-    /// The disk's first blocks are not what the picker read.
+    /// The disk's GPT blocks are not what the picker read.
     Changed,
+    /// The disk's two copies of the GPT are not whole, alike and in the
+    /// layout a rewrite keeps: why.
+    Copies(&'static str),
+    /// The plan writes what no plan writes: why.
+    Refused(&'static str),
+    /// The plan changes the entry of a partition that stays, numbered from
+    /// 1 as the systems on the disk number it.
+    Entry { entry: usize },
+    /// The new partition overlaps this partition.
+    Overlap { entry: usize },
+    /// The partition holds these bytes, less than [`MIN_BYTES`].
+    TooSmall { bytes: u64 },
+    /// The plan only checks the disk.
+    CheckOnly,
+    /// Blocks written read back otherwise.
+    ReadBack,
     /// The table read back cannot be used.
     Table(GptError),
     /// The table read back does not hold the chosen partition as planned.
@@ -302,6 +424,10 @@ pub struct ApplyError {
     pub cause: Cause,
 }
 
+fn error(step: Step, lba: Option<u64>, cause: Cause) -> ApplyError {
+    ApplyError { step, lba, cause }
+}
+
 impl fmt::Display for ApplyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.step.name())?;
@@ -315,7 +441,24 @@ impl fmt::Display for ApplyError {
                 ": the disk has {} blocks of {} bytes, not what was chosen",
                 found.blocks, found.block_bytes
             ),
-            Cause::Changed => f.write_str(": the disk's first blocks are not what was chosen"),
+            Cause::Changed => f.write_str(
+                ": the disk's partition table blocks are not what the picker read through the \
+                 firmware",
+            ),
+            Cause::Copies(why) | Cause::Refused(why) => write!(f, ": {why}"),
+            Cause::Entry { entry } => write!(
+                f,
+                ": the plan changes the entry of partition {entry}, which stays as it is"
+            ),
+            Cause::Overlap { entry } => {
+                write!(f, ": the new partition overlaps partition {entry}")
+            }
+            Cause::TooSmall { bytes } => write!(
+                f,
+                ": the partition holds {bytes} bytes, less than macOS's {MIN_BYTES}"
+            ),
+            Cause::CheckOnly => f.write_str(": the plan only checks the disk and writes nothing"),
+            Cause::ReadBack => f.write_str(": the blocks read back are not what was written"),
             Cause::Table(error) => write!(f, ": {error}"),
             Cause::Missing => f.write_str(": the chosen partition is not in it"),
             Cause::NotZero => f.write_str(": a zeroed block does not read as zero"),
@@ -340,6 +483,143 @@ impl fmt::Display for LocateError {
             Self::Ambiguous(count) => write!(f, "{count} disks could be the one chosen"),
         }
     }
+}
+
+/// What [`Plan::check`] found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Checked {
+    /// The table the plan writes, as its writes hold it; `None` when it
+    /// writes none.
+    pub table: Option<Table>,
+}
+
+/// Blocks as the check's lines name them.
+struct Span {
+    lba: u64,
+    blocks: u64,
+    block: u64,
+}
+
+impl fmt::Display for Span {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.blocks {
+            1 => write!(f, "LBA {} (1 block, {} bytes)", self.lba, self.block),
+            blocks => write!(
+                f,
+                "LBA {}-{} ({blocks} blocks, {} bytes)",
+                self.lba,
+                self.lba + blocks - 1,
+                blocks * self.block
+            ),
+        }
+    }
+}
+
+/// The first block of `found` whose bytes are not `expected`'s, counted
+/// from the first; `Some(0)` for buffers of different sizes.
+fn first_difference(found: &[u8], expected: &[u8], block: u64) -> Option<u64> {
+    if found.len() != expected.len() {
+        return Some(0);
+    }
+    found
+        .chunks(block as usize)
+        .zip(expected.chunks(block as usize))
+        .position(|(found, expected)| found != expected)
+        .map(|index| index as u64)
+}
+
+/// The disk's table as both copies of its GPT hold it, from its [`Ends`]:
+/// each header valid at its own block, naming the other copy, the usable
+/// blocks a rewrite keeps and 128 entries of 128 bytes beside it, each
+/// entry array its header's, and both arrays the same bytes.
+#[expect(
+    clippy::result_large_err,
+    reason = "the driver's error is kept whole for the stop's message, and one plan is checked a boot"
+)]
+fn copies(geometry: Disk, ends: &Ends) -> Result<Table, ApplyError> {
+    let block = geometry.block_bytes as usize;
+    let entry_blocks = geometry.entry_blocks();
+    let entries = entry_blocks as usize * block;
+    let last = geometry.blocks - 1;
+    let backup_entries_lba = last - entry_blocks;
+    let refuse = |lba, why| error(Step::Check, Some(lba), Cause::Copies(why));
+    let primary = (
+        1,
+        &ends.head[block..2 * block],
+        2,
+        &ends.head[2 * block..2 * block + entries],
+    );
+    let backup = (
+        last,
+        &ends.tail[entries..],
+        backup_entries_lba,
+        &ends.tail[..entries],
+    );
+    let mut tables = Vec::new();
+    for ((lba, header, entries_lba, array), other) in [(primary, last), (backup, 1)] {
+        let info = match shared::parse_header(geometry, lba, header) {
+            Ok(Some(info)) => info,
+            Ok(None) => return Err(refuse(lba, "a GPT header is missing")),
+            Err(_) => return Err(refuse(lba, "a GPT header is damaged")),
+        };
+        let alternate = u64::from_le_bytes(header[32..40].try_into().expect("8 bytes"));
+        if info.entries_lba != entries_lba
+            || info.entry_count != 128
+            || info.entry_bytes != ENTRY_BYTES as u32
+            || info.first_usable != geometry.first_usable()
+            || info.last_usable != geometry.last_usable()
+            || alternate != other
+        {
+            return Err(refuse(
+                lba,
+                "a GPT header names another layout than the one a rewrite keeps",
+            ));
+        }
+        let table = shared::parse_entries(&info, array)
+            .map_err(|_| refuse(entries_lba, "a GPT entry array is damaged"))?;
+        tables.push(table);
+    }
+    if primary.3 != backup.3 || tables[0] != tables[1] {
+        return Err(refuse(
+            backup_entries_lba,
+            "the backup GPT is not the primary's copy",
+        ));
+    }
+    Ok(tables.swap_remove(0))
+}
+
+/// The table the backup copy in `tail` holds, if it is whole.
+fn backup_copy(geometry: Disk, tail: &[u8]) -> Option<Table> {
+    let entries = (geometry.entry_blocks() * geometry.block_bytes) as usize;
+    let info = shared::parse_header(geometry, geometry.blocks - 1, &tail[entries..]).ok()??;
+    shared::parse_entries(&info, &tail[..entries]).ok()
+}
+
+/// Read both of `device`'s [`Ends`], at `step`.
+#[expect(
+    clippy::result_large_err,
+    reason = "the driver's error is kept whole for the stop's message, and one plan is checked a boot"
+)]
+fn read_ends(
+    geometry: Disk,
+    step: Step,
+    mut read: impl FnMut(u64, &mut [u8]) -> Result<(), BlockError>,
+) -> Result<Ends, ApplyError> {
+    let [head, tail] = Ends::spans(geometry).ok_or(error(
+        Step::Check,
+        None,
+        Cause::Copies("the disk is too small for a GPT"),
+    ))?;
+    let block = geometry.block_bytes;
+    let mut ends = Ends {
+        head: vec![0; (head.blocks * block) as usize],
+        tail: vec![0; (tail.blocks * block) as usize],
+    };
+    for (span, buffer) in [(head, &mut ends.head), (tail, &mut ends.tail)] {
+        read(span.lba, buffer)
+            .map_err(|cause| error(step, Some(span.lba), Cause::Device(cause)))?;
+    }
+    Ok(ends)
 }
 
 const MAGIC: &[u8; 8] = b"STELAPLN";
@@ -396,60 +676,537 @@ impl Plan {
         }
     }
 
-    /// Make the plan's change to `device`, the whole disk.
+    fn span(&self, lba: u64, blocks: u64) -> Span {
+        Span {
+            lba,
+            blocks,
+            block: self.geometry.block_bytes,
+        }
+    }
+
+    /// What the table write at `lba` holds.
+    fn names(&self, lba: u64) -> &'static str {
+        let last = self.geometry.blocks - 1;
+        match lba {
+            0 => "the protective MBR",
+            1 => "the primary GPT header",
+            2 => "the primary GPT entries",
+            lba if lba == last => "the backup GPT header",
+            lba if lba == last - self.geometry.entry_blocks() => "the backup GPT entries",
+            _ => "blocks outside the GPT",
+        }
+    }
+
+    /// The write that tries Stela's driver in the new partition before
+    /// any of the table is written: as many blocks as an entry array, from
+    /// the partition's first, each holding its block number; the first
+    /// MiB's zeroing clears it.
+    fn probe(&self) -> Write {
+        let block = self.geometry.block_bytes as usize;
+        let mut bytes = vec![0x5a; self.geometry.entry_blocks() as usize * block];
+        for (index, part) in bytes.chunks_mut(block).enumerate() {
+            part[..8].copy_from_slice(b"STELATRY");
+            part[8..16].copy_from_slice(&(self.partition.first_lba + index as u64).to_le_bytes());
+        }
+        Write {
+            lba: self.partition.first_lba,
+            bytes,
+        }
+    }
+
+    /// Say every write the plan makes, in order.
+    fn say_plan(&self, say: &mut dyn FnMut(&str)) {
+        let block = self.geometry.block_bytes;
+        let partition = self.partition;
+        say(match self.mode {
+            Mode::Check => "PLAN check only: nothing below is written",
+            Mode::Install => "PLAN install: each write is read back before the next",
+        });
+        say(&format!(
+            "PLAN the disk: {} blocks of {block} bytes",
+            self.geometry.blocks
+        ));
+        let whole = self.span(partition.first_lba, partition.blocks);
+        say(&if self.table.is_empty() {
+            format!("PLAN the macOS partition: the Stela partition at {whole}, blanked")
+        } else {
+            format!("PLAN the macOS partition: new, at {whole}")
+        });
+        let mut number = 0;
+        let mut write = |say: &mut dyn FnMut(&str), what: &str, lba, bytes: usize| {
+            number += 1;
+            say(&format!(
+                "PLAN write {number}: {what}, {}",
+                self.span(lba, bytes as u64 / block)
+            ));
+        };
+        if self.table.is_empty() {
+            say("PLAN the partition table is not written");
+        } else {
+            let probe = self.probe();
+            write(
+                say,
+                "a trial write in the new partition, read back and zeroed below",
+                probe.lba,
+                probe.bytes.len(),
+            );
+            for table in &self.table {
+                write(say, self.names(table.lba), table.lba, table.bytes.len());
+            }
+            if self.table.iter().all(|table| table.lba != 0) {
+                say("PLAN the protective MBR at LBA 0 is valid: it is not written");
+            }
+        }
+        for (index, extent) in self.zero.iter().enumerate() {
+            let what = match index {
+                0 => "the macOS partition's first MiB",
+                1 => "the machine state in its tail",
+                _ => "a range of the macOS partition",
+            };
+            say(&format!(
+                "PLAN zero {}: {what}, {}, by Write Zeroes, not TRIM",
+                index + 1,
+                self.span(extent.lba, extent.blocks)
+            ));
+        }
+        say("PLAN nothing else is written, and nothing is trimmed");
+    }
+
+    /// Check the plan against `disk`, the whole disk as Stela's own driver
+    /// reads it, saying every write the plan makes (`PLAN` lines) and each
+    /// check it passes (`PASS`). The disk only reads, so the check writes
+    /// nothing, whatever it finds.
     ///
-    /// Nothing is written unless the disk has the geometry and first blocks
-    /// the picker saw. The table's blocks go in [`shared::encode`]'s order,
-    /// the backup copy before the primary, each made durable before the
-    /// next: until the primary's entries are written the disk reads as its
-    /// earlier table, and from then on as the new one, from the backup
-    /// while the primary header is still the earlier one's
-    /// ([`shared::read`]). So a write that fails, or power lost, leaves one
-    /// whole table or the other, never a mix. The table goes before the
-    /// zeroes, so no block is zeroed that the table on the disk still gives
-    /// to a partition being deleted. Then the ranges are zeroed, in pieces
-    /// of [`ZERO_BYTES`], everything is made durable, and the table and
-    /// each range's first block are read back.
+    /// The disk must have the geometry the picker saw and hold at both ends
+    /// the bytes the picker read through the firmware; both copies of its
+    /// GPT must be whole and alike. The partition must lie in the blocks
+    /// the GPT gives partitions and hold at least [`MIN_BYTES`]. A reused
+    /// one must be that Stela partition on the disk. A new one must overlap
+    /// no partition, and the table written must be the backup entries and
+    /// header, then the primary's, with a protective MBR only for a disk
+    /// without one: every entry of the disk byte for byte as it is, but one
+    /// unused entry that takes the planned Stela partition, and each header
+    /// as it is but for its two checksums. Each range to zero, and the
+    /// trial write, lie in the partition.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the driver's error is kept whole for the stop's message, and one plan is checked a boot"
+    )]
+    pub fn check(
+        &self,
+        disk: &mut ReadOnly<'_>,
+        say: &mut dyn FnMut(&str),
+    ) -> Result<Checked, ApplyError> {
+        self.say_plan(say);
+        let geometry = self.geometry;
+        let block = geometry.block_bytes;
+        let found = gpt::geometry(disk.identity());
+        if found != geometry {
+            return Err(error(Step::Identify, None, Cause::Geometry { found }));
+        }
+        say(&format!(
+            "PASS the disk has {} blocks of {block} bytes, as the picker saw",
+            geometry.blocks
+        ));
+        let now = read_ends(geometry, Step::Identify, |lba, buffer| {
+            disk.read(lba, buffer)
+        })?;
+        let [head, tail] = Ends::spans(geometry).expect("read");
+        for (what, span, read, picked) in [
+            ("primary", head, &now.head, &self.ends.head),
+            ("backup", tail, &now.tail, &self.ends.tail),
+        ] {
+            if let Some(index) = first_difference(read, picked, block) {
+                return Err(error(
+                    Step::Identify,
+                    Some(span.lba + index),
+                    Cause::Changed,
+                ));
+            }
+            say(&format!(
+                "PASS the {what} GPT's blocks, {}, read through Stela's driver are byte for byte \
+                 what the picker read through the firmware",
+                self.span(span.lba, span.blocks)
+            ));
+        }
+        let existing = copies(geometry, &now)?;
+        say(&format!(
+            "PASS both GPT copies are whole and alike: headers at LBA 1 and {}, 128 entries of \
+             128 bytes at LBA 2 and {}, {} partitions",
+            geometry.blocks - 1,
+            tail.lba,
+            existing.partitions.len()
+        ));
+        let partition = self.partition;
+        let refuse = |lba, why| error(Step::Check, Some(lba), Cause::Refused(why));
+        let last_lba = partition
+            .first_lba
+            .checked_add(partition.blocks.saturating_sub(1))
+            .filter(|_| partition.blocks != 0)
+            .ok_or(refuse(
+                partition.first_lba,
+                "the macOS partition has no blocks",
+            ))?;
+        if partition.first_lba < geometry.first_usable() || last_lba > geometry.last_usable() {
+            return Err(refuse(
+                partition.first_lba,
+                "the macOS partition lies outside the blocks the GPT gives partitions",
+            ));
+        }
+        let bytes = partition.blocks * block;
+        if bytes < MIN_BYTES || machine_state::split(bytes).is_err() {
+            return Err(error(
+                Step::Check,
+                Some(partition.first_lba),
+                Cause::TooSmall { bytes },
+            ));
+        }
+        let whole = self.span(partition.first_lba, partition.blocks);
+        let table = if self.table.is_empty() {
+            let reused = existing
+                .partitions
+                .iter()
+                .position(|found| {
+                    found.unique_guid == partition.guid
+                        && found.role() == Some(Role::AppleRegion)
+                        && found.first_lba == partition.first_lba
+                        && found.blocks() == partition.blocks
+                })
+                .ok_or(refuse(
+                    partition.first_lba,
+                    "the partition to reuse is not that Stela partition on the disk",
+                ))?;
+            say(&format!(
+                "PASS the partition reused, entry {}, is the Stela partition at {whole}; the \
+                 partition table is not written",
+                existing.slot(reused) + 1
+            ));
+            None
+        } else {
+            for (index, kept) in existing.partitions.iter().enumerate() {
+                if kept.first_lba <= last_lba && partition.first_lba <= kept.last_lba {
+                    return Err(error(
+                        Step::Check,
+                        Some(partition.first_lba),
+                        Cause::Overlap {
+                            entry: existing.slot(index) as usize + 1,
+                        },
+                    ));
+                }
+                if kept.unique_guid == partition.guid {
+                    return Err(refuse(
+                        partition.first_lba,
+                        "the new partition's GUID is a partition's on the disk",
+                    ));
+                }
+            }
+            say(&format!(
+                "PASS the new partition, {whole}, lies in free space: it overlaps none of the \
+                 disk's {} partitions and holds at least {MIN_BYTES} bytes",
+                existing.partitions.len()
+            ));
+            Some(self.check_table(&now, &existing, say)?)
+        };
+        let inside = |lba: u64, blocks: u64| {
+            blocks != 0
+                && lba >= partition.first_lba
+                && lba
+                    .checked_add(blocks)
+                    .is_some_and(|end| end <= last_lba + 1)
+        };
+        for extent in &self.zero {
+            if !inside(extent.lba, extent.blocks) {
+                return Err(refuse(
+                    extent.lba,
+                    "a range to zero lies outside the macOS partition",
+                ));
+            }
+        }
+        if table.is_some() {
+            let probe = self.probe();
+            let blocks = probe.bytes.len() as u64 / block;
+            let zeroed = self.zero.iter().any(|extent| {
+                probe.lba >= extent.lba && probe.lba + blocks <= extent.lba + extent.blocks
+            });
+            if !inside(probe.lba, blocks) || !zeroed {
+                return Err(refuse(
+                    probe.lba,
+                    "the trial write would not be zeroed in the macOS partition",
+                ));
+            }
+        }
+        say(
+            "PASS every write lies in the GPT's own blocks or in the macOS partition, and none is \
+             a TRIM",
+        );
+        Ok(Checked { table })
+    }
+
+    /// The table the plan writes, checked against `now`, the disk's GPT
+    /// blocks, and `existing`, the table they hold.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the driver's error is kept whole for the stop's message, and one plan is checked a boot"
+    )]
+    fn check_table(
+        &self,
+        now: &Ends,
+        existing: &Table,
+        say: &mut dyn FnMut(&str),
+    ) -> Result<Table, ApplyError> {
+        let geometry = self.geometry;
+        let block = geometry.block_bytes as usize;
+        let entry_blocks = geometry.entry_blocks();
+        let last = geometry.blocks - 1;
+        let refuse = |lba, why| error(Step::Check, Some(lba), Cause::Refused(why));
+        let keep_mbr = shared::protective(&now.head[..block]);
+        let mut expected = vec![
+            (last - entry_blocks, entry_blocks),
+            (last, 1),
+            (2, entry_blocks),
+            (1, 1),
+        ];
+        if !keep_mbr {
+            expected.push((0, 1));
+        }
+        let at = |index: usize| self.table.get(index).map_or(0, |write| write.lba);
+        if self.table.len() != expected.len() {
+            return Err(refuse(
+                at(expected.len().min(self.table.len())),
+                "the table's writes are not the backup GPT, the primary and, for a disk without \
+                 one, a protective MBR",
+            ));
+        }
+        for (index, (write, &(lba, blocks))) in self.table.iter().zip(&expected).enumerate() {
+            if write.lba != lba || write.bytes.len() != (blocks as usize) * block {
+                return Err(refuse(
+                    at(index),
+                    "a table write is not in the GPT's own blocks, in the order that keeps a \
+                     whole copy",
+                ));
+            }
+        }
+        if !keep_mbr && !shared::protective(&self.table[4].bytes) {
+            return Err(refuse(0, "the MBR the plan writes is not a protective one"));
+        }
+        let [
+            backup_entries,
+            backup_header,
+            primary_entries,
+            primary_header,
+        ] = [0, 1, 2, 3].map(|index| &self.table[index].bytes[..]);
+        if backup_entries != primary_entries {
+            return Err(refuse(
+                last - entry_blocks,
+                "the plan's backup entries are not its primary's",
+            ));
+        }
+        let entries = (entry_blocks as usize) * block;
+        let old = &now.head[2 * block..2 * block + entries];
+        let mut added = None;
+        for (slot, (was, will)) in old
+            .chunks(ENTRY_BYTES)
+            .zip(primary_entries.chunks(ENTRY_BYTES))
+            .enumerate()
+        {
+            if was == will {
+                continue;
+            }
+            let lba = 2 + (slot * ENTRY_BYTES / block) as u64;
+            if was.iter().any(|&byte| byte != 0) {
+                return Err(error(
+                    Step::Check,
+                    Some(lba),
+                    Cause::Entry { entry: slot + 1 },
+                ));
+            }
+            if added.replace(slot).is_some() {
+                return Err(refuse(lba, "the plan adds more than one partition"));
+            }
+        }
+        let slot = added.ok_or(refuse(2, "the plan adds no partition"))?;
+        for (lba, was, will) in [
+            (1, &now.head[block..2 * block], primary_header),
+            (last, &now.tail[entries..], backup_header),
+        ] {
+            let changed = was.iter().zip(will).enumerate().any(|(at, (was, will))| {
+                was != will && !CHECKSUMS.iter().any(|checksum| checksum.contains(&at))
+            });
+            if changed {
+                return Err(refuse(
+                    lba,
+                    "a GPT header the plan writes changes more than its two checksums",
+                ));
+            }
+        }
+        let parsed = |lba, header, array| {
+            let info = shared::parse_header(geometry, lba, header).ok().flatten()?;
+            shared::parse_entries(&info, array).ok()
+        };
+        let planned = parsed(1, primary_header, primary_entries)
+            .ok_or(refuse(1, "the plan's primary GPT is not valid"))?;
+        if parsed(last, backup_header, backup_entries).as_ref() != Some(&planned) {
+            return Err(refuse(
+                last,
+                "the plan's backup GPT is not its primary's copy",
+            ));
+        }
+        let partition = self.partition;
+        let new = planned
+            .partitions
+            .iter()
+            .zip(&planned.slots)
+            .find(|(_, found)| **found as usize == slot)
+            .map(|(new, _)| new)
+            .filter(|new| {
+                new.role() == Some(Role::AppleRegion)
+                    && new.unique_guid == partition.guid
+                    && new.first_lba == partition.first_lba
+                    && new.blocks() == partition.blocks
+                    && new.attributes == 0
+            })
+            .ok_or(refuse(
+                2 + (slot * ENTRY_BYTES / block) as u64,
+                "the entry the plan adds is not the planned Stela partition",
+            ))?;
+        for (index, kept) in existing.partitions.iter().enumerate() {
+            say(&format!(
+                "PASS entry {} stays byte for byte: {:?}, type {}, LBA {}-{}",
+                existing.slot(index) + 1,
+                kept.name,
+                kept.type_guid,
+                kept.first_lba,
+                kept.last_lba
+            ));
+        }
+        say(&format!(
+            "PASS entry {}, unused on the disk, takes the new partition: {:?}, type {}, LBA {}-{}",
+            slot + 1,
+            new.name,
+            new.type_guid,
+            new.first_lba,
+            new.last_lba
+        ));
+        say(
+            "PASS the primary and backup GPT headers change only their header and entries \
+             checksums, bytes 16-19 and 88-91",
+        );
+        say(if keep_mbr {
+            "PASS the protective MBR at LBA 0 is valid, and stays byte for byte"
+        } else {
+            "PASS the disk has no protective MBR, and the plan writes one at LBA 0"
+        });
+        Ok(planned)
+    }
+
+    /// Write `write`, make it durable and read it back, at `step`.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the driver's error is kept whole for the stop's message, and one plan is applied a boot"
+    )]
+    fn write_back(
+        &self,
+        device: &mut dyn BlockDevice,
+        step: Step,
+        write: &Write,
+        what: &str,
+        say: &mut dyn FnMut(&str),
+    ) -> Result<(), ApplyError> {
+        let failed = |cause| error(step, Some(write.lba), Cause::Device(cause));
+        Request::Write {
+            lba: write.lba,
+            data: write.bytes.clone(),
+            durable: false,
+        }
+        .run(device)
+        .map_err(failed)?;
+        device.flush().map_err(failed)?;
+        let mut back = vec![0; write.bytes.len()];
+        device.read(write.lba, &mut back).map_err(failed)?;
+        if let Some(index) = first_difference(&back, &write.bytes, self.geometry.block_bytes) {
+            return Err(error(step, Some(write.lba + index), Cause::ReadBack));
+        }
+        say(&format!(
+            "PASS wrote {what}, {}, and read it back the same",
+            self.span(
+                write.lba,
+                write.bytes.len() as u64 / self.geometry.block_bytes
+            )
+        ));
+        Ok(())
+    }
+
+    /// Make the plan's change to `device`, the whole disk.
     #[expect(
         clippy::result_large_err,
         reason = "the driver's error is kept whole for the stop's message, and one plan is applied a boot"
     )]
     pub fn apply(&self, device: &mut dyn BlockDevice) -> Result<(), ApplyError> {
-        let failed = |step, lba| {
-            move |error| ApplyError {
-                step,
-                lba,
-                cause: Cause::Device(error),
+        self.apply_saying(device, &mut |_| {})
+    }
+
+    /// [`Self::apply`], saying each step as [`Self::check`] does.
+    ///
+    /// Nothing is written unless the plan installs and passes
+    /// [`Self::check`]. Then a trial write in the new partition is read
+    /// back, and the table's blocks go in [`shared::encode`]'s order, the
+    /// backup copy before the primary, each made durable and read back
+    /// before the next, and the backup read whole before the primary is
+    /// touched: until the primary's entries are written the disk reads as
+    /// its earlier table, and from then on as the new one, from the backup
+    /// while the primary header is still the earlier one's
+    /// ([`shared::read`]). So a write that fails or reads back otherwise,
+    /// or power lost, leaves one whole table or the other, never a mix, and
+    /// a write that does not read back stops before the next. Then the
+    /// ranges are zeroed, in pieces of [`ZERO_BYTES`], everything is made
+    /// durable, both copies of the table are read back, and the zeroed
+    /// ranges are read back whole.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the driver's error is kept whole for the stop's message, and one plan is applied a boot"
+    )]
+    pub fn apply_saying(
+        &self,
+        device: &mut dyn BlockDevice,
+        say: &mut dyn FnMut(&str),
+    ) -> Result<(), ApplyError> {
+        if self.mode == Mode::Check {
+            return Err(error(Step::Check, None, Cause::CheckOnly));
+        }
+        let failed = |step, lba| move |cause| error(step, lba, Cause::Device(cause));
+        let checked = self.check(&mut ReadOnly::new(device), say)?;
+        let geometry = self.geometry;
+        let block = geometry.block_bytes;
+        if let Some(planned) = &checked.table {
+            self.write_back(
+                device,
+                Step::Probe,
+                &self.probe(),
+                "the trial write in the new partition",
+                say,
+            )?;
+            for (index, write) in self.table.iter().enumerate() {
+                self.write_back(device, Step::Table, write, self.names(write.lba), say)?;
+                if index != 1 {
+                    continue;
+                }
+                // The backup copy is whole before the primary is touched.
+                let back = read_ends(geometry, Step::Table, |lba, buffer| {
+                    device.read(lba, buffer)
+                })?;
+                if backup_copy(geometry, &back.tail).as_ref() != Some(planned) {
+                    return Err(error(
+                        Step::Table,
+                        Some(geometry.last_usable() + 1),
+                        Cause::ReadBack,
+                    ));
+                }
+                say(
+                    "PASS the backup GPT on the disk is the new table, whole, and the primary is \
+                     as it was",
+                );
             }
-        };
-        let found = Self::geometry_of(device);
-        if found != self.geometry {
-            return Err(ApplyError {
-                step: Step::Identify,
-                lba: None,
-                cause: Cause::Geometry { found },
-            });
         }
-        if !self.saw(device).map_err(failed(Step::Identify, Some(0)))? {
-            return Err(ApplyError {
-                step: Step::Identify,
-                lba: Some(0),
-                cause: Cause::Changed,
-            });
-        }
-        for write in &self.table {
-            Request::Write {
-                lba: write.lba,
-                data: write.bytes.clone(),
-                durable: false,
-            }
-            .run(device)
-            .map_err(failed(Step::Table, Some(write.lba)))?;
-            device
-                .flush()
-                .map_err(failed(Step::Table, Some(write.lba)))?;
-        }
-        let block = self.geometry.block_bytes;
         let piece = (ZERO_BYTES / block).max(1);
         for extent in &self.zero {
             let mut done = 0;
@@ -467,12 +1224,18 @@ impl Plan {
             }
         }
         device.flush().map_err(failed(Step::Flush, None))?;
-        let verify = |cause| ApplyError {
-            step: Step::Verify,
-            lba: None,
-            cause,
-        };
-        let table = gpt::read(device).map_err(|error| verify(Cause::Table(error)))?;
+        let verify = |lba, cause| error(Step::Verify, lba, cause);
+        let table = gpt::read(device).map_err(|cause| verify(None, Cause::Table(cause)))?;
+        if let Some(planned) = &checked.table {
+            let now = read_ends(geometry, Step::Verify, |lba, buffer| {
+                device.read(lba, buffer)
+            })?;
+            let found = copies(geometry, &now).map_err(|found| verify(found.lba, found.cause))?;
+            if found != *planned || table != *planned {
+                return Err(verify(Some(1), Cause::Missing));
+            }
+            say("PASS both GPT copies read back whole, alike and as planned");
+        }
         let mut matching = table
             .partitions
             .iter()
@@ -483,20 +1246,30 @@ impl Plan {
                 && partition.role() == Some(Role::AppleRegion)
         });
         if !planned || matching.next().is_some() {
-            return Err(verify(Cause::Missing));
+            return Err(verify(None, Cause::Missing));
         }
-        let mut first = vec![0; block as usize];
+        let mut read = vec![0; (piece * block) as usize];
         for extent in &self.zero {
-            device
-                .read(extent.lba, &mut first)
-                .map_err(failed(Step::Verify, Some(extent.lba)))?;
-            if first.iter().any(|&byte| byte != 0) {
-                return Err(ApplyError {
-                    step: Step::Verify,
-                    lba: Some(extent.lba),
-                    cause: Cause::NotZero,
-                });
+            let mut done = 0;
+            while done < extent.blocks {
+                let lba = extent.lba + done;
+                let blocks = (extent.blocks - done).min(piece);
+                let part = &mut read[..(blocks * block) as usize];
+                device
+                    .read(lba, part)
+                    .map_err(failed(Step::Verify, Some(lba)))?;
+                if let Some(index) = part
+                    .chunks(block as usize)
+                    .position(|found| found.iter().any(|&byte| byte != 0))
+                {
+                    return Err(verify(Some(lba + index as u64), Cause::NotZero));
+                }
+                done += blocks;
             }
+            say(&format!(
+                "PASS zeroed {} and read it back as zeros",
+                self.span(extent.lba, extent.blocks)
+            ));
         }
         Ok(())
     }
@@ -508,6 +1281,13 @@ impl Plan {
         }
         let mut bytes = Vec::new();
         bytes.extend_from_slice(MAGIC);
+        number(
+            &mut bytes,
+            match self.mode {
+                Mode::Install => 0,
+                Mode::Check => 1,
+            },
+        );
         number(&mut bytes, self.geometry.block_bytes);
         number(&mut bytes, self.geometry.blocks);
         bytes.extend_from_slice(&self.seen);
@@ -516,6 +1296,10 @@ impl Plan {
         number(&mut bytes, self.partition.blocks);
         number(&mut bytes, self.serial.len() as u64);
         bytes.extend_from_slice(self.serial.as_bytes());
+        for end in [&self.ends.head, &self.ends.tail] {
+            number(&mut bytes, end.len() as u64);
+            bytes.extend_from_slice(end);
+        }
         number(&mut bytes, self.zero.len() as u64);
         for extent in &self.zero {
             number(&mut bytes, extent.lba);
@@ -537,6 +1321,11 @@ impl Plan {
         if rest.take(MAGIC.len() as u64)? != MAGIC {
             return None;
         }
+        let mode = match rest.number()? {
+            0 => Mode::Install,
+            1 => Mode::Check,
+            _ => return None,
+        };
         let geometry = Disk {
             block_bytes: rest.number()?,
             blocks: rest.number()?,
@@ -549,6 +1338,10 @@ impl Plan {
         };
         let serial_bytes = rest.number()?;
         let serial = String::from(core::str::from_utf8(rest.take(serial_bytes)?).ok()?);
+        let ends = Ends {
+            head: rest.counted()?.to_vec(),
+            tail: rest.counted()?.to_vec(),
+        };
         let mut zero = Vec::new();
         for _ in 0..rest.number()? {
             zero.push(Extent {
@@ -569,6 +1362,8 @@ impl Plan {
             serial,
             geometry,
             seen,
+            ends,
+            mode,
             table,
             zero,
             partition,
@@ -599,653 +1394,4 @@ impl<'a> Rest<'a> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use stela_drivers::block::{Identity, RamDisk};
-
-    const SERIAL: &str = "FAKE-SERIAL-0001";
-    const NAME: &str = "Stela macOS";
-    const NEW: &str = "CCCCCCCC-0000-0000-0000-000000000001";
-    const DISK: &str = "DDDDDDDD-0000-0000-0000-000000000001";
-    const LINUX: &str = "0FC63DAF-8483-4772-8E79-3D69D8477DE4";
-    /// 64 MiB: room for an 18 MiB partition and others.
-    const BYTES: u64 = 64 * MIB;
-
-    fn guid(text: &str) -> Guid {
-        text.parse().unwrap()
-    }
-
-    /// The GUIDs a plan draws, in order: a blank disk's own, then the new
-    /// partition's.
-    fn entropy(table: bool) -> impl FnMut() -> Guid {
-        let mut drawn = if table {
-            vec![guid(NEW)]
-        } else {
-            vec![guid(NEW), guid(DISK)]
-        };
-        move || drawn.pop().expect("no more GUIDs are drawn")
-    }
-
-    fn partition(kind: Guid, unique: &str, first_mib: u64, mib: u64, block: u64) -> Partition {
-        Partition {
-            type_guid: kind,
-            unique_guid: guid(unique),
-            first_lba: first_mib * MIB / block,
-            last_lba: (first_mib + mib) * MIB / block - 1,
-            attributes: 0,
-            name: String::from("test"),
-        }
-    }
-
-    /// A Linux partition at 1 MiB, another at 2 MiB and a Stela partition
-    /// of 20 MiB at 40 MiB.
-    fn layout(block: u64) -> Table {
-        Table {
-            disk_guid: guid(DISK),
-            slots: Default::default(),
-            partitions: vec![
-                partition(
-                    guid(LINUX),
-                    "AAAAAAAA-0000-0000-0000-000000000001",
-                    1,
-                    1,
-                    block,
-                ),
-                partition(
-                    guid(LINUX),
-                    "AAAAAAAA-0000-0000-0000-000000000002",
-                    2,
-                    1,
-                    block,
-                ),
-                partition(
-                    Role::AppleRegion.type_guid(),
-                    "AAAAAAAA-0000-0000-0000-000000000003",
-                    40,
-                    20,
-                    block,
-                ),
-            ],
-        }
-    }
-
-    /// A disk of `block`-byte blocks, every byte 0xa5 under `table`.
-    fn disk(block: u64, table: Option<&Table>) -> RamDisk {
-        let mut disk = RamDisk::new(SERIAL, BYTES / block, block as u32);
-        disk.bytes.fill(0xa5);
-        // No table: the ends a GPT would take are zero, as a blank disk's.
-        let ends = (34 * block) as usize;
-        disk.bytes[..ends].fill(0);
-        let length = disk.bytes.len();
-        disk.bytes[length - ends..].fill(0);
-        if let Some(table) = table {
-            for write in shared::encode(gpt::geometry(&disk.identity), table).unwrap() {
-                disk.write(write.lba, &write.bytes).unwrap();
-            }
-        }
-        disk
-    }
-
-    fn decision<'a>(disk: &RamDisk, table: Option<&'a Table>, place: Place) -> Decision<'a> {
-        let block = u64::from(disk.identity.block_size);
-        Decision {
-            serial: SERIAL,
-            geometry: gpt::geometry(&disk.identity),
-            seen: seen(&disk.bytes[..(SEEN_BLOCKS * block) as usize]),
-            table,
-            deleted: &[],
-            erased: false,
-            place,
-            name: NAME,
-        }
-    }
-
-    fn free(first_mib: u64, mib: u64, block: u64) -> Place {
-        Place::Free {
-            first_lba: first_mib * MIB / block,
-            bytes: mib * MIB,
-        }
-    }
-
-    /// The table `plan`'s writes hold, read as a disk with only them would.
-    fn planned_table(plan: &Plan) -> Table {
-        let block = plan.geometry.block_bytes;
-        let mut blank = RamDisk::new(SERIAL, plan.geometry.blocks, block as u32);
-        for write in &plan.table {
-            blank.write(write.lba, &write.bytes).unwrap();
-        }
-        gpt::read(&mut blank).unwrap()
-    }
-
-    fn zeroed(disk: &RamDisk, extent: Extent) -> bool {
-        let block = u64::from(disk.identity.block_size);
-        let span = (extent.lba * block) as usize..((extent.lba + extent.blocks) * block) as usize;
-        disk.bytes[span].iter().all(|&byte| byte == 0)
-    }
-
-    #[test]
-    fn a_new_partition_in_free_space_joins_the_table() {
-        for block in [512, 4096] {
-            let table = layout(block);
-            let disk = disk(block, Some(&table));
-            let made = plan(
-                &decision(&disk, Some(&table), free(4, 18, block)),
-                &mut entropy(true),
-            )
-            .unwrap();
-            assert_eq!(
-                made.partition,
-                Planned {
-                    guid: guid(NEW),
-                    first_lba: 4 * MIB / block,
-                    blocks: 18 * MIB / block,
-                }
-            );
-            assert_eq!(
-                made.target(),
-                format!("{SERIAL}:{NEW}").parse::<Target>().unwrap()
-            );
-            // The first MiB, and the machine state: the last 16 MiB of an
-            // 18 MiB partition, from a MiB boundary.
-            assert_eq!(
-                made.zero,
-                [
-                    Extent {
-                        lba: 4 * MIB / block,
-                        blocks: MIB / block
-                    },
-                    Extent {
-                        lba: 6 * MIB / block,
-                        blocks: 16 * MIB / block
-                    },
-                ]
-            );
-            // The backup copy first, the primary header after its entries.
-            let last = BYTES / block - 1;
-            let lbas: Vec<u64> = made.table.iter().map(|write| write.lba).collect();
-            assert_eq!(lbas[1..], [last, 2, 1, 0], "{block}");
-            let new = planned_table(&made);
-            assert_eq!(new.disk_guid, guid(DISK));
-            // The new partition takes the first unused entry, the fourth,
-            // though it lies before the third on the disk: the partitions
-            // there keep their entries, and so their numbers.
-            assert_eq!(new.partitions.len(), 4);
-            assert_eq!(new.slots, [0, 1, 2, 3]);
-            assert_eq!(new.partitions[..3], table.partitions[..]);
-            assert_eq!(new.partitions[3].unique_guid, guid(NEW));
-            assert_eq!(new.partitions[3].name, NAME);
-            assert_eq!(new.partitions[3].role(), Some(Role::AppleRegion));
-        }
-    }
-
-    #[test]
-    fn no_partition_that_stays_changes_its_entry() {
-        // Entries 0 and 3 used, 1 and 2 empty, and the first entry later on
-        // the disk than the second: as Windows, gdisk or Linux leave a disk
-        // after a partition is deleted or one added in front.
-        let [low, high, stela] = layout(512).partitions.try_into().unwrap();
-        let table = Table {
-            disk_guid: guid(DISK),
-            partitions: vec![stela.clone(), low.clone()],
-            slots: vec![0, 3],
-        };
-        let mut gapped = disk(512, Some(&table));
-        assert_eq!(gpt::read(&mut gapped).unwrap(), table);
-        let new = planned_table(
-            &plan(
-                &decision(&gapped, Some(&table), free(4, 18, 512)),
-                &mut entropy(true),
-            )
-            .unwrap(),
-        );
-        assert_eq!(new.partitions[0], stela);
-        assert_eq!(new.partitions[1].unique_guid, guid(NEW));
-        assert_eq!(new.partitions[2], low);
-        assert_eq!(new.slots, [0, 1, 3]);
-        // Deleting one frees only its own entry.
-        let table = Table {
-            partitions: vec![stela.clone(), high.clone(), low.clone()],
-            slots: vec![0, 2, 3],
-            ..table
-        };
-        let three = disk(512, Some(&table));
-        let new = planned_table(
-            &plan(
-                &Decision {
-                    deleted: &[1],
-                    ..decision(&three, Some(&table), free(4, 18, 512))
-                },
-                &mut entropy(true),
-            )
-            .unwrap(),
-        );
-        assert_eq!(new.partitions[0], stela);
-        assert_eq!(new.partitions[2], low);
-        assert_eq!(new.slots, [0, 1, 3]);
-    }
-
-    #[test]
-    fn deleted_partitions_leave_the_table_and_the_rest_stay() {
-        let table = layout(512);
-        let disk = disk(512, Some(&table));
-        // Over both deleted partitions.
-        let made = plan(
-            &Decision {
-                deleted: &[1, 0],
-                ..decision(&disk, Some(&table), free(1, 20, 512))
-            },
-            &mut entropy(true),
-        )
-        .unwrap();
-        let new = planned_table(&made);
-        assert_eq!(new.partitions.len(), 2);
-        assert_eq!(new.partitions[0].unique_guid, guid(NEW));
-        assert_eq!(new.partitions[1], table.partitions[2]);
-        // Over a partition that stays, nothing is planned.
-        assert_eq!(
-            plan(
-                &Decision {
-                    deleted: &[0],
-                    ..decision(&disk, Some(&table), free(1, 20, 512))
-                },
-                &mut entropy(true),
-            ),
-            Err(PlanError::Overlap)
-        );
-        assert_eq!(
-            plan(
-                &Decision {
-                    deleted: &[7],
-                    ..decision(&disk, Some(&table), free(4, 18, 512))
-                },
-                &mut entropy(true),
-            ),
-            Err(PlanError::NoPartition(7))
-        );
-    }
-
-    #[test]
-    fn an_erased_disk_holds_only_the_new_partition() {
-        let table = layout(512);
-        let with_table = disk(512, Some(&table));
-        let made = plan(
-            &Decision {
-                erased: true,
-                ..decision(&with_table, Some(&table), free(1, 60, 512))
-            },
-            &mut entropy(true),
-        )
-        .unwrap();
-        let new = planned_table(&made);
-        assert_eq!(new.disk_guid, guid(DISK));
-        assert_eq!(new.partitions.len(), 1);
-        assert_eq!(new.partitions[0].unique_guid, guid(NEW));
-        // A disk without a table gets one, with a GUID of its own.
-        let blank = disk(512, None);
-        let made = plan(
-            &Decision {
-                erased: true,
-                ..decision(&blank, None, free(1, 60, 512))
-            },
-            &mut entropy(false),
-        )
-        .unwrap();
-        let new = planned_table(&made);
-        assert_eq!(new.disk_guid, guid(DISK));
-        assert_eq!(new.partitions.len(), 1);
-        assert_eq!(made.table.len(), 5);
-    }
-
-    #[test]
-    fn a_reused_partition_writes_no_table() {
-        for block in [512, 4096] {
-            let table = layout(block);
-            let disk = disk(block, Some(&table));
-            let made = plan(&decision(&disk, Some(&table), Place::Reuse(2)), &mut || {
-                panic!("a reused partition draws no GUID")
-            })
-            .unwrap();
-            assert!(made.table.is_empty());
-            assert_eq!(made.partition.guid, table.partitions[2].unique_guid);
-            assert_eq!(made.partition.first_lba, 40 * MIB / block);
-            assert_eq!(
-                made.zero,
-                [
-                    Extent {
-                        lba: 40 * MIB / block,
-                        blocks: MIB / block
-                    },
-                    Extent {
-                        lba: 44 * MIB / block,
-                        blocks: 16 * MIB / block
-                    },
-                ]
-            );
-        }
-        let table = layout(512);
-        let disk = disk(512, Some(&table));
-        // With another partition deleted the table is written, and the
-        // reused partition keeps its GUID.
-        let made = plan(
-            &Decision {
-                deleted: &[0],
-                ..decision(&disk, Some(&table), Place::Reuse(2))
-            },
-            &mut || panic!("a reused partition draws no GUID"),
-        )
-        .unwrap();
-        assert_eq!(made.table.len(), 5);
-        assert_eq!(planned_table(&made).partitions, table.partitions[1..]);
-        // Only a Stela partition that stays is reused.
-        for (deleted, index) in [(&[][..], 0), (&[2][..], 2), (&[][..], 9)] {
-            assert_eq!(
-                plan(
-                    &Decision {
-                        deleted,
-                        ..decision(&disk, Some(&table), Place::Reuse(index))
-                    },
-                    &mut entropy(true),
-                ),
-                Err(PlanError::NotReusable)
-            );
-        }
-    }
-
-    #[test]
-    fn a_decision_that_cannot_be_carried_out_makes_no_plan() {
-        let table = layout(512);
-        let disk = disk(512, Some(&table));
-        let refused = |decision: Decision<'_>| plan(&decision, &mut entropy(true)).unwrap_err();
-        // Too small for a namespace and the machine state.
-        assert_eq!(
-            refused(decision(&disk, Some(&table), free(4, 16, 512))),
-            PlanError::TooSmall
-        );
-        // Past the blocks a table leaves usable.
-        assert_eq!(
-            refused(decision(&disk, Some(&table), free(4, 60, 512))),
-            PlanError::Overlap
-        );
-        assert_eq!(
-            refused(Decision {
-                erased: true,
-                ..decision(&disk, Some(&table), free(4, 60, 512))
-            }),
-            PlanError::Table("partition outside the usable range")
-        );
-        assert_eq!(
-            refused(Decision {
-                serial: "",
-                ..decision(&disk, Some(&table), free(4, 18, 512))
-            }),
-            PlanError::NoSerial
-        );
-        assert_eq!(
-            refused(Decision {
-                geometry: Disk {
-                    block_bytes: 520,
-                    blocks: 1 << 20
-                },
-                ..decision(&disk, Some(&table), free(4, 18, 512))
-            }),
-            PlanError::Blocks(520)
-        );
-    }
-
-    #[test]
-    fn applying_makes_the_partition_and_zeroes_only_its_ranges() {
-        for block in [512, 4096] {
-            let table = layout(block);
-            let mut disk = disk(block, Some(&table));
-            let made = plan(
-                &decision(&disk, Some(&table), free(4, 18, block)),
-                &mut entropy(true),
-            )
-            .unwrap();
-            let before = disk.bytes.clone();
-            made.apply(&mut disk).unwrap();
-            let found = gpt::read(&mut disk).unwrap();
-            assert_eq!(found, planned_table(&made));
-            for extent in &made.zero {
-                assert!(zeroed(&disk, *extent));
-            }
-            // Between the two ranges, and in every other partition, the
-            // disk is as it was.
-            let mib = MIB as usize;
-            assert_eq!(disk.bytes[5 * mib..6 * mib], before[5 * mib..6 * mib]);
-            assert_eq!(disk.bytes[mib..4 * mib], before[mib..4 * mib]);
-            assert_eq!(disk.bytes[22 * mib..63 * mib], before[22 * mib..63 * mib]);
-        }
-    }
-
-    #[test]
-    fn applying_a_reused_partition_leaves_the_table_as_it_is() {
-        let table = layout(512);
-        let mut disk = disk(512, Some(&table));
-        let made = plan(
-            &decision(&disk, Some(&table), Place::Reuse(2)),
-            &mut entropy(true),
-        )
-        .unwrap();
-        let before = disk.bytes.clone();
-        made.apply(&mut disk).unwrap();
-        let mib = MIB as usize;
-        assert_eq!(disk.bytes[..40 * mib], before[..40 * mib]);
-        assert_eq!(disk.bytes[60 * mib..], before[60 * mib..]);
-        assert_eq!(disk.bytes[41 * mib..44 * mib], before[41 * mib..44 * mib]);
-        assert!(disk.bytes[40 * mib..41 * mib].iter().all(|&byte| byte == 0));
-        assert!(disk.bytes[44 * mib..60 * mib].iter().all(|&byte| byte == 0));
-    }
-
-    #[test]
-    fn a_blank_or_foreign_disk_is_erased_into_one_table() {
-        let mut blank = disk(512, None);
-        // Another scheme's boot block.
-        blank.bytes[..512].fill(0x5a);
-        let made = plan(
-            &Decision {
-                erased: true,
-                ..decision(&blank, None, free(1, 60, 512))
-            },
-            &mut entropy(false),
-        )
-        .unwrap();
-        made.apply(&mut blank).unwrap();
-        assert_eq!(gpt::read(&mut blank).unwrap().partitions.len(), 1);
-    }
-
-    #[test]
-    fn another_disk_under_the_serial_is_not_written() {
-        let table = layout(512);
-        let chosen = disk(512, Some(&table));
-        let made = plan(
-            &decision(&chosen, Some(&table), free(4, 18, 512)),
-            &mut entropy(true),
-        )
-        .unwrap();
-        // Another size.
-        let mut other = RamDisk::new(SERIAL, 2 * BYTES / 512, 512);
-        let before = other.bytes.clone();
-        assert_eq!(
-            made.apply(&mut other),
-            Err(ApplyError {
-                step: Step::Identify,
-                lba: None,
-                cause: Cause::Geometry {
-                    found: Disk {
-                        block_bytes: 512,
-                        blocks: 2 * BYTES / 512
-                    }
-                },
-            })
-        );
-        assert_eq!(other.bytes, before);
-        // Other blocks, the same disk seen with 4096-byte ones.
-        let mut other = RamDisk::new(SERIAL, BYTES / 4096, 4096);
-        assert!(matches!(
-            made.apply(&mut other),
-            Err(ApplyError {
-                step: Step::Identify,
-                cause: Cause::Geometry { .. },
-                ..
-            })
-        ));
-        // The same size with another table.
-        let mut other = disk(
-            512,
-            Some(&Table {
-                disk_guid: guid(NEW),
-                ..table.clone()
-            }),
-        );
-        let before = other.bytes.clone();
-        let error = made.apply(&mut other).unwrap_err();
-        assert_eq!(error.cause, Cause::Changed);
-        assert_eq!(
-            error.to_string(),
-            "checking that it is the disk chosen at block 0: the disk's first blocks are not \
-             what was chosen"
-        );
-        assert_eq!(other.bytes, before);
-    }
-
-    /// A disk whose write to one block fails.
-    struct Failing {
-        disk: RamDisk,
-        at: u64,
-    }
-
-    impl BlockDevice for Failing {
-        fn identity(&self) -> &Identity {
-            &self.disk.identity
-        }
-        fn read(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
-            self.disk.read(lba, buffer)
-        }
-        fn write(&mut self, lba: u64, data: &[u8]) -> Result<(), BlockError> {
-            let blocks = data.len() as u64 / u64::from(self.disk.identity.block_size);
-            if (lba..lba + blocks).contains(&self.at) {
-                return Err(BlockError::Timeout);
-            }
-            self.disk.write(lba, data)
-        }
-    }
-
-    #[test]
-    fn a_failed_write_names_its_step_and_block_and_leaves_one_whole_table() {
-        let table = layout(512);
-        let chosen = disk(512, Some(&table));
-        let made = plan(
-            &decision(&chosen, Some(&table), free(4, 18, 512)),
-            &mut entropy(true),
-        )
-        .unwrap();
-        let new = planned_table(&made);
-        // Each of the table's writes failing in turn.
-        for (index, write) in made.table.iter().enumerate() {
-            let mut failing = Failing {
-                disk: disk(512, Some(&table)),
-                at: write.lba,
-            };
-            assert_eq!(
-                made.apply(&mut failing),
-                Err(ApplyError {
-                    step: Step::Table,
-                    lba: Some(write.lba),
-                    cause: Cause::Device(BlockError::Timeout),
-                })
-            );
-            // The earlier table until the primary's entries are written,
-            // the new one after.
-            let found = gpt::read(&mut failing.disk).unwrap();
-            assert_eq!(
-                found,
-                if index < 3 {
-                    table.clone()
-                } else {
-                    new.clone()
-                }
-            );
-            // No block was zeroed.
-            assert!(!zeroed(&failing.disk, made.zero[0]));
-        }
-        // A write of the zeroes failing, in the tail's third MiB.
-        let at = 8 * MIB / 512 + 5;
-        let mut failing = Failing {
-            disk: disk(512, Some(&table)),
-            at,
-        };
-        let error = made.apply(&mut failing).unwrap_err();
-        assert_eq!(
-            error,
-            ApplyError {
-                step: Step::Zero,
-                lba: Some(8 * MIB / 512),
-                cause: Cause::Device(BlockError::Timeout),
-            }
-        );
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "zeroing the partition's first MiB and machine state at block {}: {}",
-                8 * MIB / 512,
-                BlockError::Timeout
-            )
-        );
-        assert_eq!(gpt::read(&mut failing.disk).unwrap(), new);
-    }
-
-    #[test]
-    fn a_plan_survives_its_bytes() {
-        let table = layout(4096);
-        let disk = disk(4096, Some(&table));
-        for place in [free(4, 18, 4096), Place::Reuse(2)] {
-            let made = plan(&decision(&disk, Some(&table), place), &mut entropy(true)).unwrap();
-            let bytes = made.encode();
-            assert_eq!(Plan::decode(&bytes), Some(made));
-            // Cut short, grown or under another mark it is no plan.
-            assert_eq!(Plan::decode(&bytes[..bytes.len() - 1]), None);
-            assert_eq!(Plan::decode(&[&bytes[..], &[0]].concat()), None);
-            assert_eq!(Plan::decode(&bytes[1..]), None);
-        }
-        assert_eq!(Plan::decode(&[]), None);
-    }
-
-    #[test]
-    fn the_disk_is_found_by_its_serial_or_by_what_the_picker_read() {
-        let table = layout(512);
-        let chosen = disk(512, Some(&table));
-        let made = plan(
-            &decision(&chosen, Some(&table), free(4, 18, 512)),
-            &mut entropy(true),
-        )
-        .unwrap();
-        let renamed = |serial: &str, table: &Table| -> Box<dyn BlockDevice> {
-            let mut disk = disk(512, Some(table));
-            disk.identity.serial = serial.into();
-            Box::new(disk)
-        };
-        let other = Table {
-            disk_guid: guid(NEW),
-            ..table.clone()
-        };
-        let mut devices = vec![renamed("FAKE-OTHER-0002", &other), renamed(SERIAL, &table)];
-        assert_eq!(made.locate(&mut devices), Ok(1));
-        // Two disks under the serial.
-        devices.push(renamed(SERIAL, &other));
-        assert_eq!(made.locate(&mut devices), Err(LocateError::Ambiguous(2)));
-        // No disk under the serial: the one with the same size and first
-        // blocks.
-        let mut devices = vec![
-            renamed("FAKE-OTHER-0002", &other),
-            renamed("FAKE-BRIDGE-0003", &table),
-            Box::new(RamDisk::new("FAKE-OTHER-0004", 16, 512)),
-        ];
-        assert_eq!(made.locate(&mut devices), Ok(1));
-        devices.push(renamed("FAKE-BRIDGE-0005", &table));
-        assert_eq!(made.locate(&mut devices), Err(LocateError::Ambiguous(2)));
-        devices.truncate(1);
-        assert_eq!(made.locate(&mut devices), Err(LocateError::NoDisk));
-        assert_eq!(made.locate(&mut []), Err(LocateError::NoDisk));
-    }
-}
+pub(super) mod tests;
