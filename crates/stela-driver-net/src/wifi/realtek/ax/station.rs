@@ -336,8 +336,24 @@ struct Eapol {
     acked: u32,
 }
 
+/// The data frames past the handshake's: the MSDUs the station took
+/// (`delivered`), the protected frames dropped because the hardware left
+/// them encrypted (`sealed`) or because no key holds their key ID
+/// (`keyless`), and those the station's replay and port checks refused
+/// (`refused`); then the frames of the host's own the chip took (`sent`).
+/// EAPOL counts in [`Eapol`] instead.
+#[derive(Clone, Copy, Debug, Default)]
+struct Traffic {
+    delivered: u32,
+    sealed: u32,
+    keyless: u32,
+    refused: u32,
+    sent: u32,
+}
+
 /// The progress line's counts (spec S14.6), each `None` until reached.
 /// `auth` counts the SAE frames when the last join was by SAE (`sae`).
+/// `data` counts once the first association is configured.
 #[derive(Clone, Debug, Default)]
 struct Progress {
     scans: u32,
@@ -347,6 +363,7 @@ struct Progress {
     aid: Option<u16>,
     eapol: Option<Eapol>,
     keys: Option<u32>,
+    data: Option<Traffic>,
     beacon_lost: Option<u32>,
     last: Option<&'static str>,
 }
@@ -794,6 +811,8 @@ impl<C: Chip> Rtl8852c<C> {
                     self.eapol_reports.pop_front();
                 }
                 self.eapol_reports.push_back(token);
+            } else {
+                self.count_data(|data| &mut data.sent);
             }
         }
         Ok(())
@@ -999,6 +1018,23 @@ impl<C: Chip> Rtl8852c<C> {
         }
     }
 
+    /// One more of the data counts `field` names, once they are reached.
+    fn count_data(&mut self, field: impl FnOnce(&mut Traffic) -> &mut u32) {
+        if let Some(data) = &mut self.progress.data {
+            bump(field(data));
+        }
+    }
+
+    /// A protected data frame no key opened, dropped: one the hardware
+    /// left encrypted, or one it decrypted under a key ID no key holds.
+    fn count_keyless(&mut self, frame: &Mpdu) {
+        if frame.security.decrypted {
+            self.count_data(|data| &mut data.keyless);
+        } else {
+            self.count_data(|data| &mut data.sealed);
+        }
+    }
+
     /// The firmware's beacon loss (spec S15, ruling R2): while associated,
     /// not leaving and not scanning, the keeper hears the connection lost,
     /// which it reconnects from after `RECONNECT_US`, the loss is counted,
@@ -1130,6 +1166,7 @@ impl<C: Chip> Rtl8852c<C> {
         }
         if header.fragmented() {
             if header.protected() && frame.security.key.is_none() {
+                self.count_keyless(&frame);
                 return Ok(());
             }
             self.reassemble(&frame, now);
@@ -1357,13 +1394,16 @@ impl<C: Chip> Rtl8852c<C> {
     /// checks refuse. EAPOL goes to the keeper. A protected frame without
     /// the key that opened it ([`Self::frame`]) is dropped first, as
     /// `ieee80211_rx_h_decrypt` drops it once the reorder buffer released
-    /// it.
+    /// it. The progress line counts each outcome but EAPOL's.
     fn deliver(&mut self, frame: Mpdu) {
         if frame.header().protected() && frame.security.key.is_none() {
+            self.count_keyless(&frame);
             return;
         }
+        let refused = |radio: &mut Self| radio.count_data(|data| &mut data.refused);
         let ingress = if frame.header().amsdu {
             let Some(context) = self.context.clone() else {
+                refused(self);
                 return;
             };
             let key = frame.security.key;
@@ -1380,27 +1420,38 @@ impl<C: Chip> Rtl8852c<C> {
                 .map(|key| &mut key.slot)
                 .find(|slot| key.is_some() && slot.installed() == key);
             let Ok(received) = self.station.receive_ordered_group(&group, slot) else {
+                refused(self);
                 return;
             };
             let keys: Vec<&KeySlot> = self.keys.iter().map(|key| &key.slot).collect();
             match self.station.receive_group_refs(&received, &keys) {
                 Ok(ingress) => ingress,
-                Err(_) => return,
+                Err(_) => {
+                    refused(self);
+                    return;
+                }
             }
         } else {
             let Some(epoch) = self.station.association_epoch() else {
+                refused(self);
                 return;
             };
             let mut keys: Vec<&mut KeySlot> =
                 self.keys.iter_mut().map(|key| &mut key.slot).collect();
             match self.station.receive_msdu_refs(epoch, &frame, &mut keys) {
                 Ok(ingress) => alloc::vec![ingress],
-                Err(_) => return,
+                Err(_) => {
+                    refused(self);
+                    return;
+                }
             }
         };
         for ingress in ingress {
             match ingress {
-                Ingress::Data(ethernet) => self.received.push_back(ethernet),
+                Ingress::Data(ethernet) => {
+                    self.count_data(|data| &mut data.delivered);
+                    self.received.push_back(ethernet);
+                }
                 Ingress::ControlPort { ethernet, .. } => {
                     bump(&mut self.progress.eapol.get_or_insert_default().received);
                     self.events.push_back(keeper::Event::Eapol(ethernet));
@@ -1749,6 +1800,12 @@ impl<C: Chip> Rtl8852c<C> {
         } else {
             ", port closed"
         });
+        if let Some(d) = p.data {
+            line.push_str(&format!(
+                ", rx data {} sealed {} nokey {} refused {}, tx data {}",
+                d.delivered, d.sealed, d.keyless, d.refused, d.sent
+            ));
+        }
         if let Some(lost) = p.beacon_lost {
             line.push_str(&format!(", beacon lost {lost}"));
         }
@@ -1943,6 +2000,7 @@ impl<C: Chip> Rtl8852c<C> {
                 .map_err(|_| Error::Refused("Block Ack limits"))?;
         }
         self.progress.eapol.get_or_insert_default();
+        self.progress.data.get_or_insert_default();
         Ok(())
     }
 

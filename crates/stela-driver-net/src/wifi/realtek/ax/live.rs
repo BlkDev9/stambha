@@ -196,10 +196,6 @@ pub const CONNECTED: AxError =
 /// past it they are dropped and counted ([`Live::held_dropped`]).
 const MAX_HELD: usize = MAX_PENDING;
 
-/// What the station's key calls got in M3a (spec S14.5), which the host
-/// check's M3a verdict still reads; nothing returns it since M3 Task 15.
-pub const KEYS_BEFORE_M3B: &str = "keys before M3b";
-
 /// What [`Chip::transmit_data`] gets for a frame naming a security CAM
 /// entry that holds no key [`Live::add_key`] installed.
 pub const KEY_NOT_IN_CAM: &str = "a key not in the security CAM";

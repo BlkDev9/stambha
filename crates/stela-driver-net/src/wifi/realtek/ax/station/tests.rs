@@ -1121,7 +1121,8 @@ fn progress_reports_each_stage() {
         progress(&mut wifi),
         alloc::format!(
             "scans 1 (1 networks, target found ch 1 -40 dBm), auth 1/1 status 0, \
-             assoc 1/1 status 0 aid 1, eapol rx 0 tx 0 acked 0, keys -, port closed{chip}"
+             assoc 1/1 status 0 aid 1, eapol rx 0 tx 0 acked 0, keys -, port closed, \
+             rx data 0 sealed 0 nokey 0 refused 0, tx data 0{chip}"
         )
     );
     // The handshake, its two keys and the port (M3b's pass).
@@ -1131,7 +1132,8 @@ fn progress_reports_each_stage() {
         progress(&mut wifi),
         alloc::format!(
             "scans 1 (1 networks, target found ch 1 -40 dBm), auth 1/1 status 0, \
-             assoc 1/1 status 0 aid 1, eapol rx 2 tx 2 acked 2, keys 2, port open{chip}"
+             assoc 1/1 status 0 aid 1, eapol rx 2 tx 2 acked 2, keys 2, port open, \
+             rx data 0 sealed 0 nokey 0 refused 0, tx data 0{chip}"
         )
     );
 }
@@ -1336,7 +1338,12 @@ fn beacon_loss_while_associated_reconnects() {
         )))
     );
     let line = progress(&mut wifi);
-    assert!(line.contains(", port closed, beacon lost 1; "), "{line}");
+    assert!(
+        line.contains(
+            ", port closed, rx data 0 sealed 0 nokey 0 refused 0, tx data 0, beacon lost 1; "
+        ),
+        "{line}"
+    );
     assert!(run(&mut wifi, &model, |_, air| scans(air) > before));
     assert!(CLOCK.now_us() - left >= 90_000);
     // The keeper joins again; the count stays.
@@ -1593,6 +1600,52 @@ fn a_frame_failing_its_icv_or_fcs_leaves_no_sequence_for_its_retry() {
     drop(air);
     wifi.carrier();
     assert_eq!(delivered(&mut wifi), [0x46]);
+}
+
+#[test]
+fn the_progress_line_counts_data_both_ways() {
+    // M3 Task 20: with keys 2 and the port open but no lease, the line
+    // tells data that never came from data the hardware left sealed, data
+    // under a key ID with no key and data the station's checks refused, and
+    // shows whether the station's own data left. EAPOL counts apart.
+    let (mut wifi, model) = wifi();
+    assert!(!progress(&mut wifi).contains("rx data"));
+    drop((wifi, model));
+    let (mut wifi, model) = connected();
+    assert!(
+        progress(&mut wifi)
+            .contains(", keys 2, port open, rx data 0 sealed 0 nokey 0 refused 0, tx data 0; chip"),
+        "{}",
+        progress(&mut wifi)
+    );
+    let body = [0x45; 46];
+    let keyless = |mut frame: Vec<u8>| {
+        frame[29] = 0x20 | 2 << 6;
+        frame
+    };
+    let mut air = model.0.borrow_mut();
+    // Delivered; left sealed; under key ID 2, which has no key.
+    air.hear_as(protected(LOCAL, 10, 0, 1, &body), true, false);
+    air.hear_as(protected(LOCAL, 11, 0, 2, &body), false, false);
+    air.hear_as(keyless(protected(LOCAL, 12, 0, 3, &body)), true, false);
+    // Unprotected once the port is controlled, then a replay of PN 1: the
+    // station refuses both.
+    air.hear(data(LOCAL, 13, [8, 0], &body));
+    air.hear_as(protected(LOCAL, 14, 0, 1, &body), true, false);
+    // A fragment left sealed, and one under key ID 2; one more left sealed.
+    air.hear_as(fragment(15, 0, true, 4, &body), false, false);
+    air.hear_as(keyless(fragment(16, 0, true, 5, &body)), true, false);
+    air.hear_as(protected(LOCAL, 17, 0, 6, &body), false, false);
+    drop(air);
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x45]);
+    wifi.transmit(&ip(1)).unwrap();
+    wifi.transmit(&ip(2)).unwrap();
+    let line = progress(&mut wifi);
+    assert!(
+        line.contains(", port open, rx data 1 sealed 3 nokey 2 refused 2, tx data 2; "),
+        "{line}"
+    );
 }
 
 #[test]
@@ -1972,6 +2025,11 @@ fn an_a_msdu_gives_up_each_of_its_frames() {
     model.0.borrow_mut().hear_as(frame, true, false);
     wifi.carrier();
     assert_eq!(delivered(&mut wifi), [0x31, 0x32]);
+    let line = progress(&mut wifi);
+    assert!(
+        line.contains(", rx data 2 sealed 0 nokey 0 refused 0, "),
+        "{line}"
+    );
 }
 
 /// An SA Query request at packet number `number` as the hardware leaves
@@ -2500,7 +2558,8 @@ fn an_sae_network_authenticates_associates_and_keys() {
     assert!(
         line.starts_with(
             "scans 1 (1 networks, target found ch 1 -40 dBm), sae 2/2, assoc 1/1 status 0 \
-             aid 1, eapol rx 2 tx 2 acked 2, keys 2, port open; "
+             aid 1, eapol rx 2 tx 2 acked 2, keys 2, port open, rx data 0 sealed 0 nokey 0 \
+             refused 0, tx data 0; "
         ),
         "{line}"
     );
