@@ -13,9 +13,9 @@
 //! `rtw89_pci_alloc_tx_wd_ring` (`pci.c:3539`) allocates them at probe
 //! ([`TxPools`]). The result, [`Live`], owns the register window, the rings,
 //! the pools, the H2C sequence, the command session's receiver and ledger,
-//! the bring-up's report, the inputs of every channel switch, and the TX
-//! power tables with their regulatory index. [`Live::tune`] switches
-//! channel as `__rtw89_set_channel` does, TX power included;
+//! the bring-up's report, the inputs of every channel switch, the TX power
+//! tables with their regulatory index, and the security CAM. [`Live::tune`]
+//! switches channel as `__rtw89_set_channel` does, TX power included;
 //! [`Live::stop`] is `rtw89_core_stop` (`core.c:6727-6767`): the coex half,
 //! `rtw89_pci_ops_deinit` (`pci.c:3053`), then `rtw89_mac_pwr_off`
 //! (`mac.c:1603`).
@@ -96,13 +96,21 @@
 //! a qsel without a channel, a page not in flight) is counted, never
 //! reported. The live chip is the station's [`Chip`] (M3 spec S14.1).
 //!
-//! This module grants no key yet (M3b), and no TX status beyond RPQ's: a
-//! report says the MAC is done with a frame, acknowledged or not, nothing
-//! more. It runs no IQK, DPK, TSSI, watchdog, interrupts, probe request or
-//! idle power save, and processes no beacon filter report (M3 Task 18). It
-//! has no `Drop`: a live chip that is dropped keeps running, its rings and
-//! pools quarantined, as rtw88's `Hardware` keeps running for the boot.
-use super::assoc::{self, AssocInputs, Features, RaPeer};
+//! The associated station's keys are operations too (M3 spec S12, each step
+//! from [`keys`]): [`Live::add_key`] installs one in the security CAM and
+//! points the address CAM at it, waiting for the firmware's receipt and
+//! acknowledgement, and [`Live::remove_key`] deletes one; [`Live::leave`]
+//! deletes what is left first. A refused key leaves the chip on.
+//!
+//! This module sends no frame under a key yet (M3 Task 15:
+//! [`Chip::transmit_data`] refuses a keyed frame), and grants no TX status
+//! beyond RPQ's: a report says the MAC is done with a frame, acknowledged or
+//! not, nothing more. It runs no IQK, DPK, TSSI, watchdog, interrupts, probe
+//! request or idle power save, and processes no beacon filter report (M3
+//! Task 18). It has no `Drop`: a live chip that is dropped keeps running,
+//! its rings and pools quarantined, as rtw88's `Hardware` keeps running for
+//! the boot.
+use super::assoc::{self, AddrCam, AssocInputs, Features, RaPeer};
 use super::bb::BbGain;
 use super::bringup::{self, BringUpError, Calibrated, FirmwareFile, Host, Running};
 use super::c2h::{C2h, SCAN_END};
@@ -114,6 +122,7 @@ use super::dm::Dig;
 use super::efuse::RxGain;
 use super::h2c::{H2c, ScanChannel};
 use super::io::{AxError, AxIo};
+use super::keys::{self, KeyCam};
 use super::pci::{Rings, TX_DONE, TxChannel, TxPools, WD_HEAD_BYTES, releases};
 use super::receive::{Event, MAX_PENDING, Mode, Received, Tag};
 use super::regd::Regds;
@@ -159,7 +168,8 @@ pub const CONNECTED: AxError =
 /// ([`Live::held_dropped`]).
 const MAX_HELD: usize = MAX_PENDING;
 
-/// What every key call and every keyed frame gets in M3a (spec S14.5).
+/// What every keyed frame gets until encrypted data is sent (M3 Task 15),
+/// and what the station's key calls got in M3a (spec S14.5).
 pub const KEYS_BEFORE_M3B: &str = "keys before M3b";
 
 /// The data and management channels, in the order the reclaim reads them.
@@ -224,6 +234,9 @@ pub struct Live<I: AxIo> {
     associated: Option<AssocInputs>,
     /// DIG's pause.
     dig: Dig,
+    /// The security CAM and the station's address CAM key fields, empty
+    /// unless associated with keys installed.
+    keys: KeyCam,
     tx: TxCounts,
     /// A failure powered the chip off.
     off: bool,
@@ -456,6 +469,7 @@ pub unsafe fn start<I: AxIo>(
         authenticated: false,
         associated: None,
         dig: Dig::default(),
+        keys: KeyCam::default(),
         tx: TxCounts::default(),
         off: false,
     })
@@ -1027,16 +1041,22 @@ impl<I: AxIo> Live<I> {
         Ok(())
     }
 
-    /// Leave (M3 spec S11): from an association, [`assoc::leave`] for it;
-    /// from a BSSID set without one, [`assoc::clear_bssid`], after
-    /// [`assoc::disconnect`] when the AP's station was
+    /// Leave (M3 spec S11): from an association, first every key still
+    /// installed deleted as [`Live::remove_key`] deletes it, the group keys
+    /// first, as mac80211 deletes the AP station's keys before its ASSOC to
+    /// AUTH (`sta_info.c:1577-1578`, `ieee80211_free_sta_keys`), then
+    /// [`assoc::leave`] for it, whose address CAMs carry the key fields the
+    /// deletes left; from a BSSID set without one, [`assoc::clear_bssid`],
+    /// after [`assoc::disconnect`] when the AP's station was
     /// [`Live::authenticated`] (`ieee80211_destroy_assoc_data` destroys it
     /// from AUTH); with neither, nothing, without I/O. Either way the BSSID,
-    /// the authentication and the association are gone afterwards; DIG is
-    /// left as it is. Refused before any I/O,
-    /// changing nothing, on a chip off ([`POWERED_OFF`]) and while a scan
-    /// has not been ended ([`SCAN_NOT_ENDED`]). A failure powers the chip
-    /// off.
+    /// the authentication, the association and the keys are gone
+    /// afterwards, and the address CAM's key fields are a fresh vif's, as
+    /// Linux's idle power-off and its vif init leave them (`ps.c:233-278`,
+    /// `rtw89_cam_init_addr_cam`, `cam.c:646-684`) before the station's next
+    /// scan or join; DIG is left as it is. Refused before any I/O, changing
+    /// nothing, on a chip off ([`POWERED_OFF`]) and while a scan has not
+    /// been ended ([`SCAN_NOT_ENDED`]). A failure powers the chip off.
     ///
     /// # Safety
     /// [`start`]'s contract, still holding for this chip.
@@ -1048,6 +1068,7 @@ impl<I: AxIo> Live<I> {
         let associated = self.associated.take();
         let bssid = self.bssid.take();
         let authenticated = core::mem::take(&mut self.authenticated);
+        let mut cam = core::mem::take(&mut self.keys);
         let features = Features::of(self.running.firmware);
         let mac = self.running.mac;
         let band = self.chan.band;
@@ -1055,21 +1076,114 @@ impl<I: AxIo> Live<I> {
         let done = self.session(|io, session| {
             let sink = &mut |e: Event<'_>| held.keep(e);
             match (&associated, bssid) {
-                // SAFETY: the caller's contract is `start`'s, which `leave`'s
-                // is, for the live chip's own window and rings.
-                (Some(inputs), _) => unsafe { assoc::leave(io, session, inputs, features, sink) },
+                (Some(inputs), _) => {
+                    let addr = AddrCam::connected(inputs.mac, inputs.bssid, inputs.aid);
+                    for idx in cam.deletion_order() {
+                        // SAFETY: the caller's contract is `start`'s, which
+                        // `delete`'s is, for the live chip's own window and
+                        // rings.
+                        unsafe { keys::delete(io, session, &mut cam, &addr, idx, sink) }?;
+                    }
+                    let left = cam.keys();
+                    // SAFETY: as above, `leave`'s.
+                    unsafe { assoc::leave(io, session, inputs, features, left, sink) }
+                }
                 (None, Some(bssid)) if authenticated => {
+                    let left = cam.keys();
                     // SAFETY: as above, `disconnect`'s and `clear_bssid`'s.
-                    unsafe { assoc::disconnect(io, session, mac, bssid, band, sink) }?;
+                    unsafe { assoc::disconnect(io, session, mac, bssid, band, left, sink) }?;
                     // SAFETY: as above.
-                    unsafe { assoc::clear_bssid(io, session, mac, sink) }
+                    unsafe { assoc::clear_bssid(io, session, mac, left, sink) }
                 }
                 // SAFETY: as above, `clear_bssid`'s.
-                (None, _) => unsafe { assoc::clear_bssid(io, session, mac, sink) },
+                (None, _) => unsafe { assoc::clear_bssid(io, session, mac, cam.keys(), sink) },
             }
         });
         self.held = held;
         self.done(done)
+    }
+
+    /// Whether security CAM entry `cam` holds a key [`Live::add_key`]
+    /// installed and nothing has deleted since.
+    pub fn key_installed(&self, cam: u8) -> bool {
+        self.keys.installed(cam)
+    }
+
+    /// Install `key` for the associated station (M3 spec S12.5,
+    /// [`keys::install`]): SEC_UPD into the first free security CAM entry
+    /// and its REC_ACK, then the dctl and the address CAM, connected with the
+    /// association's AID, and that CAM's own DONE_ACK with return 0, each
+    /// wait `ACK_WAIT_US`; frames drained meanwhile are held for the next
+    /// [`Live::drain`]. Returns the entry, which a frame's TX descriptor
+    /// names. Refused before any I/O, changing nothing: on a chip off
+    /// ([`POWERED_OFF`]), while a scan has not been ended
+    /// ([`SCAN_NOT_ENDED`]), with `Mac` while not associated (mac80211
+    /// refuses a station's key before ASSOC, `ieee80211_add_key`), and as
+    /// [`keys::check`] refuses. Any later failure, a firmware that never
+    /// acknowledged the key included, is returned with nothing installed:
+    /// the entry and the slot are free again, and the chip stays on, for
+    /// the station to leave and join again.
+    ///
+    /// # Safety
+    /// [`start`]'s contract, still holding for this chip.
+    pub unsafe fn add_key(&mut self, key: &HardwareKey<'_>) -> Result<u8, AxError> {
+        self.idle()?;
+        let Some(inputs) = &self.associated else {
+            return Err(AxError::Mac("a key without an association"));
+        };
+        let addr = AddrCam::connected(inputs.mac, inputs.bssid, inputs.aid);
+        keys::check(&self.keys, key.pairwise, key.index)?;
+        let mut cam = self.keys;
+        let mut held = core::mem::take(&mut self.held);
+        let done = self.session(|io, session| {
+            // SAFETY: the caller's contract is `start`'s, which `install`'s
+            // is, for the live chip's own window and rings.
+            unsafe {
+                keys::install(
+                    io,
+                    session,
+                    &mut cam,
+                    &addr,
+                    key.pairwise,
+                    key.index,
+                    key.material,
+                    &mut |e| held.keep(e),
+                )
+            }
+        });
+        self.held = held;
+        self.keys = cam;
+        done.and_then(|done| done)
+    }
+
+    /// Delete the key in security CAM entry `cam` (M3 spec S12.6,
+    /// [`keys::delete`]): its slot detached, the dctl and the address CAM,
+    /// neither waited on; the entry is free afterwards whatever they
+    /// returned, as Linux frees it, and their first failure is returned
+    /// with the chip left on. Refused before any I/O, changing nothing, on
+    /// a chip off ([`POWERED_OFF`]), while a scan has not been ended
+    /// ([`SCAN_NOT_ENDED`]), and for an entry holding no key
+    /// ([`keys::NO_KEY`]).
+    ///
+    /// # Safety
+    /// [`start`]'s contract, still holding for this chip.
+    pub unsafe fn remove_key(&mut self, cam: u8) -> Result<(), AxError> {
+        self.idle()?;
+        // A key is installed only while associated, and leaving deletes it.
+        let (true, Some(inputs)) = (self.keys.installed(cam), &self.associated) else {
+            return Err(keys::NO_KEY);
+        };
+        let addr = AddrCam::connected(inputs.mac, inputs.bssid, inputs.aid);
+        let mut state = self.keys;
+        let mut held = core::mem::take(&mut self.held);
+        let done = self.session(|io, session| {
+            // SAFETY: the caller's contract is `start`'s, which `delete`'s
+            // is, for the live chip's own window and rings.
+            unsafe { keys::delete(io, session, &mut state, &addr, cam, &mut |e| held.keep(e)) }
+        });
+        self.held = held;
+        self.keys = state;
+        done.and_then(|done| done)
     }
 
     /// The channel context released after the station left (mac80211's
@@ -1309,8 +1423,8 @@ impl<I: AxIo> Live<I> {
     }
 
     /// `rtw89_core_stop` after a failure ([`bringup::shut_down`]): every
-    /// later call is refused with [`POWERED_OFF`], and a scan, a BSSID and
-    /// an association are gone with the firmware.
+    /// later call is refused with [`POWERED_OFF`], and a scan, a BSSID, an
+    /// association and the keys are gone with the firmware.
     fn power_off(&mut self) {
         bringup::shut_down(&mut self.io, &self.rings, self.host);
         self.off = true;
@@ -1318,6 +1432,7 @@ impl<I: AxIo> Live<I> {
         self.bssid = None;
         self.authenticated = false;
         self.associated = None;
+        self.keys = KeyCam::default();
     }
 
     /// Run `f` on the command session, resumed from where the last one was
@@ -1492,20 +1607,16 @@ impl<I: AxIo> Chip for Live<I> {
         Ok(())
     }
 
-    /// Refused until M3b ([`KEYS_BEFORE_M3B`]).
-    fn add_key(&mut self, _key: &HardwareKey<'_>) -> Result<u8, String> {
-        if self.off {
-            return Err(POWERED_OFF.to_string());
-        }
-        Err(KEYS_BEFORE_M3B.into())
+    /// [`Live::add_key`].
+    fn add_key(&mut self, key: &HardwareKey<'_>) -> Result<u8, String> {
+        // SAFETY: `start`'s contract holds for the live chip's every use.
+        unsafe { Live::add_key(self, key) }.map_err(|e| e.to_string())
     }
 
-    /// Refused until M3b ([`KEYS_BEFORE_M3B`]).
-    fn remove_key(&mut self, _cam: u8) -> Result<(), String> {
-        if self.off {
-            return Err(POWERED_OFF.to_string());
-        }
-        Err(KEYS_BEFORE_M3B.into())
+    /// [`Live::remove_key`].
+    fn remove_key(&mut self, cam: u8) -> Result<(), String> {
+        // SAFETY: `start`'s contract holds for the live chip's every use.
+        unsafe { Live::remove_key(self, cam) }.map_err(|e| e.to_string())
     }
 
     /// Accepted without the BA CAM until M3b, with no access.
@@ -1570,6 +1681,10 @@ impl<I: AxIo> Live<I> {
 
     pub(crate) fn receiver(&self) -> &super::receive::Receiver {
         &self.parked.as_ref().unwrap().rx
+    }
+
+    pub(crate) fn cam_keys(&self) -> super::assoc::CamKeys {
+        self.keys.keys()
     }
 }
 

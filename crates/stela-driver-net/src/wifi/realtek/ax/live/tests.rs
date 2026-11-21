@@ -29,6 +29,7 @@ use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use std::sync::Mutex;
 
 mod chip;
+mod keys;
 
 type Started = Result<Live<RegisterModel>, StartError<RegisterModel>>;
 

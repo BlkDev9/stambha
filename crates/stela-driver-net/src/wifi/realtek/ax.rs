@@ -75,6 +75,7 @@ pub mod elements;
 pub mod fwdl;
 pub mod h2c;
 pub mod io;
+pub mod keys;
 pub mod live;
 pub mod pci;
 pub mod phy;

@@ -900,18 +900,42 @@ fn skipped_and_stale_reports_are_counted_not_reported() {
 }
 
 #[test]
-fn keys_and_block_ack_wait_for_m3b() {
+fn the_chip_installs_and_removes_keys() {
     let (mut live, _m, _air) = on_air(&|_| {});
-    let before = live.io().trace.len();
-    let material = [0x11; 16];
-    let key = HardwareKey {
-        pairwise: true,
-        index: 0,
+    // An obvious test key.
+    let material: [u8; 16] = core::array::from_fn(|i| i as u8);
+    let key = |pairwise: bool, index: u8| HardwareKey {
+        pairwise,
+        index,
         material: &material,
     };
+    let unassociated = Chip::add_key(&mut live, &key(true, 0));
+    assert_eq!(
+        unassociated,
+        Err(String::from("a key without an association"))
+    );
+    let ch1 = channel(HwBand::G2, 1);
+    Chip::set_bssid(&mut live, Mac(AP)).unwrap();
+    Chip::associate(&mut live, &joined(ch1, 0xFFF, None)).unwrap();
+    // The security CAM entries, the first free each time (spec S12.1).
+    assert_eq!(Chip::add_key(&mut live, &key(true, 0)), Ok(0));
+    assert_eq!(Chip::add_key(&mut live, &key(false, 1)), Ok(1));
+    assert_eq!(Chip::remove_key(&mut live, 0), Ok(()));
+    assert_eq!(
+        Chip::remove_key(&mut live, 0),
+        Err(String::from("no key in that security CAM entry"))
+    );
+    assert_eq!(Chip::add_key(&mut live, &key(true, 0)), Ok(0));
+    // The disassociation deletes what is left first.
+    Chip::disassociate(&mut live).unwrap();
+    assert!(!live.key_installed(0) && !live.key_installed(1));
+}
+
+#[test]
+fn keyed_data_and_block_ack_wait_for_later_tasks() {
+    let (mut live, _m, _air) = on_air(&|_| {});
+    let before = live.io().trace.len();
     let m3b = Err(String::from("keys before M3b"));
-    assert_eq!(Chip::add_key(&mut live, &key), m3b.clone().map(|()| 0));
-    assert_eq!(Chip::remove_key(&mut live, 0), m3b.clone());
     let frame = data_frame(1, 1);
     let keyed = Data {
         key: Some((0, 0, 1)),
@@ -957,6 +981,14 @@ fn a_powered_off_chip_refuses_every_call() {
         Err(dead.clone())
     );
     assert_eq!(Chip::disassociate(&mut live), Err(dead.clone()));
+    let material = [0; 16];
+    let key = HardwareKey {
+        pairwise: true,
+        index: 0,
+        material: &material,
+    };
+    assert_eq!(Chip::add_key(&mut live, &key), Err(dead.clone()));
+    assert_eq!(Chip::remove_key(&mut live, 0), Err(dead.clone()));
     assert_eq!(Chip::start_rx_block_ack(&mut live, 0, 0), Err(dead.clone()));
     assert_eq!(Chip::stop_rx_block_ack(&mut live, 0), Err(dead));
     assert_eq!(live.io().trace.len(), off);

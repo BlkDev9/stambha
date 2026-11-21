@@ -19,7 +19,9 @@
 //! `rtw89_fw_h2c_assoc_cmac_tbl` (`fw.c:3889-3976`), `rtw89_fw_h2c_join_info`
 //! connected or not, `rtw89_fw_h2c_ra` (`fw.c:5560-5649`, AX format),
 //! `rtw89_fw_h2c_set_bcn_fltr_cfg` (`fw.c:5397-5470`) and
-//! `rtw89_fw_h2c_set_edca` (`fw.c:5241-5276`).
+//! `rtw89_fw_h2c_set_edca` (`fw.c:5241-5276`). For the keys (M3 spec S12):
+//! `rtw89_cam_send_sec_key_cmd`'s SEC_UPD (`cam.c:11-99`) and
+//! `rtw89_fw_h2c_dctl_sec_cam_v1` (`fw.c:2346-2382`).
 //!
 //! Each of those is fixed to the one station interface of milestone 2c's
 //! spec: wifi role STATION, self role CLIENT, MAC 0, PHY 0, address CAM 0
@@ -29,7 +31,7 @@
 //! (`mac80211.c:500-505`) and no address CAM of its own. It only builds
 //! bytes: it submits nothing, waits for no acknowledgement and grants no
 //! register access.
-use super::assoc::{AddrCam, RaInfo};
+use super::assoc::{AddrCam, CamKeys, RaInfo};
 use super::chan::HwBand;
 use super::elements::RfPath;
 use super::fwdl::{RX_TYPE_H2C, descriptor};
@@ -38,8 +40,8 @@ use alloc::vec::Vec;
 
 /// `H2C_HDR_*` (`fw.h:4673-4683`).
 const H2C_HEADER_LEN: usize = 8;
-const H2C_HDR_REC_ACK: u32 = 1 << 14;
-const H2C_HDR_DONE_ACK: u32 = 1 << 15;
+pub(super) const H2C_HDR_REC_ACK: u32 = 1 << 14;
+pub(super) const H2C_HDR_DONE_ACK: u32 = 1 << 15;
 const H2C_HDR_TOTAL_LEN: u32 = 0x3FFF;
 pub(super) const H2C_CAT_MAC: u8 = 1;
 pub(super) const H2C_CL_MAC_FW_OFLD: u8 = 9;
@@ -51,6 +53,21 @@ pub(super) const H2C_FUNC_LOG_CFG: u8 = 0;
 /// `H2C_FUNC_MAC_CCTLINFO_UD_V1` (`fw.h:4744-4748`, `rtw8852c.c:3260`).
 pub(super) const H2C_CL_MAC_FR_EXCHG: u8 = 5;
 pub(super) const H2C_FUNC_MAC_CCTLINFO_UD_V1: u8 = 0xA;
+/// 8852C's `h2c_dctl_sec_cam`, `rtw89_fw_h2c_dctl_sec_cam_v1`'s func
+/// `H2C_FUNC_MAC_DCTLINFO_UD_V1` (`fw.h:4747`, `rtw8852c.c:3112`).
+pub(super) const H2C_FUNC_MAC_DCTLINFO_UD_V1: u8 = 0x9;
+/// `H2C_CL_MAC_SEC_CAM` / `H2C_FUNC_MAC_SEC_UPD` (`fw.h:4804-4805`).
+pub(super) const H2C_CL_MAC_SEC_CAM: u8 = 0xA;
+pub(super) const H2C_FUNC_MAC_SEC_UPD: u8 = 0x1;
+/// `RTW89_SEC_CAM_LEN` (`cam.h:10`), a sec CAM entry's length.
+pub(super) const SEC_CAM_LEN: u32 = 20;
+/// `RTW89_SEC_KEY_TYPE_CCMP128` (`core.h:321`).
+pub(super) const SEC_KEY_TYPE_CCMP128: u32 = 6;
+/// `struct rtw89_h2c_dctlinfo_ud_v1` (`cam.h:119-137`): c0, w0-w7, m0-m7.
+const DCTLINFO_V1_DWORDS: usize = 17;
+/// `DCTLINFO_V1_W4_SEC_ENT0_KEYID` to `_ENT6_KEYID` (`cam.h:169-175`), the
+/// bits of address CAM w9 the same key IDs take (`cam.h:89-95`).
+const SEC_ENT_KEYIDS: u32 = 0xFFFC_0000;
 /// `H2C_CL_MAC_ADDR_CAM_UPDATE` / `H2C_FUNC_MAC_ADDR_CAM_UPD`
 /// (`fw.h:4755-4756`).
 pub(super) const H2C_CL_MAC_ADDR_CAM_UPDATE: u8 = 6;
@@ -471,6 +488,56 @@ impl H2c {
             H2C_CL_MAC_FR_EXCHG,
             H2C_FUNC_MAC_CCTLINFO_UD_V1,
             true,
+            &le_words(&w),
+        )
+    }
+
+    /// `rtw89_cam_send_sec_key_cmd` for a CCMP-128 key (M3 spec S12.2,
+    /// `rtw89_cam_get_sec_key_cmd`, `cam.c:11-99`, bits `fw.h:496-544`):
+    /// MAC / SEC_CAM / SEC_UPD, rack 1, dack 0, 24 bytes. w0 = sec CAM
+    /// index `idx` [7:0] | offset 0 [15:8] | LEN 20 [23:16]; w1 = TYPE
+    /// CCMP128 (6) [3:0] | EXT_KEY 0 b4 | SPP_MODE 0 b5 (`kzalloc`ed, never
+    /// set); w2..w5 = `key`, its byte `4i + j` in bits `[8j + 7:8j]` of
+    /// word `i`, which is `key` in order as little-endian words. A 256-bit
+    /// key's second H2C (`ext_key`) is never sent: CCMP-128 only.
+    pub fn sec_upd(&mut self, idx: u8, key: &[u8; 16]) -> (u8, Vec<u8>) {
+        let w0 = field(u32::from(idx), 7, 0) | field(0, 15, 8) | field(SEC_CAM_LEN, 23, 16);
+        let w1 = field(SEC_KEY_TYPE_CCMP128, 3, 0) | field(0, 4, 4) | field(0, 5, 5);
+        let mut payload = le_words(&[w0, w1]);
+        payload.extend_from_slice(key);
+        self.packet_with(
+            H2C_CAT_MAC,
+            H2C_CL_MAC_SEC_CAM,
+            H2C_FUNC_MAC_SEC_UPD,
+            true,
+            false,
+            &payload,
+        )
+    }
+
+    /// `rtw89_fw_h2c_dctl_sec_cam_v1(vif, sta)` (M3 spec S12.4,
+    /// `fw.c:2346-2382`) with `rtw89_cam_fill_dctl_sec_cam_info_v1`
+    /// (`cam.c:930-1009`, layout `cam.h:119-186`) for `macid` and the
+    /// address CAM's security fields `keys`: MAC / FR_EXCHG /
+    /// DCTLINFO_UD_V1, rack 0, dack 0, 68 bytes. c0 = macid [6:0] | OP b7;
+    /// w4 = the key IDs, `keys.keyids` [31:18] (the same bits as address
+    /// CAM w9's); w5 = `keys.valid_and_ents`; w6 = `keys.ents_hi`; m4 =
+    /// those key ID bits, m5 and m6 all ones; nothing else, as no WoWLAN
+    /// key (`ptk_alg`) is ever set.
+    pub fn dctl_sec(&mut self, macid: u8, keys: &CamKeys) -> (u8, Vec<u8>) {
+        let mut w = [0u32; DCTLINFO_V1_DWORDS];
+        w[0] = field(u32::from(macid), 6, 0) | field(1, 7, 7);
+        w[5] = keys.keyids & SEC_ENT_KEYIDS;
+        w[6] = keys.valid_and_ents;
+        w[7] = keys.ents_hi;
+        w[13] = SEC_ENT_KEYIDS;
+        w[14] = u32::MAX;
+        w[15] = u32::MAX;
+        self.packet(
+            H2C_CAT_MAC,
+            H2C_CL_MAC_FR_EXCHG,
+            H2C_FUNC_MAC_DCTLINFO_UD_V1,
+            false,
             &le_words(&w),
         )
     }

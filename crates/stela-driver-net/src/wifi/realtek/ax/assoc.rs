@@ -78,8 +78,9 @@
 //!
 //! This module does not grant (spec S1.15): `rtw89_fw_h2c_general_pkt` and
 //! its templates, the BTC role notifies, `rtw89_chip_rfk_channel`, LPS, the
-//! watchdog, keys (M3b: the key deletes before the beacon filter goes off,
-//! `sta_info.c:1577-1578`), RX block ack teardown, TX flushes, and any
+//! watchdog, keys (the deletes that come before [`leave`]'s beacon filter,
+//! `sta_info.c:1577-1578`, are [`super::keys::delete`]'s; [`leave`] carries
+//! the key fields they leave), RX block ack teardown, TX flushes, and any
 //! channel switch. Nor `ieee80211_regulatory_limit_wmm_params` on the
 //! defaults [`associate`] and [`leave`] program: the station layer limits
 //! the AP's parameters, which [`associate`] takes as given.
@@ -94,8 +95,8 @@ use crate::wifi::station::phy::AccessCategory;
 pub use super::vif::PortConfig;
 
 /// The address CAM's security fields (`cam.c:906-927`): the key IDs of
-/// w9 [31:18] in place, and w10 and w11 whole. M3b's key installs fill
-/// them; until then they are 0.
+/// w9 [31:18] in place, and w10 and w11 whole, as [`super::keys::KeyCam`]
+/// holds them; 0 before any key.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CamKeys {
     /// `SEC_ENT0_KEYID` to `SEC_ENT6_KEYID`, w9 [31:18]; other bits are
@@ -609,13 +610,17 @@ pub unsafe fn associate<I: AxIo + ?Sized>(
 }
 
 /// Leaving the association `assoc` made (M3 spec S11; see the module
-/// documentation), in Linux's order: the beacon filter off when the
-/// firmware has it; the beamformee's NDPA off on MAC 0; the CMAC table,
-/// join info disconnected, the address CAM with NO_LINK; the address CAM
-/// with the BSSID cleared; the association's EDCA parameters
-/// ([`AssocInputs::params`]) with the long slot (`BSS_CHANGED_ERP_SLOT`,
-/// which `ieee80211_reset_erp_info` always raises), the GID table cleared,
-/// then [`wmm_defaults`] with the long slot. Nothing of the port or DIG.
+/// documentation), in Linux's order, after the keys were deleted
+/// ([`super::keys::delete`], which mac80211 runs first,
+/// `sta_info.c:1577-1578`): the beacon filter off when the firmware has
+/// it; the beamformee's NDPA off on MAC 0; the CMAC table, join info
+/// disconnected, the address CAM with NO_LINK; the address CAM with the
+/// BSSID cleared, both CAMs with the key fields `keys` the deletes left
+/// (`rtw89_cam_fill_addr_cam_info` reads the vif's entry, `cam.c:906-927`);
+/// the association's EDCA parameters ([`AssocInputs::params`]) with the
+/// long slot (`BSS_CHANGED_ERP_SLOT`, which `ieee80211_reset_erp_info`
+/// always raises), the GID table cleared, then [`wmm_defaults`] with the
+/// long slot. Nothing of the port or DIG.
 ///
 /// # Safety
 /// As [`set_bssid`].
@@ -624,6 +629,7 @@ pub unsafe fn leave<I: AxIo + ?Sized>(
     session: &mut Session<'_>,
     assoc: &AssocInputs,
     features: Features,
+    keys: CamKeys,
     sink: &mut dyn FnMut(Event<'_>),
 ) -> Result<(), AxError> {
     let band = assoc.band;
@@ -633,9 +639,9 @@ pub unsafe fn leave<I: AxIo + ?Sized>(
         unsafe { session.send(io, packet, sink) }?;
     }
     // SAFETY: as above, `disconnect`'s.
-    unsafe { disconnect(io, session, assoc.mac, assoc.bssid, band, sink) }?;
+    unsafe { disconnect(io, session, assoc.mac, assoc.bssid, band, keys, sink) }?;
     // SAFETY: as above, `clear_bssid`'s.
-    unsafe { clear_bssid(io, session, assoc.mac, sink) }?;
+    unsafe { clear_bssid(io, session, assoc.mac, keys, sink) }?;
     // SAFETY: as above, `conf_tx`'s.
     unsafe { conf_tx(io, session, &assoc.params(), false, band, sink) }?;
     // The membership and position tables, zeroed before the notify
@@ -653,10 +659,10 @@ pub unsafe fn leave<I: AxIo + ?Sized>(
 /// `rtw89_core_sta_link_disconnect` (`core.c:5818-5859`), on `band`: the
 /// beamformee's NDPA off on MAC 0 (`rtw89_mac_bf_disassoc`), the CMAC
 /// table, join info disconnected, and the address CAM of `mac` with the
-/// BSSID and NO_LINK. [`leave`] runs it after the beacon filter; a join
-/// whose station authenticated and never associated runs it alone, before
-/// [`clear_bssid`], as `ieee80211_destroy_assoc_data` destroys that station
-/// before clearing the BSSID.
+/// BSSID, NO_LINK and the key fields `keys`. [`leave`] runs it after the
+/// beacon filter; a join whose station authenticated and never associated
+/// runs it alone, before [`clear_bssid`], as `ieee80211_destroy_assoc_data`
+/// destroys that station before clearing the BSSID.
 ///
 /// # Safety
 /// As [`set_bssid`].
@@ -666,6 +672,7 @@ pub unsafe fn disconnect<I: AxIo + ?Sized>(
     mac: [u8; 6],
     bssid: [u8; 6],
     band: HwBand,
+    keys: CamKeys,
     sink: &mut dyn FnMut(Event<'_>),
 ) -> Result<(), AxError> {
     // `rtw89_mac_bf_disassoc`: `rtw89_mac_bfee_ctrl(false)`.
@@ -676,14 +683,18 @@ pub unsafe fn disconnect<I: AxIo + ?Sized>(
     let packet = session.h2c.join_info(MAC_ID, PORT, false);
     // SAFETY: as above.
     unsafe { session.send(io, packet, sink) }?;
-    let cam = AddrCam::with_bssid(mac, bssid);
+    let cam = AddrCam {
+        keys,
+        ..AddrCam::with_bssid(mac, bssid)
+    };
     let packet = session.h2c.addr_cam_with(&cam, MAC_ID, PORT);
     // SAFETY: as above.
     unsafe { session.send(io, packet, sink) }.map(|_| ())
 }
 
 /// The BSSID cleared on a station that is not associated: the address CAM
-/// of [`AddrCam::unassociated`], the bytes of vif init's.
+/// of [`AddrCam::unassociated`] with the key fields `keys`, which without a
+/// key ever installed are vif init's bytes.
 ///
 /// # Safety
 /// As [`set_bssid`].
@@ -691,9 +702,14 @@ pub unsafe fn clear_bssid<I: AxIo + ?Sized>(
     io: &mut I,
     session: &mut Session<'_>,
     mac: [u8; 6],
+    keys: CamKeys,
     sink: &mut dyn FnMut(Event<'_>),
 ) -> Result<(), AxError> {
-    let packet = session.h2c.addr_cam(mac, MAC_ID, PORT);
+    let cam = AddrCam {
+        keys,
+        ..AddrCam::unassociated(mac)
+    };
+    let packet = session.h2c.addr_cam_with(&cam, MAC_ID, PORT);
     // SAFETY: the caller's contract is `send`'s, word for word.
     unsafe { session.send(io, packet, sink) }.map(|_| ())
 }

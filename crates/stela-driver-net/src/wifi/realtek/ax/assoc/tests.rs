@@ -671,7 +671,7 @@ fn leave_runs_linux_order() {
     let a = inputs(HwBand::G5);
     // SAFETY: as in `set_bssid_sends_the_pre_auth_cam_then_suspends_dig`.
     let (got, ran) = on_session(31, &|_| {}, |io, s, sink| unsafe {
-        leave(io, s, &a, FULL, sink)
+        leave(io, s, &a, FULL, CamKeys::default(), sink)
     });
     assert_eq!(got, Ok(()));
     let mut b = H2c::at(31);
@@ -756,7 +756,7 @@ fn leave_takes_the_defaults_of_the_bss_it_left() {
         a.peer.ht = None;
         // SAFETY: as in `set_bssid_sends_the_pre_auth_cam_then_suspends_dig`.
         let (got, ran) = on_session(31, &|_| {}, |io, s, sink| unsafe {
-            leave(io, s, &a, FULL, sink)
+            leave(io, s, &a, FULL, CamKeys::default(), sink)
         });
         assert_eq!(got, Ok(()));
         assert_eq!(ran.packets.len(), 13);
@@ -777,7 +777,7 @@ fn leave_takes_the_defaults_of_the_bss_it_left() {
     };
     // SAFETY: as above.
     let (got, ran) = on_session(31, &|_| {}, |io, s, sink| unsafe {
-        leave(io, s, &a, old, sink)
+        leave(io, s, &a, old, CamKeys::default(), sink)
     });
     assert_eq!(got, Ok(()));
     let mut b = H2c::at(31);
@@ -802,10 +802,51 @@ fn leave_takes_the_defaults_of_the_bss_it_left() {
 fn clear_bssid_sends_the_unassociated_cam() {
     // SAFETY: as in `set_bssid_sends_the_pre_auth_cam_then_suspends_dig`.
     let (got, ran) = on_session(18, &|_| {}, |io, s, sink| unsafe {
-        clear_bssid(io, s, LOCAL, sink)
+        clear_bssid(io, s, LOCAL, CamKeys::default(), sink)
     });
     assert_eq!(got, Ok(()));
     assert_eq!(ran.packets, [H2c::at(18).addr_cam(LOCAL, 0, 0).1]);
     // DIG stays as it was: Linux resumes it only at association.
     assert!(!ran.io.trace.iter().any(|o| matches!(o, Op::R32(0x1481C))));
+}
+
+#[test]
+fn leave_carries_the_address_cams_key_fields() {
+    // rtw89_cam_fill_addr_cam_info (cam.c:906-927) reads the vif's address
+    // CAM entry, whose key IDs and entries a key delete leaves in place
+    // with only the valid map cleared (cam.c:215-246): the leave's CAM with
+    // NO_LINK and its CAM without the BSSID both carry them.
+    let stale = CamKeys {
+        keyids: 0x0040_0000,
+        valid_and_ents: 0x0100_0000,
+        ents_hi: 0,
+    };
+    let a = inputs(HwBand::G5);
+    // SAFETY: as in `set_bssid_sends_the_pre_auth_cam_then_suspends_dig`.
+    let (got, ran) = on_session(31, &|_| {}, |io, s, sink| unsafe {
+        leave(io, s, &a, FULL, stale, sink)
+    });
+    assert_eq!(got, Ok(()));
+    let mut b = H2c::at(34);
+    let unlinked = AddrCam {
+        keys: stale,
+        ..AddrCam::with_bssid(LOCAL, AP)
+    };
+    let cleared = AddrCam {
+        keys: stale,
+        ..AddrCam::unassociated(LOCAL)
+    };
+    assert_eq!(ran.packets[3], b.addr_cam_with(&unlinked, 0, 0).1);
+    assert_eq!(ran.packets[4], b.addr_cam_with(&cleared, 0, 0).1);
+    // w9: SEC_ENT_MODE NORMAL and SEC_ENT2_KEYID 1; w10: SEC_ENT2 1, no
+    // valid slot.
+    assert_eq!(payload_word(&ran.packets[3], 9), 0x0042_0000);
+    assert_eq!(payload_word(&ran.packets[4], 10), 0x0100_0000);
+    // The auth-only teardown's disconnect carries them too.
+    // SAFETY: as above.
+    let (got, ran) = on_session(18, &|_| {}, |io, s, sink| unsafe {
+        disconnect(io, s, LOCAL, AP, HwBand::G5, stale, sink)
+    });
+    assert_eq!(got, Ok(()));
+    assert_eq!(ran.packets[2], H2c::at(20).addr_cam_with(&unlinked, 0, 0).1);
 }
