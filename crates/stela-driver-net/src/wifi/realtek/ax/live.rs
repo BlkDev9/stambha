@@ -118,20 +118,28 @@
 //! mac80211 (`core.c:4551`), and a pairwise key's install starts the
 //! started TIDs' checks over (`mac80211.c:1007-1008`).
 //!
+//! The beacon filter the association arms reports the AP's beacons lost
+//! (M3 spec S15, ruling R2): [`Live::service`] takes each BCNFLTR_RPT as
+//! `rtw89_mac_bcn_fltr_rpt` does, a report an operation drained held for
+//! the next poll as its frames are. A loss for the associated vif's MAC ID
+//! re-arms the filter, and, unless a scan has not been ended, is handed on
+//! as [`Incoming::BeaconLost`]; anything else is ignored.
+//!
 //! This module grants no TX status beyond RPQ's: a report says the MAC is
 //! done with a frame, acknowledged or not, nothing more; a flush grants no
 //! empty queue either, as Linux's waits only log their timeouts. It
 //! encrypts no management frame (a robust one is sealed on the host, spec
 //! S1.2). It runs no IQK, DPK, TSSI, watchdog, interrupts, probe
-//! request or idle power save, and processes no beacon filter report (M3
-//! Task 18). It has no `Drop`: a live chip that is dropped keeps running,
-//! its rings and pools quarantined, as rtw88's `Hardware` keeps running for
-//! the boot.
+//! request or idle power save, and no CQM: the beacon filter's RSSI reports
+//! are ignored, and a beacon loss is the AP gone, not a reason to probe it
+//! (`ieee80211_mgd_probe_ap`). It has no `Drop`: a live chip that is
+//! dropped keeps running, its rings and pools quarantined, as rtw88's
+//! `Hardware` keeps running for the boot.
 use super::assoc::{self, AddrCam, AssocInputs, Features, RaPeer};
 use super::ba::{self, BaCam, RxStats};
 use super::bb::BbGain;
 use super::bringup::{self, BringUpError, Calibrated, FirmwareFile, Host, Running};
-use super::c2h::{C2h, SCAN_END};
+use super::c2h::{BCNFLTR_BEACON_LOSS, BcnFltr, C2h, SCAN_END};
 use super::chan::{Chan, frequency};
 use super::channel::{self, ChannelError, ChannelInputs, TxPower};
 use super::command::{Parked, Session};
@@ -181,9 +189,9 @@ pub const SCAN_NOT_ENDED: AxError = AxError::Scan("the last scan has not been en
 pub const CONNECTED: AxError =
     AxError::Scan("a BSSID is set: the station is connecting or connected");
 
-/// The most frames a [`Live`] holds for the next [`Live::drain`], as the
-/// receiver's own queue is bounded; past it they are dropped and counted
-/// ([`Live::held_dropped`]).
+/// The most frames, and the most beacon filter reports, a [`Live`] holds
+/// for the next [`Live::drain`], as the receiver's own queue is bounded;
+/// past it they are dropped and counted ([`Live::held_dropped`]).
 const MAX_HELD: usize = MAX_PENDING;
 
 /// What the station's key calls got in M3a (spec S14.5), which the host
@@ -321,24 +329,51 @@ impl LiveScan {
     }
 }
 
-/// Frames a scan start or restore drained, oldest first, for the next
-/// [`Live::drain`] to hand out. C2Hs other than the scan's own are not
-/// held: the ledger counts them.
+/// What [`Held`] keeps: a frame, or a beacon filter report.
+enum Kept {
+    Frame(Received),
+    Report(BcnFltr),
+}
+
+/// Frames and beacon filter reports drained outside [`Live::drain`] and
+/// [`Live::expire_scan`], oldest first, for the next [`Live::drain`] to hand
+/// out, at most [`MAX_HELD`] of each; past it they are dropped and counted.
+/// Other C2Hs are not held: the ledger counts them.
 #[derive(Default)]
 struct Held {
-    frames: VecDeque<Received>,
+    kept: VecDeque<Kept>,
+    frames: usize,
+    reports: usize,
     dropped: u16,
 }
 
 impl Held {
     fn keep(&mut self, event: Event<'_>) {
-        if let Event::Frame(frame) = event {
-            if self.frames.len() < MAX_HELD {
-                self.frames.push_back(frame);
-            } else {
-                self.dropped = self.dropped.saturating_add(1);
-            }
+        let (kept, count) = match event {
+            Event::Frame(frame) => (Kept::Frame(frame), &mut self.frames),
+            Event::C2h(C2h::BeaconFilter(report)) => (Kept::Report(report), &mut self.reports),
+            Event::C2h(_) => return,
+        };
+        if *count < MAX_HELD {
+            *count += 1;
+            self.kept.push_back(kept);
+        } else {
+            self.dropped = self.dropped.saturating_add(1);
         }
+    }
+
+    /// The oldest kept, as the event it was.
+    fn next(&mut self) -> Option<Event<'static>> {
+        Some(match self.kept.pop_front()? {
+            Kept::Frame(frame) => {
+                self.frames -= 1;
+                Event::Frame(frame)
+            }
+            Kept::Report(report) => {
+                self.reports -= 1;
+                Event::C2h(C2h::BeaconFilter(report))
+            }
+        })
     }
 }
 
@@ -623,8 +658,9 @@ impl<I: AxIo> Live<I> {
         self.scan.as_ref().and_then(|scan| scan.end)
     }
 
-    /// The frames a scan start or restore drained past the 64 it
-    /// holds for the next [`Live::drain`], which were dropped (saturating).
+    /// The frames, and the beacon filter reports, drained outside
+    /// [`Live::drain`] and [`Live::expire_scan`] past the 64 of each it holds
+    /// for the next [`Live::drain`], which were dropped (saturating).
     pub fn held_dropped(&self) -> u16 {
         self.held.dropped
     }
@@ -805,7 +841,8 @@ impl<I: AxIo> Live<I> {
     }
 
     /// One RXQ poll for `sink` (the RXQ step of the radio's poll): first the
-    /// frames a scan start or restore held, oldest first, then every RXQ
+    /// frames and beacon filter reports an operation held, oldest first
+    /// (see [`Live::service`]), then every RXQ
     /// entry through the receiver and the session's ledger, as
     /// `rtw89_pci_poll_rxq_dma` hands them to `rtw89_core_rx`. A running
     /// scan's first END_SCAN ends it: the same call then drains what
@@ -1529,13 +1566,15 @@ impl<I: AxIo> Live<I> {
     /// `RTW89_TX_DONE`; the TX reclaim of every channel with TXBDs
     /// outstanding; RXQ ([`Live::drain`]), its frames handed on but those
     /// `rtw89_core_skb_pn_valid` drops ([`RxStats::valid`], counted); the
-    /// scan budget ([`Live::expire_scan`]); then, once, [`Incoming::ScanEnded`]
-    /// when the scan begun has ended, after every frame it heard. Every step
-    /// runs whatever an earlier one returned, and the first error is
-    /// returned. Such an error is not fatal: no step powers the chip off,
-    /// every event before the error was handed on, and the next poll tries
-    /// again. Beacon filter reports are not handed on (M3 Task 18).
-    /// Refused with [`POWERED_OFF`] on a chip off.
+    /// scan budget ([`Live::expire_scan`]); then each beacon filter report
+    /// the drains brought, held ones first, as `rtw89_mac_bcn_fltr_rpt`
+    /// takes it ([`Live::beacon_filter`]); then, once,
+    /// [`Incoming::ScanEnded`] when the scan begun has ended, after every
+    /// frame it heard. Every step runs whatever an earlier one returned,
+    /// and the first error is returned. Such an error is not fatal: no step
+    /// powers the chip off, every event before the error was handed on, and
+    /// the next poll tries again. Refused with [`POWERED_OFF`] on a chip
+    /// off.
     ///
     /// # Safety
     /// [`start`]'s contract, still holding for this chip.
@@ -1553,18 +1592,25 @@ impl<I: AxIo> Live<I> {
         }
         let associated = self.associated.is_some();
         let mut stats = core::mem::take(&mut self.rx_stats);
-        let mut frames = |e: Event<'_>| {
-            if let Event::Frame(frame) = e
-                && stats.valid(associated, &frame)
-            {
-                sink(Incoming::Frame(heard(frame)));
+        let mut filter = Vec::new();
+        let mut frames = |e: Event<'_>| match e {
+            Event::Frame(frame) => {
+                if stats.valid(associated, &frame) {
+                    sink(Incoming::Frame(heard(frame)));
+                }
             }
+            Event::C2h(C2h::BeaconFilter(report)) => filter.push(report),
+            Event::C2h(_) => {}
         };
         // SAFETY: as above, `drain`'s.
         keep(&mut first, unsafe { self.drain(&mut frames) });
         // SAFETY: as above, `expire_scan`'s.
         keep(&mut first, unsafe { self.expire_scan(&mut frames) });
         self.rx_stats = stats;
+        for report in filter {
+            // SAFETY: as above, `beacon_filter`'s.
+            keep(&mut first, unsafe { self.beacon_filter(report, sink) });
+        }
         if let Some(scan) = self.scan.as_mut()
             && !scan.announced
             && let Some(end) = scan.end
@@ -1625,6 +1671,56 @@ impl<I: AxIo> Live<I> {
         polled.map(|_| ())
     }
 
+    /// `rtw89_mac_bcn_fltr_rpt` (`mac.c:5389-5443`) of `report` for the one
+    /// vif (M3 spec S15): a report for another MAC ID than the vif's is
+    /// ignored, and so are the RSSI and NOTIFY ones, as nothing asks for
+    /// CQM (`ieee80211_cqm_rssi_notify`); `report.ma` is raw, its signal
+    /// `ma - MAX_RSSI`, which nothing reads. A BEACON_LOSS while associated
+    /// is handed on as [`Incoming::BeaconLost`] unless a scan has not been
+    /// ended (`rtwdev->scanning`, as `ieee80211_beacon_loss` is called only
+    /// then), and then re-arms the filter as Linux does on every loss
+    /// report, `rtw89_fw_h2c_set_bcn_fltr_cfg(.., true)` ([`H2c::bcn_fltr`]
+    /// of this firmware's [`Features`]) sent without a wait when the
+    /// firmware has BEACON_FILTER (`fw.c:5409-5410`); frames drained
+    /// meanwhile are held for the next [`Live::drain`]. While not
+    /// associated nothing happens: mac80211 takes no beacon loss of a
+    /// station not associated, and Linux sends no filter for a vif not
+    /// INFRA (`fw.c:5413`). A failed send is returned with the chip left
+    /// on, where Linux only logs it.
+    ///
+    /// # Safety
+    /// [`start`]'s contract, still holding for this chip.
+    unsafe fn beacon_filter(
+        &mut self,
+        report: BcnFltr,
+        sink: &mut dyn FnMut(Incoming),
+    ) -> Result<(), AxError> {
+        if report.macid != vif::MAC_ID
+            || report.kind != BCNFLTR_BEACON_LOSS
+            || self.associated.is_none()
+        {
+            return Ok(());
+        }
+        if self.scan.is_none() {
+            sink(Incoming::BeaconLost);
+        }
+        let features = Features::of(self.running.firmware);
+        if !features.beacon_filter {
+            return Ok(());
+        }
+        let mut held = core::mem::take(&mut self.held);
+        let sent = self.session(|io, session| {
+            let packet = session
+                .h2c
+                .bcn_fltr(vif::MAC_ID, true, features.loss_count_v1);
+            // SAFETY: the caller's contract is `start`'s, which `send`'s is,
+            // for the live chip's own window and rings.
+            unsafe { session.send(io, packet, &mut |e| held.keep(e)) }.map(|_| ())
+        });
+        self.held = held;
+        sent.and_then(|sent| sent)
+    }
+
     /// The end of an association step run on the session: its error, the
     /// chip powered off for it.
     fn done(&mut self, done: Result<Result<(), AxError>, AxError>) -> Result<(), AxError> {
@@ -1638,10 +1734,11 @@ impl<I: AxIo> Live<I> {
         }
     }
 
-    /// Hand the held frames to `sink`, oldest first.
+    /// Hand the held frames and beacon filter reports to `sink`, oldest
+    /// first.
     fn release(&mut self, sink: &mut dyn FnMut(Event<'_>)) {
-        while let Some(frame) = self.held.frames.pop_front() {
-            sink(Event::Frame(frame));
+        while let Some(event) = self.held.next() {
+            sink(event);
         }
     }
 

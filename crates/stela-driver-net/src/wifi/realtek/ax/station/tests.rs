@@ -197,6 +197,9 @@ struct Air {
     sae_stray: bool,
     /// The AP's confirm does not verify, as under another passphrase.
     sae_wrong_confirm: bool,
+    /// The chip reports beacon loss during a scan, before the beacon it
+    /// hears, and with the AP's answer to an authentication.
+    lost_unassociated: bool,
 }
 
 impl Air {
@@ -240,7 +243,12 @@ impl Air {
             }
             match bytes[0] {
                 0xb0 if self.sae => self.answer_sae(&bytes),
-                0xb0 => self.hear(management(0xb0, &[0, 0, 2, 0, 0, 0])),
+                0xb0 => {
+                    self.hear(management(0xb0, &[0, 0, 2, 0, 0, 0]));
+                    if self.lost_unassociated {
+                        self.incoming.push_back(Incoming::BeaconLost);
+                    }
+                }
                 0x00 if !self.mute_on_assoc => {
                     let mut body = vec![0x11, 0, 0, 0, 1, 0xc0];
                     body.extend(RATES);
@@ -389,6 +397,9 @@ impl Chip for Model {
         let mut air = self.0.borrow_mut();
         if let Some(channels) = air.scanning.take() {
             let channel = air.channel.unwrap();
+            if air.lost_unassociated {
+                air.incoming.push_back(Incoming::BeaconLost);
+            }
             if channels.contains(&channel) {
                 let bad = air.bad_fcs;
                 let bytes = beacon(&air);
@@ -1285,6 +1296,98 @@ fn the_radio_waits_30_s_for_carrier_and_polls() {
     assert_eq!(WIFI_CARRIER_WAIT_US, 30_000_000);
     assert!(!wifi.signals());
     assert_eq!(wifi.due_us(), None);
+}
+
+#[test]
+fn beacon_loss_while_associated_reconnects() {
+    // Review Focus 5, spec S15 (ruling R2): the firmware's loss of the AP's
+    // beacons ends the association as `ieee80211_sta_connection_lost` does
+    // with tx false: the flush with drop and no frame of the station's own,
+    // then the keys and the leaving. The keeper reconnects after
+    // RECONNECT_US (100 ms), and the progress line counts the loss.
+    let (mut wifi, model) = connected();
+    let from = model.0.borrow().calls.len();
+    let scans = |air: &Air| air.count(|c| matches!(c, Call::BeginScan(_)));
+    let before = scans(&model.0.borrow());
+    model
+        .0
+        .borrow_mut()
+        .incoming
+        .push_back(Incoming::BeaconLost);
+    assert!(run(&mut wifi, &model, |_, air| {
+        air.calls[from..].contains(&Call::Disassociate)
+    }));
+    let left = CLOCK.now_us();
+    assert_eq!(
+        leaving(&model.0.borrow(), from),
+        [
+            "flush true",
+            "flush false",
+            "remove 0",
+            "flush false",
+            "remove 1",
+            "leave"
+        ]
+    );
+    assert_eq!(
+        wifi.receive(),
+        Err(LinkError::Adapter(String::from(
+            "rtw89: the AP ended the association"
+        )))
+    );
+    let line = progress(&mut wifi);
+    assert!(line.contains(", port closed, beacon lost 1; "), "{line}");
+    assert!(run(&mut wifi, &model, |_, air| scans(air) > before));
+    assert!(CLOCK.now_us() - left >= 90_000);
+    // The keeper joins again; the count stays.
+    assert!(run(&mut wifi, &model, |wifi, _| {
+        wifi.radio().station().phase() == Peering::Associated
+    }));
+    assert_eq!(
+        model.0.borrow().count(|c| matches!(c, Call::Associate(_))),
+        2
+    );
+    assert!(progress(&mut wifi).contains("beacon lost 1"));
+}
+
+#[test]
+fn beacon_loss_while_scanning_is_ignored() {
+    // Linux hands mac80211 a beacon loss only outside a scan
+    // (`rtwdev->scanning`), and mac80211 takes one only while associated:
+    // a loss during the scan, or with the authentication's answer, changes
+    // nothing, and the join goes on.
+    let (mut wifi, model) = wifi_with(|air| air.lost_unassociated = true);
+    assert!(run(&mut wifi, &model, |wifi, _| {
+        wifi.radio().station().phase() == Peering::Associated
+    }));
+    let air = model.0.borrow();
+    assert_eq!(air.count(|c| matches!(c, Call::BeginScan(_))), 1);
+    assert_eq!(air.count(|c| *c == Call::Disassociate), 0);
+    drop(air);
+    assert_eq!(wifi.receive(), Ok(None));
+    let line = progress(&mut wifi);
+    assert!(!line.contains("beacon lost"), "{line}");
+}
+
+#[test]
+fn a_beacon_loss_while_leaving_is_not_counted() {
+    // The station already departs: the loss is not the connection's end.
+    let (mut wifi, model) = connected();
+    wifi.radio_mut().deauthenticate(3).unwrap();
+    model
+        .0
+        .borrow_mut()
+        .incoming
+        .push_back(Incoming::BeaconLost);
+    assert!(run(&mut wifi, &model, |_, air| {
+        air.position(|c| *c == Call::Disassociate).is_some()
+    }));
+    let line = progress(&mut wifi);
+    assert!(!line.contains("beacon lost"), "{line}");
+    let Err(LinkError::Adapter(failure)) = wifi.receive() else {
+        panic!("no failure")
+    };
+    assert!(!failure.contains("the AP ended"), "{failure}");
 }
 
 #[test]

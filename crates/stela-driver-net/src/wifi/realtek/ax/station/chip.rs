@@ -73,7 +73,8 @@ pub enum Incoming {
     ScanEnded {
         completed: bool,
     },
-    /// The firmware reported the associated AP's beacons lost.
+    /// The firmware reported the associated AP's beacons lost, while no
+    /// scan ran (M3 spec S15).
     BeaconLost,
 }
 

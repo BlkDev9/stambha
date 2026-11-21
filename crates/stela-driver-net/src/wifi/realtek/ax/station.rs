@@ -90,18 +90,27 @@
 //!   is deleted after a flush without drop, as `rtw89_ops_set_key`'s
 //!   DISABLE_KEY flushes, the PTK first, then the group keys, before the
 //!   chip disassociates.
+//! - The firmware's beacon loss, which the chip reports while associated
+//!   and not scanning (spec S15), loses the connection: the keeper hears
+//!   of it and reconnects after `RECONNECT_US`, and the station departs as
+//!   `ieee80211_sta_connection_lost` leaves an AP that stopped answering,
+//!   the flush with drop and no frame of its own. The progress line counts
+//!   each.
 //!
 //! The radio polls (spec S1.4): it never signals, and the keeper services
 //! it from `carrier()` and `receive()`. Its diagnostic is the progress line
-//! of spec S14.6, which names no address, then the chip's own counts.
+//! of spec S14.6, which names no address, then the chip's own counts. It
+//! takes 30 s from its start to carrier ([`WIFI_CARRIER_WAIT_US`], spec
+//! S1.5), which the keeper forwards.
 //!
 //! This module does not grant: any cipher but CCMP-128 (TKIP, GCMP,
 //! CCMP-256, WEP), hardware-encrypted management frames
 //! (`hw_mgmt_tx_encrypt`), the IGTK in the CAM, SAE on 6 GHz or on an MLD
-//! link, beacon loss, A-MSDU or aggregated TX, power
-//! save, templates, the watchdog, SA Query requests of its own, or following
-//! the AP's beacons and channel switches. Of RX Block Ack it does not
-//! grant: an agreement's inactivity timeout
+//! link, the probe of the AP mac80211 sends on a beacon loss before it
+//! gives the AP up (`ieee80211_mgd_probe_ap`), A-MSDU or aggregated TX,
+//! power save, templates, the watchdog, SA Query requests of its own, or
+//! following the AP's beacons and channel switches. Of RX Block Ack it
+//! does not grant: an agreement's inactivity timeout
 //! (`sta_rx_agg_session_timer_expired`); the DELBA mac80211 sends for an
 //! aggregate on a TID without an agreement (`unexpected_agg`); ending an
 //! agreement for a fragment under it (fragments are reassembled, never
@@ -323,6 +332,7 @@ struct Progress {
     aid: Option<u16>,
     eapol: Option<Eapol>,
     keys: Option<u32>,
+    beacon_lost: Option<u32>,
     last: Option<&'static str>,
 }
 
@@ -905,8 +915,7 @@ impl<C: Chip> Rtl8852c<C> {
                     None => Ok(()),
                 },
                 Incoming::ScanEnded { completed } => self.scan_ended(completed),
-                // Beacon loss is M3 Task 18's; no chip reports it yet.
-                Incoming::BeaconLost => Ok(()),
+                Incoming::BeaconLost => self.beacon_lost(),
             };
             if first.is_ok() {
                 first = taken;
@@ -968,6 +977,26 @@ impl<C: Chip> Rtl8852c<C> {
         if acknowledged && let Some(exchange) = exchange {
             bump(&mut exchange.acked);
         }
+    }
+
+    /// The firmware's beacon loss (spec S15, ruling R2): while associated,
+    /// not leaving and not scanning, the keeper hears the connection lost,
+    /// which it reconnects from after `RECONNECT_US`, the loss is counted,
+    /// and the station departs without a frame of its own, as
+    /// `ieee80211_sta_connection_lost(.., tx false)` ends it once the probe
+    /// of the AP that `ieee80211_beacon_loss` starts goes unanswered: the
+    /// flush with drop, then the departure. Stela leaves at once, as a lost
+    /// AP needs a new association either way (spec S1.11). Anything else
+    /// is ignored.
+    fn beacon_lost(&mut self) -> Result<(), Error> {
+        if self.context.is_none() || self.left || self.scanning.is_some() {
+            return Ok(());
+        }
+        bump(self.progress.beacon_lost.get_or_insert(0));
+        self.events.push_back(keeper::Event::ConnectionLost);
+        let action = self.station.disconnect().map_err(Error::Station)?;
+        self.act(action);
+        Ok(())
     }
 
     /// The scan ended (spec S8.2): its ticket completed, the chip restored
@@ -1684,6 +1713,9 @@ impl<C: Chip> Rtl8852c<C> {
         } else {
             ", port closed"
         });
+        if let Some(lost) = p.beacon_lost {
+            line.push_str(&format!(", beacon lost {lost}"));
+        }
         if let Some(last) = p.last {
             line.push_str(&format!(", last \"{last}\""));
         }

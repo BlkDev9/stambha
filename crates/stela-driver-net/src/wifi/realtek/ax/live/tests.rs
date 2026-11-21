@@ -29,6 +29,7 @@ use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use std::sync::Mutex;
 
 mod ba;
+mod beacon;
 mod chip;
 mod keys;
 
