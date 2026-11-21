@@ -310,8 +310,9 @@ fn leave_deletes_the_keys_first() {
     assert_eq!(sent.len(), 17);
     assert_eq!(live.h2c(), H2c::at(54));
     let at = |seq: u8| sent[usize::from(seq - 37)].clone();
-    // mac80211 deletes the AP station's keys before its ASSOC -> AUTH
-    // (sta_info.c:1577-1578), the group key first (ieee80211_free_sta_keys):
+    // What the radio left is deleted where mac80211 frees the AP station's
+    // keys, before its ASSOC -> AUTH (sta_info.c:1577-1578), in Stela's
+    // order, the group key first (KeyCam::deletion_order):
     // the group key's dctl (37) and CAM (38), the pairwise key's (39, 40),
     // each without SEC_UPD; then the beacon filter off (41) and the rest of
     // the leave.

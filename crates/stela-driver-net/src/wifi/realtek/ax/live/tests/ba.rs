@@ -174,7 +174,7 @@ fn a_ba_cam_that_cannot_be_sent_keeps_its_entry_and_the_chip_on() {
 #[test]
 fn leave_stops_what_the_station_left_before_the_keys() {
     // __sta_info_destroy_part1 tears the agreements down before _part2
-    // deletes the keys (sta_info.c:1335-1348, :1578).
+    // deletes the keys (sta_info.c:1310-1348, :1543-1578).
     let log = RefCell::new(None);
     let (mut live, _m) = associated(&|fw| *log.borrow_mut() = Some(fw.record()));
     let log = log.into_inner().unwrap();

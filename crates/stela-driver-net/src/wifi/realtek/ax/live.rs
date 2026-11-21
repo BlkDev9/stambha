@@ -1138,9 +1138,12 @@ impl<I: AxIo> Live<I> {
     /// the AP station's agreements down before its keys
     /// (`__sta_info_destroy_part1`'s `ieee80211_sta_tear_down_BA_sessions`,
     /// `sta_info.c:1348`), then every key still
-    /// installed deleted as [`Live::remove_key`] deletes it, the group keys
-    /// first, as mac80211 deletes the AP station's keys before its ASSOC to
-    /// AUTH (`sta_info.c:1577-1578`, `ieee80211_free_sta_keys`), then
+    /// installed deleted as [`Live::remove_key`] deletes it, in Stela's
+    /// order, the group keys first ([`keys::KeyCam::deletion_order`]):
+    /// mac80211 frees the AP station's keys there, before its ASSOC to AUTH
+    /// (`sta_info.c:1577-1578`, `ieee80211_free_sta_keys`), but in station
+    /// mode those are the PTK alone, the GTK being the vif's, and the radio
+    /// deletes every key itself, the PTK first, before it leaves; then
     /// [`assoc::leave`] for it, whose address CAMs carry the key fields the
     /// deletes left; from a BSSID set without one, [`assoc::clear_bssid`],
     /// after [`assoc::disconnect`] when the AP's station was

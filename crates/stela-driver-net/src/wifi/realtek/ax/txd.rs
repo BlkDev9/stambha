@@ -74,7 +74,7 @@ pub struct TxSec {
 }
 
 /// The peer's RA capabilities a data frame's info carries
-/// (`rtwsta_link->ra.stbc_cap`, `ra.ldpc_cap`, `core.c:1144-1145`).
+/// (`rtwsta_link->ra.stbc_cap`, `ra.ldpc_cap`, `core.c:1145-1146`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RateCaps {
     pub stbc: bool,

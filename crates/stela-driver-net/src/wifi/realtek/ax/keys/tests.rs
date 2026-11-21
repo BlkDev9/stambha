@@ -140,8 +140,9 @@ fn detach_clears_only_the_valid_bit_as_linux_does() {
 
 #[test]
 fn keys_are_deleted_group_first_then_pairwise() {
-    // ieee80211_free_sta_keys (net/mac80211/key.c): the station's group
-    // keys by index, then its pairwise keys by index.
+    // Stela's order, which is ieee80211_free_sta_keys's for a station's own
+    // keys (net/mac80211/key.c:1186-1215): the group keys by index, then
+    // the pairwise keys by index.
     let mut cam = KeyCam::default();
     cam.attach(4, true, 0).unwrap();
     cam.attach(5, false, 2).unwrap();

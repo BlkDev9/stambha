@@ -360,9 +360,9 @@ fn associate_takes_the_negotiated_ht() {
 
 #[test]
 fn an_association_without_wmm_programs_the_qos_defaults() {
-    // mac80211 still enables QoS without WMM (`mlme.c:6255-6270`):
+    // mac80211 still enables QoS without WMM (`mlme.c:6308-6323`):
     // `ieee80211_set_wmm_default(.., true)` hands rtw89 802.11's defaults,
-    // as it does for a set it finds invalid (`mlme.c:4230-4247`).
+    // as it does for a set it finds invalid (`mlme.c:4228-4245`).
     let mut invalid = qos_defaults(false);
     invalid[2].ecw_min = 0;
     for edca in [None, Some(invalid)] {

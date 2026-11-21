@@ -5,53 +5,57 @@
 //! leaves the MAC's soft half to mac80211, as rtw88 does, so the station's
 //! orchestration is Stela's, after rtw88's `realtek/station.rs` (its
 //! `Rtl8822c`, cited per method); the hardware beneath it is
-//! [`chip::Chip`], which a live chip implements.
+//! [`chip::Chip`], which a live chip implements. mac80211's and cfg80211's
+//! functions are cited at the donor's `net/mac80211/` and `net/wireless/`
+//! (Linux `a804c5742bff`).
 //!
 //! - A scan is one firmware offload (`rtw89_ops_hw_scan`, spec S8) of every
 //!   channel the country leaves, each passive (no probe templates, spec
 //!   S1.3); its end restores the chip (`rtw89_hw_scan_complete`) before
 //!   the keeper retires it.
-//! - A join tunes to the BSS and sets its BSSID (`ieee80211_prep_connection`
-//!   over `rtw89_set_channel` and `BSS_CHANGED_BSSID`), then authenticates
-//!   and associates through the shared `Station`, whose frames leave on the
-//!   chip's management queue at the BSS's lowest basic rate, each ticketed
-//!   one's TX status from its release report. The AP's acceptance of the
-//!   authentication moves its station to AUTH ([`chip::Chip::authenticated`]).
-//! - A WPA3-Personal network is joined by SAE as `ieee80211_mgd_auth` runs
-//!   wpa_supplicant's exchange (spec S1.16): the channel and BSSID as a
-//!   join's, then the keeper's commits and confirms, which the station
-//!   builds, on the management queue, each one's TX status timing its next
-//!   try (`ieee80211_sta_work`), and the AP's handed back to the keeper.
-//!   The AP's station goes to AUTH once the exchange ends authenticated,
-//!   with the AP's confirm of the station's or the station's confirm to an
-//!   AP that confirmed first (`ieee80211_mark_sta_auth`); the association
-//!   follows under the PMF SAE requires. Only the AP's authentication
-//!   frames addressed to the station reach the exchange
-//!   (`ieee80211_accept_frame`, `ieee80211_rx_mgmt_auth`). A denied or
-//!   timed-out exchange ends, the keeper told; a deauthentication does not
-//!   end it, as `ieee80211_rx_mgmt_deauth` takes one only once associated
-//!   or associating; and the keeper's own end of it leaves with a
-//!   deauthentication (`ieee80211_mgd_deauth`).
+//! - A join tunes to the BSS and sets its BSSID (`ieee80211_prep_connection`,
+//!   `mlme.c:9596`, over `rtw89_set_channel` and `BSS_CHANGED_BSSID`), then
+//!   authenticates and associates through the shared `Station`, whose frames
+//!   leave on the chip's management queue at the BSS's lowest basic rate,
+//!   each ticketed one's TX status from its release report. The AP's
+//!   acceptance of the authentication moves its station to AUTH
+//!   ([`chip::Chip::authenticated`]).
+//! - A WPA3-Personal network is joined by SAE as `ieee80211_mgd_auth`
+//!   (`mlme.c:9898`) runs wpa_supplicant's exchange (spec S1.16): the channel
+//!   and BSSID as a join's, then the keeper's commits and confirms, which the
+//!   station builds, on the management queue, each one's TX status timing its
+//!   next try (`ieee80211_sta_work`, `mlme.c:9097`), and the AP's handed back
+//!   to the keeper. The AP's station goes to AUTH once the exchange ends
+//!   authenticated, with the AP's confirm of the station's or the station's
+//!   confirm to an AP that confirmed first (`ieee80211_mark_sta_auth`,
+//!   `mlme.c:5386`); the association follows under the PMF SAE requires. Only
+//!   the AP's authentication frames addressed to the station reach the
+//!   exchange (`ieee80211_accept_frame`, `rx.c:4517`;
+//!   `ieee80211_rx_mgmt_auth`, `mlme.c:5414`). A denied or timed-out exchange
+//!   ends, the keeper told; a deauthentication does not end it, as
+//!   `ieee80211_rx_mgmt_deauth` (`mlme.c:5646`) takes one only once
+//!   associated or associating; and the keeper's own end of it leaves with a
+//!   deauthentication (`ieee80211_mgd_deauth`, `mlme.c:10719`).
 //! - The association programs the chip with the negotiated peer as
 //!   `BSS_CHANGED_ASSOC` does (spec S10), on the channel the join switched
 //!   to.
 //! - EAPOL runs over the data queues; data frames wait in `held` while the
 //!   chip has no room, management frames in the outbox.
 //! - The handshake's keys go to the chip's security CAM (`rtw89_ops_set_key`,
-//!   spec S12), CCMP-128 only (spec S1.2): the PTK with a host packet
-//!   number, the GTK receive-only; a key of an index already held replaces
-//!   it as `ieee80211_key_replace` does, the old one deleted first, and an
-//!   identical one is not installed again (`ieee80211_key_identical`). The
-//!   port opens on both, and under PMF on the IGTK too, which stays on the
-//!   host (`BipKey`, spec S1.2); a rekey while it is open authorizes it
-//!   again on the keys then held, as mac80211's station stays authorized
-//!   across one, but a replacement closes it from the old key's delete
-//!   until the new key is installed, so one the chip refuses leaves it
-//!   closed. rtw89 puts the IGTK in the CAM as BIP_CCMP128
-//!   (`cam.c:516-517`), but reads neither BIP bit of the RX descriptor
-//!   (`AX_RXD_BIP_KEYID`, `AX_RXD_BIP_ENC`, `txrx.h:427-428`), and mac80211
-//!   checks a group robust frame's MIC itself unless the hardware marked it
-//!   decrypted (`ieee80211_crypto_aes_cmac_decrypt`): here every one's is
+//!   spec S12), CCMP-128 only (spec S1.2): the PTK with a host packet number,
+//!   the GTK receive-only; a key of an index already held replaces it as
+//!   `ieee80211_key_replace` (`key.c:440`) does, the old one deleted first,
+//!   and an identical one is not installed again (`ieee80211_key_identical`,
+//!   `key.c:813`). The port opens on both, and under PMF on the IGTK too,
+//!   which stays on the host (`BipKey`, spec S1.2); a rekey while it is open
+//!   authorizes it again on the keys then held, as mac80211's station stays
+//!   authorized across one, but a replacement closes it from the old key's
+//!   delete until the new key is installed, so one the chip refuses leaves it
+//!   closed. rtw89 puts the IGTK in the CAM as BIP_CCMP128 (`cam.c:516-517`),
+//!   but reads neither BIP bit of the RX descriptor (`AX_RXD_BIP_KEYID`,
+//!   `AX_RXD_BIP_ENC`, `txrx.h:427-428`), and mac80211 checks a group robust
+//!   frame's MIC itself unless the hardware marked it decrypted
+//!   (`ieee80211_crypto_aes_cmac_decrypt`, `wpa.c:911`): here every one's is
 //!   checked on the host.
 //! - Data under the PTK leaves as `Protection::HostIv` plans it: the
 //!   station reserves its PN and writes its CCMP header, which
@@ -61,17 +65,16 @@
 //!   leaves, waits or is dropped, so PNs only increase. Robust management
 //!   frames are sealed on the host under the PTK (`realtek::ccmp`), as
 //!   rtw88 seals them, and leave without a hardware key.
-//! - Received data the hardware decrypted (its CCMP header and MIC kept,
-//!   spec S7.3) is taken under the key its key ID names, through the
-//!   station's replay and port checks, fragments reassembled and A-MSDUs
-//!   split as rtw88 takes them; protected data the station cannot open is
-//!   dropped where mac80211 decrypts, past the reorder buffer, so it still
-//!   takes its place in its agreement's window. Protected management
-//!   frames are opened on the host when the hardware left them sealed. A
-//!   retried unicast frame
-//!   of the AP's station repeating the last sequence control its counter
-//!   saw is a duplicate, dropped (`ieee80211_rx_h_check_dup`). Frames heard
-//!   after an accepted association response wait until the keeper
+//! - Received data the hardware decrypted (its CCMP header and MIC kept, spec
+//!   S7.3) is taken under the key its key ID names, through the station's
+//!   replay and port checks, fragments reassembled and A-MSDUs split as rtw88
+//!   takes them; protected data the station cannot open is dropped where
+//!   mac80211 decrypts, past the reorder buffer, so it still takes its place
+//!   in its agreement's window. Protected management frames are opened on the
+//!   host when the hardware left them sealed. A retried unicast frame of the
+//!   AP's station repeating the last sequence control its counter saw is a
+//!   duplicate, dropped (`ieee80211_rx_h_check_dup`, `rx.c:1521`). Frames
+//!   heard after an accepted association response wait until the keeper
 //!   configures the association, as mac80211 takes the response,
 //!   `BSS_CHANGED_ASSOC` and all, before the next frame: an ADDBA Request or
 //!   EAPOL in the same poll then finds the station associated.
@@ -81,26 +84,27 @@
 //!   accepted gets its reorder buffer, then the chip's RX_START
 //!   ([`chip::Chip::start_rx_block_ack`]), then its ADDBA Response, success
 //!   whatever the chip returned, as `rtw89_ops_ampdu_action` returns 0 and
-//!   the hardware's dynamic BA CAM covers an agreement without an entry.
-//!   QoS data from the AP on its TID is reordered
-//!   (`ieee80211_rx_reorder_ampdu`, the shared `Reorder`), a BAR releasing
-//!   what waits before its SSN; a DELBA, a replacement or the departure
-//!   stops it on the chip and drops what it held. Block Ack action frames
-//!   are robust: under PMF they come and go protected.
+//!   the hardware's dynamic BA CAM covers an agreement without an entry. QoS
+//!   data from the AP on its TID is reordered (`ieee80211_rx_reorder_ampdu`,
+//!   `rx.c:1445`, the shared `Reorder`), a BAR releasing what waits before
+//!   its SSN; a DELBA, a replacement or the departure stops it on the chip
+//!   and drops what it held. Block Ack action frames are robust: under PMF
+//!   they come and go protected.
 //! - A departure leaves through the chip (spec S11), which releases its
 //!   channel. From an association, mac80211's `ieee80211_set_disassoc`
-//!   flushes first ([`chip::Chip::flush`] with drop, then without it after
-//!   a deauthentication of the station's own); the agreements stop on the
-//!   chip without a DELBA (`ieee80211_sta_tear_down_BA_sessions`); each key
-//!   is deleted after a flush without drop, as `rtw89_ops_set_key`'s
-//!   DISABLE_KEY flushes, the PTK first, then the group keys, before the
-//!   chip disassociates.
-//! - The firmware's beacon loss, which the chip reports while associated
-//!   and not scanning (spec S15), loses the connection: the keeper hears
-//!   of it and reconnects after `RECONNECT_US`, and the station departs as
-//!   `ieee80211_sta_connection_lost` leaves an AP that stopped answering,
-//!   the flush with drop and no frame of its own. The progress line counts
-//!   each.
+//!   (`mlme.c:4506`) flushes first ([`chip::Chip::flush`] with drop, then
+//!   without it after a deauthentication of the station's own); the
+//!   agreements stop on the chip without a DELBA
+//!   (`ieee80211_sta_tear_down_BA_sessions`, `ht.c:286`); each key is deleted
+//!   after a flush without drop, as `rtw89_ops_set_key`'s DISABLE_KEY
+//!   flushes, the PTK first, then the group keys, before the chip
+//!   disassociates.
+//! - The firmware's beacon loss, which the chip reports while associated and
+//!   not scanning (spec S15), loses the connection: the keeper hears of it
+//!   and reconnects after `RECONNECT_US`, and the station departs as
+//!   `ieee80211_sta_connection_lost` (`mlme.c:8937`) leaves an AP that
+//!   stopped answering, the flush with drop and no frame of its own. The
+//!   progress line counts each.
 //!
 //! The radio polls (spec S1.4): it never signals, and the keeper services
 //! it from `carrier()` and `receive()`. Its diagnostic is the progress line
@@ -108,34 +112,33 @@
 //! takes 30 s from its start to carrier ([`WIFI_CARRIER_WAIT_US`], spec
 //! S1.5), which the keeper forwards.
 //!
-//! This module does not grant: any cipher but CCMP-128 (TKIP, GCMP,
-//! CCMP-256, WEP), hardware-encrypted management frames
-//! (`hw_mgmt_tx_encrypt`), the IGTK in the CAM, SAE on 6 GHz or on an MLD
-//! link, the probe of the AP mac80211 sends on a beacon loss before it
-//! gives the AP up (`ieee80211_mgd_probe_ap`), A-MSDU or aggregated TX,
-//! power save, templates, the watchdog, SA Query requests of its own, or
-//! following the AP's beacons and channel switches. Under PMF an
-//! unprotected deauthentication or disassociation is dropped
-//! (`ieee80211_drop_unencrypted_mgmt`), and the SA Query wpa_supplicant
-//! then starts for one of reason 6 or 7, to learn whether the AP still
-//! knows the station (`sme_event_unprot_disconnect`), is the shared
-//! keeper's to send, which sends none for any radio: a station whose AP
-//! lost its state keeps a link that carries nothing until the keeper
-//! leaves it. Of RX Block Ack it does not grant: an agreement's inactivity
-//! timeout
-//! (`sta_rx_agg_session_timer_expired`); the DELBA mac80211 sends for an
-//! aggregate on a TID without an agreement (`unexpected_agg`); ending an
-//! agreement for a fragment under it (fragments are reassembled, never
-//! reordered, as rtw88 takes them); mac80211's reorder timeout, as the
-//! shared `Reorder` releases after 100 ms on TIDs 0-3 and 40 ms on 4-7
-//! where `HT_RX_REORDER_BUF_TIMEOUT` is 100 ms for all; and two answers of
-//! mac80211 the station layer gives otherwise: an ADDBA Request repeated
-//! under its agreement's dialog token without a MAC retry is declined
-//! (mac80211 answers success), and one in an association without HT gets
-//! no answer (mac80211 declines it).
+//! This module does not grant: any cipher but CCMP-128 (TKIP, GCMP, CCMP-256,
+//! WEP), hardware-encrypted management frames (`hw_mgmt_tx_encrypt`), the
+//! IGTK in the CAM, SAE on 6 GHz or on an MLD link, the probe of the AP
+//! mac80211 sends on a beacon loss before it gives the AP up
+//! (`ieee80211_mgd_probe_ap`, `mlme.c:4914`), A-MSDU or aggregated TX, power
+//! save, templates, the watchdog, SA Query requests of its own, or following
+//! the AP's beacons and channel switches. Under PMF an unprotected
+//! deauthentication or disassociation is dropped
+//! (`ieee80211_drop_unencrypted_mgmt`, `rx.c:2568`), and the SA Query
+//! wpa_supplicant then starts for one of reason 6 or 7, to learn whether the
+//! AP still knows the station (`sme_event_unprot_disconnect`), is the shared
+//! keeper's to send, which sends none for any radio: a station whose AP lost
+//! its state keeps a link that carries nothing until the keeper leaves it. Of
+//! RX Block Ack it does not grant: an agreement's inactivity timeout
+//! (`sta_rx_agg_session_timer_expired`, `agg-rx.c:143`); the DELBA mac80211
+//! sends for an aggregate on a TID without an agreement (`unexpected_agg`,
+//! `rx.c:1472-1479`); ending an agreement for a fragment under it (fragments
+//! are reassembled, never reordered, as rtw88 takes them); mac80211's reorder
+//! timeout, as the shared `Reorder` releases after 100 ms on TIDs 0-3 and 40
+//! ms on 4-7 where `HT_RX_REORDER_BUF_TIMEOUT` is 100 ms for all; and two
+//! answers of mac80211 the station layer gives otherwise: an ADDBA Request
+//! repeated under its agreement's dialog token without a MAC retry is
+//! declined (mac80211 answers success), and one in an association without HT
+//! gets no answer (mac80211 declines it).
 //!
 //! The GTK is deleted before the chip disassociates, where Linux
-//! deletes a station's group key (a vif key in station mode, cfg.c's
+//! deletes a station's group key (a vif key in station mode, `cfg.c:617`'s
 //! `ieee80211_add_key` without an address) only after cfg80211's
 //! disconnect (`__cfg80211_disconnected`'s `rdev_del_key` loop,
 //! `net/wireless/sme.c:1375-1391`); either way the chip ends keyless.

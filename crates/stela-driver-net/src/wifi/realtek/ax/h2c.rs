@@ -481,7 +481,9 @@ impl H2c {
     /// v0 carries no `upd_mode`, so CREATE, INFO_CHANGE and CON_DISCONN build
     /// the same bytes.
     ///
-    /// The vif's address CAM 0 (offset 0, len `ADDR_CAM_ENT_SIZE` 0x20,
+    /// The vif's address CAM 0 (offset 0, len `ADDR_CAM_ENT_SHORT_SIZE`
+    /// 0x20 (`mac.h:16`), which `rtw89_get_addr_cam_entry_size` gives every
+    /// chip but 8852A, 8852B, 8851B and 8852BT (`cam.c:631-643`, `:667`),
     /// valid, no address mask, `sec_ent_mode` NORMAL 2) and BSSID CAM 0
     /// (len `BSSID_CAM_ENT_SIZE` 8, valid, PHY 0) are those
     /// `rtw89_cam_init` picks for the first vif (`cam.c:741-761`), and a

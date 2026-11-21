@@ -25,11 +25,16 @@
 //! Linux sends each of these H2Cs without a wait. Stela's own (spec S1.12,
 //! S12.5): [`install`] waits for SEC_UPD's REC_ACK and for the address CAM's
 //! own DONE_ACK, matched by seq, each within `ACK_WAIT_US`, and only then
-//! is the key installed; a key the firmware never acknowledged is undone in
-//! [`KeyCam`] as Linux's error path undoes it (`cam.c:280-286`,
-//! `:455-462`): the slot's valid bit and the entry. The H2Cs already sent
-//! are not taken back, as Linux sends none either; the next dctl and
-//! address CAM carry the undone state. [`delete`] waits for nothing.
+//! is the key installed. A key that failed after its entry was taken is
+//! undone in [`KeyCam`], the slot's valid bit and the entry, whichever step
+//! failed. Linux's error path frees the entry on any failure
+//! (`cam.c:455-462`) but clears the slot's valid bit only when the address
+//! CAM's send fails (`cam.c:280-286`): a failed dctl send returns with the
+//! bit still set (`cam.c:274-278`), naming the freed entry. Stela clears it
+//! there too, its one departure from that path, so no later dctl or
+//! address CAM names an entry the CAM gave up. The H2Cs already sent are
+//! not taken back, as Linux sends none either; the next dctl and address
+//! CAM carry the undone state. [`delete`] waits for nothing.
 //!
 //! This module does not grant: any cipher but CCMP-128 (WEP's ALL_UNI mode,
 //! TKIP, GCMP, and the 256-bit keys whose `ext_key` takes two entries and a
@@ -155,9 +160,15 @@ impl KeyCam {
         }
     }
 
-    /// The entries of the valid slots in the order mac80211 deletes a
-    /// station's keys (`ieee80211_free_sta_keys`, `net/mac80211/key.c`):
-    /// the group keys by key ID, then the pairwise keys by key ID.
+    /// The entries of the valid slots in Stela's order: the group keys by
+    /// key ID, then the pairwise keys by key ID. It is the order
+    /// `ieee80211_free_sta_keys` (`net/mac80211/key.c:1186-1215`) frees a
+    /// station's own keys in, but in station mode the AP's station holds
+    /// only the PTK there: mac80211 installs the GTK as a key of the vif,
+    /// which cfg80211's disconnect deletes (`__cfg80211_disconnected`,
+    /// `net/wireless/sme.c:1375-1391`). The radio deletes every key itself,
+    /// the PTK first, before the chip leaves; this order is only for what
+    /// is left then.
     pub fn deletion_order(&self) -> Vec<u8> {
         let valid = |slot: &usize| self.valid & (1 << slot) != 0;
         let mut order = Vec::new();
