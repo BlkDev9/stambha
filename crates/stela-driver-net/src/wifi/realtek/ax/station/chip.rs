@@ -171,8 +171,11 @@ pub trait Chip {
     /// for time, as Linux's only log theirs; nothing is reported for a
     /// dropped frame beyond its release report, if any.
     fn flush(&mut self, drop: bool) -> Result<(), String>;
-    /// Accept an RX Block Ack agreement for `tid` from `ssn` (M3 spec S13.2).
-    fn start_rx_block_ack(&mut self, tid: u8, ssn: u16) -> Result<(), String>;
+    /// Program the AP's RX Block Ack agreement on `tid` from `ssn` with a
+    /// window of `window` (M3 spec S13.2), mac80211's
+    /// `IEEE80211_AMPDU_RX_START`. The host reorders what it delivers.
+    fn start_rx_block_ack(&mut self, tid: u8, ssn: u16, window: u16) -> Result<(), String>;
+    /// End the agreement on `tid`, `IEEE80211_AMPDU_RX_STOP`.
     fn stop_rx_block_ack(&mut self, tid: u8) -> Result<(), String>;
     /// The chip's own counts, naming no address.
     fn diagnostic(&self) -> String;

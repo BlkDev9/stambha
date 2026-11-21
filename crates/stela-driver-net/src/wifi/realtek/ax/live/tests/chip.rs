@@ -998,11 +998,11 @@ fn keyed_data_goes_under_its_cam_entry_and_pn() {
     assert_eq!(live.io().trace.len(), before);
     Chip::remove_key(&mut live, 0).unwrap();
     assert_eq!(Chip::transmit_data(&mut live, &keyed), unheld);
-    // RX Block Ack is accepted without the BA CAM (Task 16).
+    // RX Block Ack programs the BA CAM's entry and frees it (M3 Task 16).
     let before = live.io().trace.len();
-    assert_eq!(Chip::start_rx_block_ack(&mut live, 0, 0x123), Ok(()));
+    assert_eq!(Chip::start_rx_block_ack(&mut live, 0, 0x123, 64), Ok(()));
     assert_eq!(Chip::stop_rx_block_ack(&mut live, 0), Ok(()));
-    assert_eq!(live.io().trace.len(), before);
+    assert_eq!(kicks(&live.io().trace[before..]), 2);
     assert_eq!(Chip::mac(&live), Mac(MAC));
 }
 
@@ -1159,7 +1159,10 @@ fn a_powered_off_chip_refuses_every_call() {
     assert_eq!(Chip::remove_key(&mut live, 0), Err(dead.clone()));
     assert_eq!(Chip::flush(&mut live, true), Err(dead.clone()));
     assert_eq!(Chip::flush(&mut live, false), Err(dead.clone()));
-    assert_eq!(Chip::start_rx_block_ack(&mut live, 0, 0), Err(dead.clone()));
+    assert_eq!(
+        Chip::start_rx_block_ack(&mut live, 0, 0, 64),
+        Err(dead.clone())
+    );
     assert_eq!(Chip::stop_rx_block_ack(&mut live, 0), Err(dead));
     assert_eq!(live.io().trace.len(), off);
     assert!(Chip::diagnostic(&live).ends_with(", powered off"));

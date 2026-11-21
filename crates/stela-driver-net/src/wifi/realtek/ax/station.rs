@@ -42,13 +42,33 @@
 //!   spec S7.3) is taken under the key its key ID names, through the
 //!   station's replay and port checks, fragments reassembled and A-MSDUs
 //!   split as rtw88 takes them; protected management frames are opened on
-//!   the host when the hardware left them sealed.
+//!   the host when the hardware left them sealed. A retried unicast frame
+//!   of the AP's station repeating the last sequence control its counter
+//!   saw is a duplicate, dropped (`ieee80211_rx_h_check_dup`). Frames heard
+//!   after an accepted association response wait until the keeper
+//!   configures the association, as mac80211 takes the response,
+//!   `BSS_CHANGED_ASSOC` and all, before the next frame: an ADDBA Request or
+//!   EAPOL in the same poll then finds the station associated.
+//! - The AP's RX Block Ack agreements (spec S13.2) go through the station's
+//!   Block Ack layer as mac80211's `agg-rx.c` runs them, with A-MSDUs in
+//!   A-MPDUs and a window of at most `max_rx_agg_num`, 64: an agreement
+//!   accepted gets its reorder buffer, then the chip's RX_START
+//!   ([`chip::Chip::start_rx_block_ack`]), then its ADDBA Response, success
+//!   whatever the chip returned, as `rtw89_ops_ampdu_action` returns 0 and
+//!   the hardware's dynamic BA CAM covers an agreement without an entry.
+//!   QoS data from the AP on its TID is reordered
+//!   (`ieee80211_rx_reorder_ampdu`, the shared `Reorder`), a BAR releasing
+//!   what waits before its SSN; a DELBA, a replacement or the departure
+//!   stops it on the chip and drops what it held. Block Ack action frames
+//!   are robust: under PMF they come and go protected.
 //! - A departure leaves through the chip (spec S11), which releases its
 //!   channel. From an association, mac80211's `ieee80211_set_disassoc`
 //!   flushes first ([`chip::Chip::flush`] with drop, then without it after
-//!   a deauthentication of the station's own); each key is deleted after a
-//!   flush without drop, as `rtw89_ops_set_key`'s DISABLE_KEY flushes, the
-//!   PTK first, then the group keys, before the chip disassociates.
+//!   a deauthentication of the station's own); the agreements stop on the
+//!   chip without a DELBA (`ieee80211_sta_tear_down_BA_sessions`); each key
+//!   is deleted after a flush without drop, as `rtw89_ops_set_key`'s
+//!   DISABLE_KEY flushes, the PTK first, then the group keys, before the
+//!   chip disassociates.
 //!
 //! The radio polls (spec S1.4): it never signals, and the keeper services
 //! it from `carrier()` and `receive()`. Its diagnostic is the progress line
@@ -56,10 +76,22 @@
 //!
 //! This module does not grant: any cipher but CCMP-128 (TKIP, GCMP,
 //! CCMP-256, WEP), hardware-encrypted management frames
-//! (`hw_mgmt_tx_encrypt`), SAE, RX Block Ack and reordering, beacon loss,
-//! A-MSDU or aggregated TX, power save, templates, the watchdog, SA Query
-//! requests of its own, or following the AP's beacons and channel
-//! switches. The GTK is deleted before the chip disassociates, where Linux
+//! (`hw_mgmt_tx_encrypt`), SAE, beacon loss, A-MSDU or aggregated TX, power
+//! save, templates, the watchdog, SA Query requests of its own, or following
+//! the AP's beacons and channel switches. Of RX Block Ack it does not
+//! grant: an agreement's inactivity timeout
+//! (`sta_rx_agg_session_timer_expired`); the DELBA mac80211 sends for an
+//! aggregate on a TID without an agreement (`unexpected_agg`); ending an
+//! agreement for a fragment under it (fragments are reassembled, never
+//! reordered, as rtw88 takes them); mac80211's reorder timeout, as the
+//! shared `Reorder` releases after 100 ms on TIDs 0-3 and 40 ms on 4-7
+//! where `HT_RX_REORDER_BUF_TIMEOUT` is 100 ms for all; and two answers of
+//! mac80211 the station layer gives otherwise: an ADDBA Request repeated
+//! under its agreement's dialog token without a MAC retry is declined
+//! (mac80211 answers success), and one in an association without HT gets
+//! no answer (mac80211 declines it).
+//!
+//! The GTK is deleted before the chip disassociates, where Linux
 //! deletes a station's group key (a vif key in station mode, cfg.c's
 //! `ieee80211_add_key` without an address) only after cfg80211's
 //! disconnect (`__cfg80211_disconnected`'s `rdev_del_key` loop,
@@ -75,6 +107,7 @@ use crate::{
         Band, Channel, RadioStatus, RawRate, Timestamp,
         connection::keeper::{self, Advertisement, Keeper, Peer, Radio, Stage},
         frame::Mpdu,
+        mediatek::reorder::Reorder,
         network::Network,
         realtek::ccmp,
         regulatory::{channel::DISABLED, database::Country},
@@ -88,7 +121,7 @@ use crate::{
         },
         station::{
             Action, AssociationContext, Completion, Failure, Join, NativeBssObservation,
-            Phase as Peering, RegulatoryPolicy, Station, Ticket,
+            Phase as Peering, RegulatoryPolicy, Station, Ticket, ba,
             data::{self, Ingress, Protection, Qos, SequenceOwner, TxClass},
             external,
             fragments::Fragments,
@@ -122,6 +155,27 @@ const CCMP_HEADER: usize = 8;
 const MANAGEMENT_HEADER: usize = 24;
 /// What SAE gets in M3a (M3 Task 17).
 const SAE_BEFORE_M3B: &str = "SAE before M3b";
+/// 8852C's `max_rx_agg_num` (`rtw8852c.c:3157`), which rtw89 makes
+/// `max_rx_aggregation_subframes` (`core.c:7483`): an agreement's largest
+/// window.
+const RECEIVE_WINDOW: u16 = 64;
+/// A reorder clock of microseconds, as rtw88's.
+const REORDER_TICKS_PER_SECOND: u32 = 1_000_000;
+/// `WLAN_CATEGORY_BACK`.
+const BLOCK_ACK_CATEGORY: u8 = 3;
+/// The frames that wait behind an accepted association response, the
+/// newest dropped past it.
+const MAX_DEFERRED: usize = 64;
+/// `sta->last_seq_ctrl`: one counter per TID, and one for management and
+/// non-QoS data (`IEEE80211_NUM_TIDS + 1`).
+const SEQUENCES: usize = 17;
+/// `sta_info_alloc`'s `last_seq_ctrl`: the TIDs' at `USHRT_MAX`, the last
+/// counter's zeroed.
+const FRESH_SEQUENCES: [u16; SEQUENCES] = {
+    let mut fresh = [u16::MAX; SEQUENCES];
+    fresh[SEQUENCES - 1] = 0;
+    fresh
+};
 /// `ieee80211_add_wmm_info_ie`, without U-APSD.
 const WMM_ELEMENT: [u8; 9] = [221, 7, 0, 0x50, 0xf2, 2, 0, 1, 0];
 /// `rtw89_init_ht_cap` (`core.c:6063-6090`) at 20 MHz with two streams
@@ -418,6 +472,15 @@ pub struct Rtl8852c<C: Chip> {
     management_cipher: Option<ManagementCipher>,
     integrity: Option<BipKey>,
     fragments: Fragments,
+    /// The frames each TID's RX Block Ack agreement holds in order.
+    agreements: [Option<Reorder<Mpdu>>; 8],
+    /// Frames heard after an accepted association response, until the
+    /// keeper configures the association.
+    deferred: VecDeque<Mpdu>,
+    /// The AP's station, from the join until the station's retirement, and
+    /// its `last_seq_ctrl`.
+    ap: Option<Mac>,
+    last_sequence: [u16; SEQUENCES],
     port_open: bool,
     departing: Option<Ticket>,
     left: bool,
@@ -457,6 +520,10 @@ impl<C: Chip> Rtl8852c<C> {
             management_cipher: None,
             integrity: None,
             fragments: Fragments::default(),
+            agreements: Default::default(),
+            deferred: VecDeque::new(),
+            ap: None,
+            last_sequence: FRESH_SEQUENCES,
             port_open: false,
             departing: None,
             left: false,
@@ -552,6 +619,7 @@ impl<C: Chip> Rtl8852c<C> {
         self.admitted = None;
         self.outbox.clear();
         self.held.clear();
+        self.deferred.clear();
     }
 
     /// The station's state gone after its retirement, the keys with it. A
@@ -572,6 +640,12 @@ impl<C: Chip> Rtl8852c<C> {
         self.management_cipher = None;
         self.integrity = None;
         self.fragments.clear();
+        for tid in 0..self.agreements.len() {
+            self.close_agreement(tid);
+        }
+        self.deferred.clear();
+        self.ap = None;
+        self.last_sequence = FRESH_SEQUENCES;
     }
 
     /// A report the station no longer awaits, kept for the progress line.
@@ -751,11 +825,27 @@ impl<C: Chip> Rtl8852c<C> {
         self.send_data()
     }
 
-    /// What the chip handed on since the last poll, every item taken; then
-    /// the poll's own error, or the first an item gave.
+    /// What the chip handed on since the last poll, every item taken: once
+    /// the keeper configured the association, the frames deferred behind
+    /// its response first; then each item the chip handed on, a frame heard
+    /// while an accepted association response waits for the keeper
+    /// deferred. The first error a deferred frame, the poll or an item gave
+    /// is returned.
     fn take_incoming(&mut self, now: u64) -> Result<(), Error> {
+        let mut first = Ok(());
+        if self.admitted.is_none() {
+            for frame in core::mem::take(&mut self.deferred) {
+                let taken = self.take_frame(frame, now);
+                if first.is_ok() {
+                    first = taken;
+                }
+            }
+        }
         let mut incoming = Vec::new();
-        let mut first = Self::chip(self.chip.poll(&mut |item| incoming.push(item)));
+        let polled = Self::chip(self.chip.poll(&mut |item| incoming.push(item)));
+        if first.is_ok() {
+            first = polled;
+        }
         for item in incoming {
             let taken = match item {
                 Incoming::Transmitted {
@@ -763,15 +853,13 @@ impl<C: Chip> Rtl8852c<C> {
                     acknowledged,
                 } => self.transmitted(token, acknowledged, now),
                 Incoming::Frame(received) => match Self::mpdu(received) {
-                    Some(mpdu) => match self.frame(mpdu, now) {
-                        // mac80211 drops a frame the station cannot use;
-                        // the exchange it answers retries or times out.
-                        Err(Error::Station(_)) => {
-                            self.unsupported("a management frame the station refuses");
-                            Ok(())
+                    Some(mpdu) if self.admitted.is_some() => {
+                        if self.deferred.len() < MAX_DEFERRED {
+                            self.deferred.push_back(mpdu);
                         }
-                        taken => taken,
-                    },
+                        Ok(())
+                    }
+                    Some(mpdu) => self.take_frame(mpdu, now),
                     None => Ok(()),
                 },
                 Incoming::ScanEnded { completed } => self.scan_ended(completed),
@@ -783,6 +871,18 @@ impl<C: Chip> Rtl8852c<C> {
             }
         }
         first
+    }
+
+    /// [`Self::frame`]: mac80211 drops a frame the station cannot use, and
+    /// the exchange it answers retries or times out; reported once.
+    fn take_frame(&mut self, frame: Mpdu, now: u64) -> Result<(), Error> {
+        match self.frame(frame, now) {
+            Err(Error::Station(_)) => {
+                self.unsupported("a management frame the station refuses");
+                Ok(())
+            }
+            taken => taken,
+        }
     }
 
     /// A frame's release report: the ticketed management frame's goes to
@@ -877,14 +977,16 @@ impl<C: Chip> Rtl8852c<C> {
         Some(mpdu)
     }
 
-    /// rtw88's `frame` (`station.rs:1344`) without TKIP or Block Ack
-    /// reordering (spec S13.3): a scan's beacons and probe responses to the
-    /// scanner, management frames to [`Self::management_frame`], and data
-    /// with a body to the station, a protected frame under the key its key
-    /// ID names (pairwise for unicast, a group key for a group address),
+    /// rtw88's `frame` (`station.rs:1344`) without TKIP (spec S13.3): a
+    /// scan's beacons and probe responses to the scanner; then a duplicate
+    /// dropped ([`Self::duplicate`]); a Block Ack Request to the agreement it
+    /// names; management frames to [`Self::management_frame`]; and data with
+    /// a body to the station, a protected frame under the key its key ID
+    /// names (pairwise for unicast, a group key for a group address),
     /// dropped without one, failing its ICV, or left encrypted by the
     /// hardware (mac80211 would decrypt it in software; no Stela station
-    /// does). Fragments are reassembled.
+    /// does). Fragments are reassembled; other data goes through its
+    /// agreement's reorder buffer ([`Self::order`]).
     fn frame(&mut self, mut frame: Mpdu, now: u64) -> Result<(), Error> {
         let header = *frame.header();
         if let Some(ticket) = self.scanning
@@ -895,6 +997,12 @@ impl<C: Chip> Rtl8852c<C> {
                 self.hear(bss, now);
             }
             return Ok(());
+        }
+        if self.duplicate(&frame) {
+            return Ok(());
+        }
+        if header.control & 0xfc == 0x84 {
+            return self.block_ack_request(&frame, now);
         }
         if header.control & 12 == 0 {
             return self.management_frame(frame, now);
@@ -922,8 +1030,207 @@ impl<C: Chip> Rtl8852c<C> {
             self.reassemble(&frame, now);
             return Ok(());
         }
-        self.deliver(frame);
+        self.order(frame, now);
         Ok(())
+    }
+
+    /// `ieee80211_rx_h_check_dup` (`rx.c:1521-1576` at the donor's mac80211)
+    /// on the AP's station's `last_seq_ctrl`: for a unicast frame from the
+    /// AP joined that is neither a control frame nor a null function,
+    /// whether it is retried with the sequence control its counter last saw
+    /// (a duplicate, dropped); otherwise its sequence control becomes the
+    /// last. QoS data counts per TID, everything else on one counter
+    /// (`ieee80211_parse_qos`).
+    fn duplicate(&mut self, frame: &Mpdu) -> bool {
+        let header = frame.header();
+        let bytes = frame.bytes();
+        if bytes.len() < MANAGEMENT_HEADER
+            || header.control & 12 == 4
+            || matches!(header.control & 0xfc, 0x48 | 0xc8)
+            || header.receiver.is_multicast()
+            || self.ap.is_none()
+            || header.transmitter != self.ap
+        {
+            return false;
+        }
+        // A TID is four bits: 0-15.
+        let index = header.tid.map_or(SEQUENCES - 1, usize::from);
+        let control = u16::from_le_bytes([bytes[22], bytes[23]]);
+        if header.control & 0x0800 != 0 && self.last_sequence[index] == control {
+            return true;
+        }
+        self.last_sequence[index] = control;
+        false
+    }
+
+    /// `ieee80211_rx_reorder_ampdu` (`rx.c:1445-1518` at the donor's
+    /// mac80211), rtw88's `order` (`station.rs:1427`): QoS data from the AP
+    /// to the station on a TID under an agreement, unless sent without an
+    /// acknowledgement, goes through the agreement's reorder buffer
+    /// (`ieee80211_sta_manage_reorder_buf`), and what it releases goes on in
+    /// order; everything else goes on at once.
+    fn order(&mut self, frame: Mpdu, now: u64) {
+        let header = *frame.header();
+        let from_ap = self
+            .context
+            .as_ref()
+            .is_some_and(|context| header.transmitter == Some(context.peer()));
+        // IEEE80211_QOS_CTL_ACK_POLICY_NOACK, in the QoS control
+        // `ieee80211_get_qos_ctl` finds.
+        let qos_at = if header.control & 0x0300 == 0x0300 {
+            30
+        } else {
+            24
+        };
+        let acknowledged = frame
+            .bytes()
+            .get(qos_at)
+            .is_some_and(|qc| qc & 0x60 != 0x20);
+        let agreement = header
+            .tid
+            .filter(|_| from_ap && acknowledged && !header.receiver.is_multicast())
+            .and_then(|tid| self.agreements.get_mut(usize::from(tid)))
+            .and_then(Option::as_mut);
+        let (Some(agreement), Some(sequence)) = (agreement, header.sequence) else {
+            self.deliver(frame);
+            return;
+        };
+        let mut ready = Vec::new();
+        if let Err(rejected) =
+            agreement.push(sequence, now as u32, frame, |frame| ready.push(frame))
+        {
+            ready.push(rejected.frame);
+        }
+        for frame in ready {
+            self.deliver(frame);
+        }
+    }
+
+    /// `ieee80211_rx_h_ctrl`'s Block Ack Request, through the station's
+    /// Block Ack layer: from the associated AP for an agreement it holds,
+    /// what waits before its SSN is released at once; anything else is
+    /// dropped.
+    fn block_ack_request(&mut self, frame: &Mpdu, now: u64) -> Result<(), Error> {
+        let Some(epoch) = self.station.association_epoch() else {
+            return Ok(());
+        };
+        match self.station.receive_block_ack(epoch, frame, now) {
+            Ok(action) => self.block_ack(action),
+            Err(_) => Ok(()),
+        }
+    }
+
+    /// rtw88's `block_ack` (`station.rs:1671-1740`), the station's Block Ack
+    /// layer over mac80211's `agg-rx.c` with `rtw89_ops_ampdu_action`'s RX
+    /// half beneath (spec S13.2):
+    ///
+    /// - A start (`__ieee80211_start_rx_ba_session`): the reorder buffer for
+    ///   the agreement's window, then the chip's RX_START, then the
+    ///   agreement accepted and its ADDBA Response queued. The chip's error
+    ///   is returned after it, the agreement accepted all the same, as
+    ///   `rtw89_ops_ampdu_action` returns 0 whatever its H2C did. A window
+    ///   the host cannot hold is declined.
+    /// - A stop (`___ieee80211_stop_rx_ba_session`): the chip's RX_STOP,
+    ///   whose error is returned as mac80211 only logs it, then the buffer
+    ///   and what it held dropped (`ieee80211_free_tid_rx`), then the stop
+    ///   completed, which may bring a DELBA of the station's own or a
+    ///   replacement agreement.
+    /// - A frame to send: queued, protected under PMF, as Block Ack action
+    ///   frames are robust.
+    /// - A BAR: what waits before its SSN released.
+    fn block_ack(&mut self, action: ba::Action) -> Result<(), Error> {
+        match action {
+            ba::Action::Program {
+                ticket,
+                session,
+                enable: true,
+            } => {
+                let tid = session.tid();
+                let ssn = session.start_sequence();
+                let window = session.window().min(RECEIVE_WINDOW);
+                let mut chip = Ok(());
+                let completion = match Reorder::new(tid, ssn, window, REORDER_TICKS_PER_SECOND) {
+                    Ok(reorder) if usize::from(tid) < self.agreements.len() => {
+                        chip = Self::chip(self.chip.start_rx_block_ack(tid, ssn, window));
+                        self.agreements[usize::from(tid)] = Some(reorder);
+                        Completion::Accepted
+                    }
+                    _ => {
+                        self.unsupported("a Block Ack window the host cannot hold");
+                        Completion::RejectedAndIdle
+                    }
+                };
+                // SAFETY: the host alone holds the agreement's reorder state,
+                // which is ready for this ticket; rtw89 waits for no BA CAM
+                // acknowledgement (its H2C goes without a wait), and the
+                // hardware's dynamic BA CAM answers the AP without an entry.
+                let completed = unsafe { self.station.complete_rx_block_ack(ticket, completion) };
+                let next = completed.map_or(Ok(()), |action| self.block_ack(action));
+                chip.and(next)
+            }
+            ba::Action::Program {
+                ticket,
+                session,
+                enable: false,
+            } => {
+                let tid = session.tid();
+                let chip = Self::chip(self.chip.stop_rx_block_ack(tid));
+                self.close_agreement(usize::from(tid));
+                // SAFETY: the reorder buffer and what it held are gone, and
+                // no frame of the agreement is delivered after this.
+                let completed = unsafe {
+                    self.station
+                        .complete_rx_block_ack(ticket, Completion::Accepted)
+                };
+                let next = completed.map_or(Ok(()), |action| self.block_ack(action));
+                chip.and(next)
+            }
+            ba::Action::Transmit {
+                context, mut bytes, ..
+            } => {
+                if context.pmf().is_some()
+                    && let Some(fc1) = bytes.get_mut(1)
+                {
+                    *fc1 |= 0x40;
+                }
+                self.queue_management(None, bytes);
+                Ok(())
+            }
+            ba::Action::Bar {
+                session,
+                start_sequence,
+            } => {
+                let mut ready = Vec::new();
+                if let Some(Some(agreement)) = self.agreements.get_mut(usize::from(session.tid())) {
+                    let _ = agreement.bar(start_sequence, |frame| ready.push(frame));
+                }
+                for frame in ready {
+                    self.deliver(frame);
+                }
+                Ok(())
+            }
+            // No TX agreement is ever started (spec S1.13).
+            ba::Action::Tx(_) | ba::Action::None => Ok(()),
+        }
+    }
+
+    /// `ieee80211_free_tid_rx`: what the agreement on `tid` still held goes
+    /// with it.
+    fn close_agreement(&mut self, tid: usize) {
+        if let Some(mut agreement) = self.agreements.get_mut(tid).and_then(Option::take) {
+            agreement.stop();
+        }
+    }
+
+    /// `sta_rx_agg_reorder_timer_expired`, releasing what waited too long.
+    fn release_expired(&mut self, now: u64) {
+        let mut ready = Vec::new();
+        for agreement in self.agreements.iter_mut().flatten() {
+            let _ = agreement.poll(now as u32, |frame| ready.push(frame));
+        }
+        for frame in ready {
+            self.deliver(frame);
+        }
     }
 
     /// rtw88's `reassemble` (`station.rs:1415`): `frame`, one fragment;
@@ -1008,14 +1315,16 @@ impl<C: Chip> Rtl8852c<C> {
     }
 
     /// rtw88's `management_frame` (`station.rs:1514`): what the station's
-    /// authentication and association take, and the AP's departures; a
-    /// protected frame to [`Self::protected_management`]. Under PMF a
-    /// robust frame to everyone must carry its IGTK's MIC (BIP on the host)
-    /// and a departure to the station alone must come protected once keys
-    /// are installed (`ieee80211_drop_unencrypted_mgmt`). Beacons and
-    /// probe responses outside a scan and unprotected action frames (Block
-    /// Ack is M3 Task 16's; channel switches are not followed) are dropped,
-    /// as is everything before a join.
+    /// authentication and association take, the AP's departures, and its
+    /// Block Ack action frames; a protected frame to
+    /// [`Self::protected_management`]. Under PMF a robust frame to everyone
+    /// must carry its IGTK's MIC (BIP on the host), a departure to the
+    /// station alone must come protected once keys are installed, and a
+    /// Block Ack action frame always (`ieee80211_drop_unencrypted_mgmt`,
+    /// which the station's Block Ack layer applies). Beacons and probe
+    /// responses outside a scan and other unprotected action frames (channel
+    /// switches are not followed) are dropped, as is everything before a
+    /// join.
     fn management_frame(&mut self, frame: Mpdu, now: u64) -> Result<(), Error> {
         let header = *frame.header();
         let subtype = header.control & 0xfc;
@@ -1023,14 +1332,22 @@ impl<C: Chip> Rtl8852c<C> {
             return Ok(());
         }
         if header.protected() {
-            return self.protected_management(frame);
+            return self.protected_management(frame, now);
         }
-        if subtype == 0xd0 || self.station.phase() == Peering::ExternalAuthenticating {
+        if self.station.phase() == Peering::ExternalAuthenticating {
             return Ok(());
         }
         let Some(epoch) = self.station.association_epoch() else {
             return Ok(());
         };
+        if subtype == 0xd0 {
+            if frame.bytes().get(header.length) == Some(&BLOCK_ACK_CATEGORY)
+                && let Ok(action) = self.station.receive_block_ack(epoch, &frame, now)
+            {
+                return self.block_ack(action);
+            }
+            return Ok(());
+        }
         let pmf = self.station.requires_protected_management();
         if pmf && header.receiver.is_multicast() && protection::robust(&frame) {
             let Some(integrity) = &mut self.integrity else {
@@ -1067,13 +1384,14 @@ impl<C: Chip> Rtl8852c<C> {
         Ok(())
     }
 
-    /// rtw88's `protected_management` (`station.rs:1598`) without Block
-    /// Ack (M3 Task 16) or channel switches: a frame under the PTK, opened
-    /// on the host when the hardware left it sealed, taken once under its
-    /// packet number (`ieee80211_crypto_ccmp_decrypt` keeps management's
-    /// apart from data's); a departure ends the association, and an SA
-    /// Query request is answered, sealed in turn.
-    fn protected_management(&mut self, mut frame: Mpdu) -> Result<(), Error> {
+    /// rtw88's `protected_management` (`station.rs:1598`) without channel
+    /// switches: a frame under the PTK, opened on the host when the
+    /// hardware left it sealed, taken once under its packet number
+    /// (`ieee80211_crypto_ccmp_decrypt` keeps management's apart from
+    /// data's); a departure ends the association, a Block Ack action frame
+    /// goes to the station's Block Ack layer, and an SA Query request is
+    /// answered, sealed in turn.
+    fn protected_management(&mut self, mut frame: Mpdu, now: u64) -> Result<(), Error> {
         let local = self.address;
         let Some(epoch) = self.station.association_epoch() else {
             return Ok(());
@@ -1120,6 +1438,17 @@ impl<C: Chip> Rtl8852c<C> {
                     .map_err(Error::Station)?;
                 self.events.push_back(keeper::Event::ConnectionLost);
                 self.act(action);
+            }
+            0xd0 if body.first() == Some(&BLOCK_ACK_CATEGORY) => {
+                let Some(context) = self.context.clone() else {
+                    return Ok(());
+                };
+                if let Ok(action) = self
+                    .station
+                    .receive_authenticated_block_ack(&context, &frame, body, now)
+                {
+                    return self.block_ack(action);
+                }
             }
             0xd0 if body.len() >= 4 && body[..2] == [8, 0] => {
                 let response = [8, 1, body[2], body[3]];
@@ -1173,6 +1502,7 @@ impl<C: Chip> Rtl8852c<C> {
     fn operate(&mut self) -> Result<(), Error> {
         let now = self.clock.now_us();
         let mut first = self.take_incoming(now);
+        self.release_expired(now);
         let mut policy = Admitted(&self.channels);
         if !self.left {
             match self.station.poll(now, &mut policy) {
@@ -1289,6 +1619,9 @@ impl<C: Chip> Rtl8852c<C> {
         Self::chip(self.chip.tune(bss.channel))?;
         Self::chip(self.chip.set_bssid(bss.bssid))?;
         self.peer = Some(peer);
+        // The AP's station, new (`sta_info_alloc`).
+        self.ap = Some(bss.bssid);
+        self.last_sequence = FRESH_SEQUENCES;
         self.management_cipher = join.request.pmf().map(|pmf| pmf.management());
         self.progress.auth.get_or_insert_default();
         let now = self.clock.now_us();
@@ -1307,6 +1640,7 @@ impl<C: Chip> Rtl8852c<C> {
             Err(error) => {
                 // No station began: the BSSID goes again, so a scan may run.
                 self.peer = None;
+                self.ap = None;
                 let _ = self.chip.disassociate();
                 Err(Error::Station(error))
             }
@@ -1315,18 +1649,26 @@ impl<C: Chip> Rtl8852c<C> {
 
     /// rtw88's `configure` (`station.rs:2113`) on rtw89 (spec S14.5): the
     /// chip's association on the join's channel, without a switch of the
-    /// radio's own, then the station configured. RX Block Ack is M3 Task
-    /// 16's.
+    /// radio's own, then the station configured, and with HT its RX Block
+    /// Ack limits: `max_rx_agg_num` and A-MSDUs in A-MPDUs
+    /// (`SUPPORTS_AMSDU_IN_AMPDU`, `core.c:7500`). No TX agreement is
+    /// configured (spec S1.13).
     fn configure_admitted(&mut self) -> Result<(), Error> {
         let (ticket, context) = self
             .admitted
             .take()
             .ok_or(Error::Refused("configuration"))?;
         Self::chip(self.chip.associate(&association(&context)))?;
+        let ht = context.negotiated().ht.is_some();
         self.context = Some(context);
         self.station
             .complete_configuration(ticket, Completion::Accepted, self.clock.now_us())
             .map_err(Error::Station)?;
+        if ht {
+            self.station
+                .configure_rx_block_ack(RECEIVE_WINDOW, true)
+                .map_err(|_| Error::Refused("Block Ack limits"))?;
+        }
         self.progress.eapol.get_or_insert_default();
         Ok(())
     }
@@ -1366,18 +1708,31 @@ impl<C: Chip> Rtl8852c<C> {
     }
 
     /// rtw88's `retire_peer` (`station.rs:2311`) on rtw89 (spec S14.5):
-    /// `sta_info_flush`'s key deletes first, the PTK, then the group keys by
-    /// key ID, each as `rtw89_ops_set_key`'s DISABLE_KEY runs it, a flush
-    /// without drop, then the CAM delete (`mac80211.c:1010-1015`); then the
-    /// chip's disassociation (spec S11), which releases the channel; then
-    /// the removal is accepted. Every step runs whatever an earlier one
+    /// `sta_info_flush`'s `__sta_info_destroy_part1` first stops each RX
+    /// Block Ack agreement on the chip without a DELBA and drops what it
+    /// held (`ieee80211_sta_tear_down_BA_sessions(AGG_STOP_DESTROY_STA)`,
+    /// `sta_info.c:1348` at the donor's mac80211); then `_part2`'s key
+    /// deletes, the PTK, then the group keys by key ID, each as
+    /// `rtw89_ops_set_key`'s DISABLE_KEY runs it, a flush without drop, then
+    /// the CAM delete (`mac80211.c:1010-1015`); then the chip's
+    /// disassociation (spec S11), which releases the channel; then the
+    /// removal is accepted. Every step runs whatever an earlier one
     /// returned, as mac80211 goes on past a driver's failures, and the
     /// first error is returned. A failed disassociation powered the chip
     /// off, which holds no association either.
     fn retire(&mut self) -> Result<(), Error> {
+        let mut first = Ok(());
+        for tid in 0..self.agreements.len() {
+            if self.agreements[tid].is_some() {
+                let stopped = Self::chip(self.chip.stop_rx_block_ack(tid as u8));
+                self.close_agreement(tid);
+                if first.is_ok() {
+                    first = stopped;
+                }
+            }
+        }
         let mut keys = core::mem::take(&mut self.keys);
         keys.sort_by_key(|key| (!key.pairwise, key.index));
-        let mut first = Ok(());
         for key in &keys {
             let _ = self.chip.flush(false);
             let removed = Self::chip(self.chip.remove_key(key.cam));

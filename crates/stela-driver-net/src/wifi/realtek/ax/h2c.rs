@@ -22,7 +22,8 @@
 //! `rtw89_fw_h2c_set_edca` (`fw.c:5241-5276`). For the keys (M3 spec S12):
 //! `rtw89_cam_send_sec_key_cmd`'s SEC_UPD (`cam.c:11-99`) and
 //! `rtw89_fw_h2c_dctl_sec_cam_v1` (`fw.c:2346-2382`). For a flush with drop:
-//! `rtw89_fw_h2c_pkt_drop` (`fw.c:10621-10676`).
+//! `rtw89_fw_h2c_pkt_drop` (`fw.c:10621-10676`). For RX Block Ack (M3 spec
+//! S13.2): `rtw89_fw_h2c_ba_cam` (`fw.c:2574-2651`) in 8852C's V0_EXT form.
 //!
 //! Each of those is fixed to the one station interface of milestone 2c's
 //! spec: wifi role STATION, self role CLIENT, MAC 0, PHY 0, address CAM 0
@@ -333,6 +334,43 @@ impl H2c {
     pub fn ba_cam_init(&mut self, entry: u8, uid: u8) -> (u8, Vec<u8>) {
         let w0 = field(1, 0, 0);
         let w1 = field(u32::from(entry), 31, 28) | field(u32::from(uid), 7, 0);
+        self.packet(
+            H2C_CAT_MAC,
+            H2C_CL_BA_CAM,
+            H2C_FUNC_MAC_BA_CAM,
+            true,
+            &le_words(&[w0, w1]),
+        )
+    }
+
+    /// `rtw89_fw_h2c_ba_cam(valid = start)` (M3 spec S13.2, `fw.c:2574-2651`)
+    /// in 8852C's `RTW89_BACAM_V0_EXT` form, for static BA CAM entry `entry`
+    /// of station `macid` on band 0: MAC / BA_CAM / BA_CAM, rack 0, dack 1,
+    /// 8 bytes (bits `fw.h:1925-1935`). w0 = MACID [15:8]; w1 =
+    /// ENTRY_IDX_V1 [31:28]. Only when starting, as Linux's `goto end` skips
+    /// the rest: w0 also VALID b0 | TID [7:4] | BMAP_SIZE [19:16], 4 for a
+    /// `window` past 64, else 0 | INIT_REQ b1, the hardware then taking the
+    /// SSN | SSN [31:20]; w1 also STD_EN b8 | BAND b9 = `mac_idx` 0.
+    pub fn ba_cam(
+        &mut self,
+        macid: u8,
+        tid: u8,
+        ssn: u16,
+        window: u16,
+        entry: u8,
+        start: bool,
+    ) -> (u8, Vec<u8>) {
+        let mut w0 = field(u32::from(macid), 15, 8);
+        let mut w1 = field(u32::from(entry), 31, 28);
+        if start {
+            let bmap = if window > 64 { 4 } else { 0 };
+            w0 |= field(1, 0, 0)
+                | field(u32::from(tid), 7, 4)
+                | field(bmap, 19, 16)
+                | field(1, 1, 1)
+                | field(u32::from(ssn), 31, 20);
+            w1 |= field(1, 8, 8) | field(0, 9, 9);
+        }
         self.packet(
             H2C_CAT_MAC,
             H2C_CL_BA_CAM,

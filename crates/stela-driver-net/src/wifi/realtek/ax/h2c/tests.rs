@@ -800,3 +800,36 @@ fn pkt_drop_is_byte_exact() {
     let (_, p) = H2c::at(1).pkt_drop(3, 0x7F, 2);
     assert_eq!(word(&body(&p).1[8..], 0), 0x0200_7F03);
 }
+
+#[test]
+fn ba_cam_start_and_stop_bytes() {
+    // rtw89_fw_h2c_ba_cam (fw.c:2574-2651), 8852C's V0_EXT: MAC / BA_CAM
+    // (0xC) / BA_CAM (0), rack 0, dack 1, 8 bytes (spec S13.2).
+    let (seq, p) = H2c::at(17).ba_cam(0, 0, 0x123, 64, 0, true);
+    assert_eq!(seq, 17);
+    let (len, b) = body(&p);
+    assert_eq!(len, 16);
+    assert_eq!(&b[..8], &[0x31, 0x00, 0x00, 17, 0x10, 0x80, 0x00, 0x00]);
+    // w0 = VALID | INIT_REQ | TID 0 << 4 | BMAP 0 | SSN << 20; w1 = STD_EN
+    // b8 | band 0 | entry 0 << 28.
+    assert_eq!(&b[8..], &[0x03, 0x00, 0x30, 0x12, 0x00, 0x01, 0x00, 0x00]);
+    // Stopping: macid and entry alone.
+    let (_, p) = H2c::at(18).ba_cam(0, 0, 0x123, 64, 0, false);
+    assert_eq!(&body(&p).1[8..], &[0; 8]);
+    // Every field placed and masked: macid [15:8], TID [7:4], a window past
+    // 64 is BMAP_SIZE 4 [19:16], the SSN's 12 bits [31:20], entry [31:28].
+    let (_, p) = H2c::at(19).ba_cam(0x7F, 5, 0xFFF, 65, 7, true);
+    let b = body(&p).1;
+    assert_eq!(
+        (word(&b[8..], 0), word(&b[8..], 1)),
+        (0xFFF4_7F53, 0x7000_0100)
+    );
+    let (_, p) = H2c::at(20).ba_cam(3, 5, 0xFFF, 65, 7, false);
+    let b = body(&p).1;
+    // Seq 20 takes the every-fourth REC_ACK.
+    assert_eq!(&b[..8], &[0x31, 0x00, 0x00, 20, 0x10, 0xC0, 0x00, 0x00]);
+    assert_eq!(
+        (word(&b[8..], 0), word(&b[8..], 1)),
+        (0x0000_0300, 0x7000_0000)
+    );
+}

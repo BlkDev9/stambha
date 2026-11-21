@@ -59,6 +59,7 @@
 //! channel rules.
 pub mod assoc;
 pub mod attach;
+pub mod ba;
 pub mod bb;
 pub mod bringup;
 pub mod c2h;

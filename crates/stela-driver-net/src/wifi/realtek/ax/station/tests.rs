@@ -122,6 +122,13 @@ enum Call {
     RemoveKey(u8),
     /// mac80211's flush, with drop or without.
     Flush(bool),
+    /// `rtw89_ops_ampdu_action`'s RX_START and RX_STOP.
+    StartBa {
+        tid: u8,
+        ssn: u16,
+        window: u16,
+    },
+    StopBa(u8),
 }
 
 /// What the chip was told, and what it holds for the host.
@@ -160,6 +167,11 @@ struct Air {
     late_auth_report: bool,
     /// Reports held for [`Air::late_auth_report`].
     late: Vec<Incoming>,
+    /// The AP asks for a Block Ack agreement right after its association
+    /// response, heard in the same poll.
+    addba_with_assoc: bool,
+    /// The chip cannot send its BA CAM H2C.
+    ba_fails: bool,
 }
 
 impl Air {
@@ -211,6 +223,9 @@ impl Air {
                         body.extend(WMM);
                     }
                     self.hear(management(0x10, &body));
+                    if self.addba_with_assoc {
+                        self.hear(addba(1, 0, 64, 0));
+                    }
                 }
                 _ => {}
             }
@@ -433,10 +448,17 @@ impl Chip for Model {
         self.0.borrow_mut().calls.push(Call::Flush(drop));
         Ok(())
     }
-    fn start_rx_block_ack(&mut self, _: u8, _: u16) -> Result<(), String> {
+    /// Recorded, then refused when the BA CAM H2C cannot be sent.
+    fn start_rx_block_ack(&mut self, tid: u8, ssn: u16, window: u16) -> Result<(), String> {
+        let mut air = self.0.borrow_mut();
+        air.calls.push(Call::StartBa { tid, ssn, window });
+        if air.ba_fails {
+            return Err("the BA CAM H2C could not be sent".into());
+        }
         Ok(())
     }
-    fn stop_rx_block_ack(&mut self, _: u8) -> Result<(), String> {
+    fn stop_rx_block_ack(&mut self, tid: u8) -> Result<(), String> {
+        self.0.borrow_mut().calls.push(Call::StopBa(tid));
         Ok(())
     }
     fn diagnostic(&self) -> String {
@@ -1402,6 +1424,7 @@ fn leaving(air: &Air, from: usize) -> Vec<String> {
             Call::RemoveKey(cam) => Some(alloc::format!("remove {cam}")),
             Call::Disassociate => Some(String::from("leave")),
             Call::AddKey { .. } => Some(String::from("add")),
+            Call::StopBa(tid) => Some(alloc::format!("stop {tid}")),
             _ => None,
         })
         .collect()
@@ -1626,4 +1649,367 @@ fn a_pairwise_rekey_drops_what_waits_under_the_old_key() {
         .map(|(bytes, key)| (bytes[36], *key))
         .collect();
     assert_eq!(sent, [(2, Some((0, 0, 1)))]);
+}
+
+// RX Block Ack (M3 Task 16, spec S13.2).
+
+/// The AP's ADDBA Request: dialog `dialog`, immediate Block Ack on `tid`
+/// with a window of `window`, no timeout, from `ssn`.
+fn addba(dialog: u8, tid: u8, window: u16, ssn: u16) -> Vec<u8> {
+    let parameters = 2 | u16::from(tid) << 2 | window << 6;
+    let mut body = vec![3, 0, dialog];
+    body.extend(parameters.to_le_bytes());
+    body.extend(0u16.to_le_bytes());
+    body.extend((ssn << 4).to_le_bytes());
+    management(0xd0, &body)
+}
+
+/// The AP's DELBA of its agreement on `tid`, as its originator, reason 37
+/// (any reason does).
+fn delba(tid: u8) -> Vec<u8> {
+    let parameters = u16::from(tid) << 12 | 1 << 11;
+    let mut body = vec![3, 2];
+    body.extend(parameters.to_le_bytes());
+    body.extend(37u16.to_le_bytes());
+    management(0xd0, &body)
+}
+
+/// The AP's compressed single-TID Block Ack Request for `tid` from `ssn`.
+fn bar(tid: u8, ssn: u16) -> Vec<u8> {
+    let mut frame = vec![0x84, 0, 0, 0];
+    frame.extend(LOCAL);
+    frame.extend(AP);
+    frame.extend((u16::from(tid) << 12 | 4).to_le_bytes());
+    frame.extend((ssn << 4).to_le_bytes());
+    frame
+}
+
+/// QoS data of `tid` under the PTK at packet number `pn`, sequence number
+/// `sequence`, its first payload byte past the IPv4 type `fill`.
+fn qos(tid: u8, sequence: u16, pn: u64, fill: u8) -> Vec<u8> {
+    let mut frame = protected(LOCAL, sequence, 0, pn, &[fill; 46]);
+    frame[24] = tid;
+    frame
+}
+
+/// `frame`, a management frame, protected at packet number `pn` as the
+/// hardware leaves it decrypted: its CCMP header in place, its MIC zeros.
+fn sealed(mut frame: Vec<u8>, pn: u8) -> Vec<u8> {
+    frame[1] |= 0x40;
+    frame.splice(24..24, [pn, 0, 0, 0x20, 0, 0, 0, 0]);
+    frame.extend([0; 8]);
+    frame
+}
+
+/// The station's ADDBA Responses (category 3, action 1), unprotected.
+fn responses(air: &Air) -> Vec<Vec<u8>> {
+    air.management(0xd0)
+        .into_iter()
+        .filter(|frame| frame[24..26] == [3, 1])
+        .collect()
+}
+
+/// The chip's RX Block Ack calls from call `from` on.
+fn agreements(air: &Air, from: usize) -> Vec<Call> {
+    air.calls[from..]
+        .iter()
+        .filter(|c| matches!(c, Call::StartBa { .. } | Call::StopBa(_)))
+        .cloned()
+        .collect()
+}
+
+/// [`connected`], then the AP's agreement on TID 0 from SSN 100 accepted.
+fn aggregating() -> (Wifi<Model>, Model) {
+    let (mut wifi, model) = connected();
+    model.0.borrow_mut().hear(addba(1, 0, 64, 100));
+    assert!(run(&mut wifi, &model, |_, air| responses(air).len() == 1));
+    (wifi, model)
+}
+
+#[test]
+fn an_addba_is_accepted_programmed_and_reorders() {
+    let (mut wifi, model) = connected();
+    let from = model.0.borrow().calls.len();
+    model.0.borrow_mut().hear(addba(1, 0, 64, 100));
+    assert!(run(&mut wifi, &model, |_, air| !responses(air).is_empty()));
+    {
+        let air = model.0.borrow();
+        // rtw89_ops_ampdu_action's RX_START programs the BA CAM (spec
+        // S13.2) before mac80211 answers (agg-rx.c's
+        // __ieee80211_start_rx_ba_session).
+        let start = air
+            .position(|c| {
+                *c == Call::StartBa {
+                    tid: 0,
+                    ssn: 100,
+                    window: 64,
+                }
+            })
+            .unwrap();
+        let answer = air
+            .position(|c| matches!(c, Call::Management(b, _) if b[0] == 0xd0))
+            .unwrap();
+        assert!(from <= start && start < answer);
+        let [response] = &responses(&air)[..] else {
+            panic!("{} responses", responses(&air).len())
+        };
+        // To the AP: ADDBA Response, dialog 1, success, A-MSDU | immediate |
+        // TID 0 | a window of 64, no timeout.
+        assert_eq!(response[4..10], AP);
+        assert_eq!(response[24..33], [3, 1, 1, 0, 0, 0x03, 0x10, 0, 0]);
+        assert_eq!(agreements(&air, from).len(), 1);
+    }
+    // Out of order on TID 0, delivered in order: each passes the replay
+    // check, which an earlier packet number delivered last would fail.
+    let hear = |frame: Vec<u8>| model.0.borrow_mut().hear_as(frame, true, false);
+    hear(qos(0, 101, 11, 0x51));
+    hear(qos(0, 100, 10, 0x50));
+    hear(qos(0, 102, 12, 0x52));
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x50, 0x51, 0x52]);
+    // A hole holds what follows it until the reorder timeout releases it.
+    hear(qos(0, 104, 14, 0x54));
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), []);
+    let mut got = Vec::new();
+    let mut waited = 0;
+    while got.is_empty() && waited < 200_000 {
+        crate::test_clock::advance(CLOCK, 5_000);
+        waited += 5_000;
+        wifi.carrier();
+        got.extend(delivered(&mut wifi));
+    }
+    assert_eq!(got, [0x54]);
+    // TID 0's 100 ms, as HT_RX_REORDER_BUF_TIMEOUT's, of which the virtual
+    // clock's own reads (100 us each) took some.
+    assert!((80_000..=110_000).contains(&waited), "{waited}");
+    // Another TID is not reordered.
+    hear(qos(6, 7, 1, 0x61));
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x61]);
+}
+
+#[test]
+fn a_delba_stops_the_entry() {
+    let (mut wifi, model) = aggregating();
+    let hear = |frame: Vec<u8>| model.0.borrow_mut().hear_as(frame, true, false);
+    // SSN 102 waits for 100 and 101.
+    hear(qos(0, 102, 12, 0x52));
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), []);
+    let from = model.0.borrow().calls.len();
+    model.0.borrow_mut().hear(delba(0));
+    wifi.carrier();
+    // RX_STOP frees the BA CAM entry; the AP's own DELBA is not answered.
+    assert_eq!(agreements(&model.0.borrow(), from), [Call::StopBa(0)]);
+    let ours = model.0.borrow().calls[from..]
+        .iter()
+        .filter(|c| matches!(c, Call::Management(b, _) if b[0] == 0xd0))
+        .count();
+    assert_eq!(ours, 0);
+    // What the agreement held went with it (ieee80211_free_tid_rx), past
+    // any reorder timeout.
+    for _ in 0..30 {
+        run(&mut wifi, &model, |_, _| true);
+    }
+    assert_eq!(delivered(&mut wifi), []);
+    // TID 0 now goes as it comes: the earlier packet number arriving second
+    // fails the replay check.
+    hear(qos(0, 111, 21, 0x61));
+    hear(qos(0, 110, 20, 0x60));
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x61]);
+    // A new agreement on the TID is programmed again.
+    let from = model.0.borrow().calls.len();
+    model.0.borrow_mut().hear(addba(2, 0, 32, 200));
+    assert!(run(&mut wifi, &model, |_, air| responses(air).len() == 2));
+    assert_eq!(
+        agreements(&model.0.borrow(), from),
+        [Call::StartBa {
+            tid: 0,
+            ssn: 200,
+            window: 32
+        }]
+    );
+}
+
+#[test]
+fn a_bar_releases_what_waits_before_its_ssn() {
+    let (mut wifi, model) = aggregating();
+    model
+        .0
+        .borrow_mut()
+        .hear_as(qos(0, 102, 12, 0x52), true, false);
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), []);
+    // ieee80211_rx_h_ctrl: the BAR moves the window to its SSN at once.
+    model.0.borrow_mut().hear(bar(0, 102));
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x52]);
+}
+
+#[test]
+fn the_departure_stops_each_agreement_before_the_keys() {
+    // __sta_info_destroy_part1's ieee80211_sta_tear_down_BA_sessions
+    // (AGG_STOP_DESTROY_STA: RX_STOP for each, no DELBA) before
+    // _part2's key deletes and the AP's station leaving.
+    let (mut wifi, model) = aggregating();
+    model.0.borrow_mut().hear(addba(2, 6, 64, 0));
+    assert!(run(&mut wifi, &model, |_, air| responses(air).len() == 2));
+    let from = model.0.borrow().calls.len();
+    wifi.radio_mut().deauthenticate(3).unwrap();
+    assert!(run(&mut wifi, &model, |_, air| {
+        air.position(|c| *c == Call::Disassociate).is_some()
+    }));
+    assert_eq!(
+        leaving(&model.0.borrow(), from),
+        [
+            "flush true",
+            "mgmt c0",
+            "flush false",
+            "stop 0",
+            "stop 6",
+            "flush false",
+            "remove 0",
+            "flush false",
+            "remove 1",
+            "leave"
+        ]
+    );
+    // The next association starts with none.
+    let from = model.0.borrow().calls.len();
+    assert!(run(&mut wifi, &model, |wifi, air| {
+        air.count(|c| matches!(c, Call::Associate(_))) == 2
+            && wifi.radio().station().phase() == Peering::Associated
+    }));
+    assert!(agreements(&model.0.borrow(), from).is_empty());
+}
+
+#[test]
+fn an_addba_with_the_association_response_is_answered_once_associated() {
+    // The AP asks in the poll that brings its association response.
+    // mac80211 takes the response, BSS_CHANGED_ASSOC and all, before the
+    // next frame, so the request finds the station associated.
+    let (mut wifi, model) = wifi_with(|air| air.addba_with_assoc = true);
+    assert!(run(&mut wifi, &model, |_, air| !responses(air).is_empty()));
+    let air = model.0.borrow();
+    let associate = air.position(|c| matches!(c, Call::Associate(_))).unwrap();
+    let start = air
+        .position(|c| matches!(c, Call::StartBa { tid: 0, .. }))
+        .unwrap();
+    assert!(associate < start);
+    assert_eq!(responses(&air)[0][27..29], [0, 0]);
+}
+
+#[test]
+fn a_retried_addba_is_dropped_as_a_duplicate() {
+    // ieee80211_rx_h_check_dup: the AP retries the same frame when our ACK
+    // was lost; answering it again would decline the agreement just made.
+    let (mut wifi, model) = connected();
+    let mut request = addba(1, 0, 64, 100);
+    request[22..24].copy_from_slice(&(7u16 << 4).to_le_bytes());
+    model.0.borrow_mut().hear(request.clone());
+    assert!(run(&mut wifi, &model, |_, air| responses(air).len() == 1));
+    request[1] |= 0x08;
+    model.0.borrow_mut().hear(request);
+    for _ in 0..3 {
+        run(&mut wifi, &model, |_, _| true);
+    }
+    assert_eq!(responses(&model.0.borrow()).len(), 1);
+    assert_eq!(
+        model
+            .0
+            .borrow()
+            .count(|c| matches!(c, Call::StartBa { .. })),
+        1
+    );
+    // A retry of another frame is no duplicate.
+    let mut next = addba(2, 6, 64, 0);
+    next[1] |= 0x08;
+    next[22..24].copy_from_slice(&(8u16 << 4).to_le_bytes());
+    model.0.borrow_mut().hear(next);
+    assert!(run(&mut wifi, &model, |_, air| responses(air).len() == 2));
+    assert_eq!(responses(&model.0.borrow())[1][27..29], [0, 0]);
+}
+
+#[test]
+fn a_chip_that_cannot_program_the_ba_cam_still_accepts() {
+    // rtw89_ops_ampdu_action returns 0 whatever its BA CAM H2C did: the
+    // hardware's dynamic BA CAM covers the agreement (fw.c:2592-2600), and
+    // the host reorders. The chip's error is reported, not fatal.
+    let (mut wifi, model) = connected();
+    model.0.borrow_mut().ba_fails = true;
+    model.0.borrow_mut().hear(addba(1, 0, 64, 100));
+    assert!(run(&mut wifi, &model, |_, air| responses(air).len() == 1));
+    assert_eq!(responses(&model.0.borrow())[0][27..29], [0, 0]);
+    let Err(LinkError::Adapter(failure)) = wifi.receive() else {
+        panic!("no failure")
+    };
+    assert!(
+        failure.contains("the BA CAM H2C could not be sent"),
+        "{failure}"
+    );
+    let hear = |frame: Vec<u8>| model.0.borrow_mut().hear_as(frame, true, false);
+    hear(qos(0, 101, 11, 0x51));
+    hear(qos(0, 100, 10, 0x50));
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x50, 0x51]);
+    assert!(wifi.carrier());
+}
+
+#[test]
+fn under_pmf_the_agreement_comes_and_goes_protected() {
+    // Block Ack action frames are robust: an unprotected request is dropped
+    // (ieee80211_drop_unencrypted_mgmt), a protected one answered sealed
+    // under the PTK.
+    let (mut wifi, model) = connected_with_pmf();
+    let ptk = model.0.borrow().ptk();
+    model.0.borrow_mut().hear(addba(1, 0, 64, 100));
+    for _ in 0..3 {
+        run(&mut wifi, &model, |_, _| true);
+    }
+    assert!(model.0.borrow().management(0xd0).is_empty());
+    model
+        .0
+        .borrow_mut()
+        .hear_as(sealed(addba(2, 0, 64, 100), 1), true, false);
+    assert!(run(&mut wifi, &model, |_, air| !air
+        .management(0xd0)
+        .is_empty()));
+    let air = model.0.borrow();
+    let [response] = &air.management(0xd0)[..] else {
+        panic!("{} action frames", air.management(0xd0).len())
+    };
+    assert_eq!(response[1] & 0x40, 0x40);
+    let opened = ccmp::open(&ptk, response, PacketNumber::new(1).unwrap()).unwrap();
+    assert_eq!(opened[32..41], [3, 1, 2, 0, 0, 0x03, 0x10, 0, 0]);
+    assert!(
+        air.position(|c| matches!(c, Call::StartBa { tid: 0, .. }))
+            .is_some()
+    );
+}
+
+#[test]
+fn only_the_aps_acknowledged_qos_data_is_reordered() {
+    // ieee80211_rx_reorder_ampdu: the agreement is the AP's station's (its
+    // TA), and a frame sent with no acknowledgement is no part of it.
+    let (mut wifi, model) = aggregating();
+    let hear = |frame: Vec<u8>| model.0.borrow_mut().hear_as(frame, true, false);
+    // SSN 102 waits for 100 and 101.
+    hear(qos(0, 102, 12, 0x52));
+    // Far ahead of the window, from another transmitter: it would flush
+    // the window if it went in; it goes on to the station, which refuses it.
+    let mut foreign = qos(0, 400, 40, 0x70);
+    foreign[10..16].copy_from_slice(&[0x02, 0xAA, 0, 0, 0, 9]);
+    hear(foreign);
+    // Far ahead too, sent without an acknowledgement: on at once.
+    let mut unacked = qos(0, 500, 11, 0x71);
+    unacked[24] |= 0x20;
+    hear(unacked);
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x71]);
+    // 102 still waited for its hole, and goes at the BAR.
+    model.0.borrow_mut().hear(bar(0, 102));
+    wifi.carrier();
+    assert_eq!(delivered(&mut wifi), [0x52]);
 }
