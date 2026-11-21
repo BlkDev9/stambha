@@ -1011,6 +1011,12 @@ impl Experiment {
         self.waiting = Some((serial, since, next));
     }
 
+    /// The system image's bytes sent and its size, while the restore sends
+    /// one.
+    pub fn asr_progress(&self) -> Option<(u64, u64)> {
+        self.driver.asr().map(|asr| asr.progress())
+    }
+
     /// The image sent so far and the share of polls the host was behind
     /// (no chunk read ahead) or the guest was (the mux took no more), while
     /// the restore sends one; and the writes the guest's receive window and

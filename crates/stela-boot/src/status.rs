@@ -86,6 +86,9 @@ struct State {
     /// screen shows them yet.
     stream: Vec<String>,
     streamed: bool,
+    /// Lines shown under the running step in place of the stream, as an
+    /// install's progress ([`panel`]).
+    panel: Option<Vec<String>>,
     /// Finished lines, each its mark's letter then its text.
     history: String,
     /// Which of the running step's details the log keeps.
@@ -102,6 +105,7 @@ static STATE: Exclusive<State> = Exclusive::new(State {
     running: None,
     stream: Vec::new(),
     streamed: true,
+    panel: None,
     history: String::new(),
     details: Thinning::new(),
 });
@@ -246,8 +250,10 @@ impl State {
         let gap = if running.detail.is_empty() { "" } else { "  " };
         // The lines under the step scroll as each new one comes: what that
         // changes reaches the screen over the next ticks.
-        let below =
-            (!self.streamed).then_some((self.stream.as_slice(), TEXT_INDENT.len(), Color::Dim));
+        let below = (!self.streamed).then_some(match &self.panel {
+            Some(panel) => (panel.as_slice(), TEXT_INDENT.len(), Color::Text),
+            None => (self.stream.as_slice(), TEXT_INDENT.len(), Color::Dim),
+        });
         console::running(
             &[
                 (" [", Color::Dim),
@@ -319,7 +325,11 @@ impl State {
         if line.len() <= HISTORY_BYTES {
             self.history.push_str(&line);
         }
-        // The running step's line, which the finished one took, follows it.
+        // The running step's line, which the finished one took, follows it,
+        // and a panel under it again.
+        if self.panel.is_some() {
+            self.streamed = false;
+        }
         self.draw_running();
     }
 }
@@ -450,6 +460,23 @@ pub fn stream<'a>(lines: impl IntoIterator<Item = &'a str>) {
             state.stream.push(String::from(line.trim_end()));
             state.streamed = false;
         }
+    });
+}
+
+/// Show `lines` under the running step in place of the streamed lines,
+/// scrolling the finished ones up to make room, as an install's progress
+/// does while macOS draws nothing new; `None` gives the streamed lines back.
+pub fn panel(lines: Option<Vec<String>>) {
+    with(|state| {
+        if state.panel == lines {
+            return;
+        }
+        if let Some(lines) = &lines {
+            console::room_below(lines.len());
+        }
+        state.panel = lines;
+        state.streamed = false;
+        state.draw_running();
     });
 }
 

@@ -30,7 +30,9 @@
 //! [`LATE_MILLIS`] is named in the `HOST SERVICE SLOW` line with what
 //! waited; a wait that began before the part is the turn's, in one
 //! `HOST SERVICE LATE` line.
-use super::{bluetooth, host, input, network, nor, output, parallel, power, restore, usb};
+use super::{
+    bluetooth, host, input, install_progress, network, nor, output, parallel, power, restore, usb,
+};
 use alloc::{format, string::String, vec::Vec};
 use core::{
     cell::UnsafeCell,
@@ -459,6 +461,11 @@ impl Service {
                 });
                 devices.serve(|devices| experiment.poll(devices));
                 lap.part(Part::Restore);
+            }
+            // How much of the system image has gone, for the install's
+            // progress, which the boot PE reports.
+            if let Some((sent, size)) = experiment.asr_progress() {
+                install_progress::image(sent, size);
             }
         }
         if stamp.wrapping_sub(*reported) >= REPORT_SECONDS * host::COUNTER_HZ {

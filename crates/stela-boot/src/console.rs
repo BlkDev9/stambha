@@ -613,6 +613,20 @@ impl Text {
         self.cells[last..].fill(BLANK);
     }
 
+    /// Move the rows up by as many as `rows` rows under the cursor's lack,
+    /// at most the cursor's row: the top rows go, and blank ones follow.
+    fn room_below(&mut self, rows: usize) {
+        let after = self.rows - 1 - self.row;
+        let up = rows.saturating_sub(after).min(self.row);
+        if up == 0 {
+            return;
+        }
+        self.cells.copy_within(up * self.columns.., 0);
+        let kept = self.cells.len() - up * self.columns;
+        self.cells[kept..].fill(BLANK);
+        self.row -= up;
+    }
+
     /// Carry on at `indent` on a blank row under the cursor's.
     fn wrap(&mut self, indent: usize) {
         self.newline();
@@ -853,17 +867,50 @@ pub(crate) fn restore_firmware() -> bool {
 /// Take the screen back after [`release`] and draw the kept text again, so
 /// a stop shows its reason instead of the guest's last frame.
 pub fn reclaim() {
+    with_consoles(|active, parked| show_parked(active, parked, |_| true));
+}
+
+/// Take the screen at `base` back as [`reclaim`] does, when the kept text
+/// was drawn there: an install shows its progress there while the guest
+/// draws nothing new. Whether the text now shows there; false when another
+/// console operation was active.
+pub fn reclaim_on(base: usize) -> bool {
     with_consoles(|active, parked| {
-        if active.is_none()
-            && parked.as_ref().is_some_and(|text| text.screen.available())
-            && let Some(mut text) = parked.take()
-        {
-            text.screen.clear();
-            text.shown.fill(BLANK);
-            text.present();
-            *active = Some(text);
+        if let Some(text) = active.as_ref() {
+            return text.screen.base == base && text.screen.available();
         }
-    });
+        show_parked(active, parked, |screen| screen.base == base)
+    })
+    .unwrap_or(false)
+}
+
+/// Draw the kept text again on its screen, when nothing draws now and
+/// `screen` takes it; whether it was drawn.
+fn show_parked(
+    active: &mut Option<Text>,
+    parked: &mut Option<Text>,
+    screen: impl FnOnce(&Framebuffer) -> bool,
+) -> bool {
+    if active.is_none()
+        && parked
+            .as_ref()
+            .is_some_and(|text| text.screen.available() && screen(&text.screen))
+        && let Some(mut text) = parked.take()
+    {
+        text.screen.clear();
+        text.shown.fill(BLANK);
+        text.present();
+        *active = Some(text);
+        return true;
+    }
+    false
+}
+
+/// Scroll the text up, as far as the rows above the cursor's allow, so at
+/// least `rows` rows follow the cursor's, for lines [`below`] it; drawn
+/// with the next change.
+pub fn room_below(rows: usize) {
+    with(|text| text.room_below(rows));
 }
 
 /// Whether text reaches the screen.

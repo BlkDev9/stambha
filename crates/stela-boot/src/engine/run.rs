@@ -1077,6 +1077,9 @@ pub(super) fn run<H: Host>(
                     super::gpu::pump();
                 }
                 service.parts.lap(ServiceParts::PUMP, host::rdtsc());
+                // An install's progress, and its screen while macOS draws
+                // nothing new, before the frames that may take it back.
+                super::install_progress::slice_end(host::rdtsc(), tsc_hz, quiet);
                 super::display::flush(turn);
                 service.parts.lap(ServiceParts::DISPLAY, host::rdtsc());
                 // A staged guest disk nobody else stepped lately: one step
@@ -1324,6 +1327,13 @@ pub(super) fn report_drained<H: Host>(
         host::rdtsc().wrapping_sub(started) < budget
     });
     let lines = drained.lines;
+    // Every step an install's log names, as the screen shows the last.
+    if super::install_progress::active() {
+        for step in lines.iter().filter_map(|line| installer_step(line)) {
+            let name = step.strip_prefix("installer: ").unwrap_or(&step);
+            super::install_progress::step(name, now, tsc_hz);
+        }
+    }
     if let Some(step) = lines.iter().rev().find_map(|line| installer_step(line)) {
         crate::status::progress(&step);
         boot_progress.installer(step);

@@ -29,6 +29,7 @@ pub(crate) mod host;
 mod ident;
 mod input;
 pub(crate) mod install;
+mod install_progress;
 pub(crate) mod interrupts;
 mod kernel_work;
 mod large_blocks;
@@ -1258,6 +1259,9 @@ fn run_machine<H: Host>(
         Some(_) => "Starting the macOS installer",
         None => "Starting macOS",
     });
+    if restore.is_some() {
+        install_progress::begin();
+    }
     session::begin();
     service::install(service::Service::new(
         machine.devices.worker(),

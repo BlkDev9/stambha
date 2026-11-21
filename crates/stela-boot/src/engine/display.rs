@@ -30,9 +30,59 @@ use super::gpu::client::{present_took, timed_present as timed};
 #[cfg(not(feature = "nvk"))]
 fn present_took(_ticks: u64) {}
 
-/// Whether the DCP model has presented a swap: the first one takes the
-/// screen from Stela's console.
+/// Whether the DCP model's frames have the screen: the first one takes it
+/// from Stela's console, and so does the first after an install's progress
+/// took it back ([`show_progress`]).
 static DCP_PRESENTED: AtomicBool = AtomicBool::new(false);
+
+/// The frames the DCP model presented to the firmware's screen.
+static PRESENTS: AtomicU64 = AtomicU64::new(0);
+
+/// The frames presented to the firmware's screen so far.
+pub fn presents() -> u64 {
+    PRESENTS.load(Ordering::Relaxed)
+}
+
+/// Whether the DCP model's frames have the screen, rather than Stela's
+/// console.
+pub fn frames_shown() -> bool {
+    DCP_PRESENTED.load(Ordering::Relaxed)
+}
+
+/// Take the firmware's screen back from the DCP model's frames for Stela's
+/// console, which an install shows its progress on while macOS draws
+/// nothing new; the next frame takes it again, as the first did
+/// ([`take_screen`]), written whole. Whether the console has the screen.
+///
+/// Only the boot PE calls this, between its slices, and while the console
+/// has the screen only the boot PE writes frames ([`Turn::Home`]), so no
+/// frame is written while the console draws. Nothing is taken while a frame
+/// is being written or one waits, or from another scanout's screen: a GPU's
+/// display, where the console's text is kept for a stop, keeps its frames.
+pub fn show_progress() -> bool {
+    let base = with_staged(|staged| {
+        let staged = staged
+            .as_mut()
+            .filter(|staged| !staged.writing && !staged.frame.pending())?;
+        if !DCP_PRESENTED.swap(false, Ordering::Relaxed) {
+            return None;
+        }
+        // The console draws over the frame on screen, in the screen's
+        // first frame where it has two: each of them lacks the next whole.
+        let (_, height) = staged.screen.resolution();
+        staged.stale = [0..height, 0..height];
+        Some(staged.screen.base)
+    });
+    let Some(base) = base else {
+        return false;
+    };
+    if console::reclaim_on(base) {
+        return true;
+    }
+    // Another console operation was active: the frame stays on screen.
+    DCP_PRESENTED.store(true, Ordering::Relaxed);
+    false
+}
 
 /// The host scanout the modeled DCP presents completed swaps to: the UEFI GOP
 /// framebuffer at its own mode. The DCP model composes each swap's layers in
@@ -527,6 +577,7 @@ impl Scanout for GopScanout {
         with_staged(|staged| match staged {
             Some(staged) => {
                 staged.frame.store(rows);
+                PRESENTS.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
             None => Err(refuse!("the firmware framebuffer has no staged frame")),
@@ -539,7 +590,10 @@ impl Scanout for GopScanout {
         fill: &mut dyn FnMut(usize, &mut [u8]) -> Result<()>,
     ) -> Result<bool> {
         with_staged(|staged| match staged {
-            Some(staged) => staged.frame.fill(damage, fill).map(|()| true),
+            Some(staged) => {
+                PRESENTS.fetch_add(1, Ordering::Relaxed);
+                staged.frame.fill(damage, fill).map(|()| true)
+            }
             None => Ok(false),
         })
     }
