@@ -15,6 +15,8 @@ use crate::wifi::connection::security::Security;
 use crate::wifi::intel::policy::tests::regdb;
 use crate::wifi::network::{Network, Secret};
 use crate::wifi::realtek::ccmp;
+use crate::wifi::sae::{self, Derivation, Exchange};
+use crate::wifi::station::multi_link::Mld;
 use crate::wifi::station::phy::AccessCategory;
 use crate::wifi::supplicant::tests::Authenticator;
 use alloc::{rc::Rc, vec};
@@ -43,6 +45,13 @@ const IGTK_KDE: [u8; 30] = [
     0xdd, 28, 0, 0x0f, 0xac, 9, 4, 0, 9, 0, 0, 0, 0, 0, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77,
     0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77,
 ];
+/// [`RSN`] of a WPA3-Personal AP: SAE (00-0F-AC:8), management frame
+/// protection required and capable (MFPR b6, MFPC b7).
+const RSN_SAE: [u8; 22] = [
+    48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 8, 0xc0, 0,
+];
+/// An SAE network's passphrase.
+const PASSPHRASE: &[u8] = b"correct horse battery";
 /// An AP's HT capabilities (SGI 20, one RX STBC stream, SM power save
 /// static) and operation, one stream at 20 MHz.
 const HT: [u8; 52] = [
@@ -172,6 +181,19 @@ struct Air {
     addba_with_assoc: bool,
     /// The chip cannot send its BA CAM H2C.
     ba_fails: bool,
+    /// The AP is WPA3-Personal (beacons [`RSN_SAE`]) and answers SAE under
+    /// [`PASSPHRASE`]: a station's commit gets its commit, the station's
+    /// confirm its confirm ([`Air::sae_confirm`] until then).
+    sae: bool,
+    /// The AP's half of the last exchange, and its confirm, held.
+    sae_ap: Option<Exchange>,
+    sae_confirm: Option<sae::Frame>,
+    /// The AP sends its confirm with its commit, before the station's.
+    sae_eager: bool,
+    /// The AP answers a commit with a deauthentication.
+    sae_deauth: bool,
+    /// The AP's confirm does not verify, as under another passphrase.
+    sae_wrong_confirm: bool,
 }
 
 impl Air {
@@ -214,6 +236,7 @@ impl Air {
                 continue;
             }
             match bytes[0] {
+                0xb0 if self.sae => self.answer_sae(&bytes),
                 0xb0 => self.hear(management(0xb0, &[0, 0, 2, 0, 0, 0])),
                 0x00 if !self.mute_on_assoc => {
                     let mut body = vec![0x11, 0, 0, 0, 1, 0xc0];
@@ -229,6 +252,41 @@ impl Air {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// The AP's side of SAE (algorithm 3) for the station's frame `bytes`:
+    /// each commit begins a new exchange, as hostapd's for a new attempt.
+    fn answer_sae(&mut self, bytes: &[u8]) {
+        let field = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+        assert_eq!(field(24), 3, "not SAE");
+        let (transaction, status, data) = (field(26), field(28), &bytes[30..]);
+        match transaction {
+            1 if self.sae_deauth => self.hear(management(0xc0, &[1, 0])),
+            1 => {
+                let mut ap = sae_ap();
+                let mut confirm = ap.receive(1, status, data).unwrap().unwrap();
+                if self.sae_wrong_confirm {
+                    // The confirm field, past the send-confirm counter.
+                    confirm.data[2] ^= 1;
+                }
+                self.hear(sae_frame(&ap.commit()));
+                if self.sae_eager {
+                    self.hear(sae_frame(&confirm));
+                } else {
+                    self.sae_confirm = Some(confirm);
+                }
+                self.sae_ap = Some(ap);
+            }
+            2 => {
+                let ap = self.sae_ap.as_mut().unwrap();
+                assert_eq!(ap.receive(2, status, data), Ok(None));
+                assert!(ap.accepted());
+                if let Some(confirm) = self.sae_confirm.take() {
+                    self.hear(sae_frame(&confirm));
+                }
+            }
+            _ => panic!("SAE transaction {transaction}"),
         }
     }
 
@@ -480,6 +538,34 @@ fn management(subtype: u8, body: &[u8]) -> Vec<u8> {
     frame
 }
 
+/// The AP's half of an SAE exchange with the station under [`PASSPHRASE`].
+fn sae_ap() -> Exchange {
+    let mut next = 0x30u8;
+    let mut random = || {
+        next += 1;
+        [next; 32]
+    };
+    Exchange::new(
+        Derivation::HuntingAndPecking,
+        PASSPHRASE,
+        None,
+        None,
+        Mac(AP),
+        Mac(LOCAL),
+        &mut random,
+    )
+    .unwrap()
+}
+
+/// The AP's SAE authentication frame carrying `frame`.
+fn sae_frame(frame: &sae::Frame) -> Vec<u8> {
+    let mut body = vec![3, 0];
+    body.extend(frame.transaction.to_le_bytes());
+    body.extend(frame.status.to_le_bytes());
+    body.extend(&frame.data);
+    management(0xb0, &body)
+}
+
 /// The AP's beacon on its channel.
 fn beacon(air: &Air) -> Vec<u8> {
     let channel = air.channel.unwrap().number as u8;
@@ -495,7 +581,13 @@ fn beacon(air: &Air) -> Vec<u8> {
     frame.extend(RATES);
     // DS parameter set, then a TIM with DTIM period 2.
     frame.extend([3, 1, channel, 5, 4, 0, 2, 0, 0]);
-    frame.extend(if air.pmf { RSN_PMF } else { RSN });
+    frame.extend(if air.sae {
+        RSN_SAE
+    } else if air.pmf {
+        RSN_PMF
+    } else {
+        RSN
+    });
     frame.extend(HT);
     // HT Operation's primary channel.
     let at = frame.len() - 22;
@@ -590,11 +682,17 @@ fn wifi_with(set: impl FnOnce(&mut Air)) -> (Wifi<Model>, Model) {
         ..Air::default()
     };
     set(&mut air);
+    // SAE needs the passphrase (`Security::select_on`).
+    let secret = if air.sae {
+        Secret::parse(PASSPHRASE).unwrap()
+    } else {
+        Secret::Psk(Zeroizing::new([0; 32]))
+    };
     let model = Model(Rc::new(RefCell::new(air)));
     let country = database.select(*b"US").unwrap();
     let network = Network {
         ssid: SSID.to_vec(),
-        secret: Secret::Psk(Zeroizing::new([0; 32])),
+        secret,
         country: None,
     };
     let radio = Rtl8852c::new(model.clone(), Mac(LOCAL), country, CLOCK).unwrap();
@@ -663,7 +761,17 @@ fn handshaken() -> (Wifi<Model>, Model) {
 /// Messages 1 to 4 of the 4-way handshake under `rsn`, message 3 carrying
 /// `extra` KDEs, m4's release report included.
 fn shake(wifi: &mut Wifi<Model>, model: &Model, rsn: &[u8], extra: &[u8]) {
-    let mut ap = authenticator_for(rsn);
+    shake_with(wifi, model, authenticator_for(rsn), rsn, extra);
+}
+
+/// [`shake`] with `ap` as the AP's half.
+fn shake_with(
+    wifi: &mut Wifi<Model>,
+    model: &Model,
+    mut ap: Authenticator,
+    rsn: &[u8],
+    extra: &[u8],
+) {
     model
         .0
         .borrow_mut()
@@ -2012,4 +2120,314 @@ fn only_the_aps_acknowledged_qos_data_is_reordered() {
     model.0.borrow_mut().hear(bar(0, 102));
     wifi.carrier();
     assert_eq!(delivered(&mut wifi), [0x52]);
+}
+
+/// The (transaction, status) of each SAE frame the station sent.
+fn sae_sent(air: &Air) -> Vec<(u16, u16)> {
+    air.management(0xb0)
+        .iter()
+        .map(|frame| {
+            assert_eq!(frame[24..26], [3, 0], "not SAE");
+            let field = |at: usize| u16::from_le_bytes([frame[at], frame[at + 1]]);
+            (field(26), field(28))
+        })
+        .collect()
+}
+
+/// Where the chip took each authentication frame, in order.
+fn authentications(air: &Air) -> Vec<usize> {
+    (0..air.calls.len())
+        .filter(|&at| matches!(&air.calls[at], Call::Management(b, _) if b[0] == 0xb0))
+        .collect()
+}
+
+#[test]
+fn an_sae_network_authenticates_associates_and_keys() {
+    // wpa_supplicant's SAE through mac80211's external authentication
+    // (spec S1.16): the station's commit, the AP's, the station's confirm,
+    // the AP's; then the association under required PMF, the PTK and GTK
+    // in the CAM and the IGTK on the host (spec S1.2).
+    let (mut wifi, model) = wifi_with(|air| air.sae = true);
+    assert!(run(&mut wifi, &model, |wifi, _| {
+        wifi.radio().station().phase() == Peering::Associated
+    }));
+    assert!(wifi.radio().station().requires_protected_management());
+    let air = model.0.borrow();
+    assert_eq!(sae_sent(&air), [(1, 0), (2, 0)]);
+    assert!(
+        air.management(0xb0)
+            .iter()
+            .all(|frame| frame[4..10] == AP && frame[16..22] == AP)
+    );
+    // `ieee80211_prep_connection`'s channel and BSSID came first. The AP's
+    // confirm of the station's moved the AP's station to AUTH
+    // (`ieee80211_mark_sta_auth`), once, before the association request.
+    let tune = air.position(|c| *c == Call::Tune(channel(1))).unwrap();
+    let bssid = air.position(|c| *c == Call::SetBssid(Mac(AP))).unwrap();
+    let sent = authentications(&air);
+    let authenticated = air.position(|c| *c == Call::Authenticated).unwrap();
+    let request = air
+        .position(|c| matches!(c, Call::Management(b, _) if b[0] == 0x00))
+        .unwrap();
+    assert!(tune < bssid && bssid < sent[0]);
+    assert!(sent[1] < authenticated && authenticated < request);
+    assert_eq!(air.count(|c| *c == Call::Authenticated), 1);
+    // The request names SAE, with MFPC.
+    let own = Security::select(&RSN_SAE, true).unwrap().element();
+    assert!(air.management(0x00)[0].windows(own.len()).any(|w| w == own));
+    let pmk = air.sae_ap.as_ref().unwrap().pmk().unwrap();
+    drop(air);
+    // The 4-way handshake under the SAE PMK, with the IGTK.
+    let security = Security::select(&RSN_SAE, true).unwrap();
+    let ap = Authenticator::between(
+        security.suites(),
+        pmk,
+        Mac(AP),
+        Mac(LOCAL),
+        security.element(),
+    );
+    shake_with(&mut wifi, &model, ap, &RSN_SAE, &IGTK_KDE);
+    assert!(wifi.carrier(), "{}", progress(&mut wifi));
+    assert_eq!(model.0.borrow().keys(), [(true, 0, 0), (false, 1, 1)]);
+    assert!(wifi.radio().integrity.is_some());
+    let line = progress(&mut wifi);
+    assert!(
+        line.starts_with(
+            "scans 1 (1 networks, target found ch 1 -40 dBm), sae 2/2, assoc 1/1 status 0 \
+             aid 1, eapol rx 2 tx 2 acked 2, keys 2, port open; "
+        ),
+        "{line}"
+    );
+}
+
+#[test]
+fn a_failed_sae_ends_and_retries() {
+    // An AP that never acknowledges: each commit goes again at once on its
+    // TX status (`ieee80211_sta_work`), three tries
+    // (IEEE80211_AUTH_MAX_TRIES); the exchange then ends, the chip leaves
+    // the BSS it was set to, and the keeper waits wpa_supplicant's 10 s
+    // before it commits again.
+    let (mut wifi, model) = wifi_with(|air| {
+        air.sae = true;
+        air.deaf_to_auth = true;
+    });
+    let mut lines = Vec::new();
+    let mut sent = Vec::new();
+    let mut joins = Vec::new();
+    let mut gave_up = None;
+    assert!(run(&mut wifi, &model, |wifi, air| {
+        lines.push(progress(wifi));
+        let now = CLOCK.now_us();
+        while sent.len() < air.management(0xb0).len() {
+            sent.push(now);
+        }
+        let set = air.count(|c| matches!(c, Call::SetBssid(_)));
+        if joins.len() < set {
+            joins.push(now);
+        }
+        if gave_up.is_none() && air.count(|c| *c == Call::Disassociate) == 1 {
+            gave_up = Some(now);
+        }
+        set == 2 && sent.len() == 4
+    }));
+    assert!(lines.iter().any(|l| l.contains(", sae 1/0, ")));
+    assert!(lines.iter().any(|l| l.contains(", sae 3/0, ")));
+    // Unacknowledged, each try left at once, well inside the 500 ms a frame
+    // waits for its TX status (IEEE80211_AUTH_TIMEOUT_LONG).
+    assert!(sent[2] - sent[0] < 100_000, "{sent:?}");
+    let air = model.0.borrow();
+    assert_eq!(sae_sent(&air), [(1, 0); 4]);
+    let first = air.position(|c| matches!(c, Call::SetBssid(_))).unwrap();
+    let left = air.position(|c| *c == Call::Disassociate).unwrap();
+    let commits = authentications(&air);
+    assert!(first < commits[0] && commits[2] < left && left < commits[3]);
+    // The AP's station never authenticated.
+    assert_eq!(air.count(|c| *c == Call::Authenticated), 0);
+    drop(air);
+    assert!(joins[1] - gave_up.unwrap() >= 10_000_000);
+    let Err(LinkError::Adapter(failure)) = wifi.receive() else {
+        panic!("no failure")
+    };
+    assert!(
+        failure.contains("SAE authentication ended: Timeout"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn an_ap_confirming_first_authenticates_the_station_as_it_confirms() {
+    // `ieee80211_mgd_auth`: once the AP confirmed, the station's confirm
+    // completes the exchange, the AP's station AUTH before it leaves.
+    let (mut wifi, model) = wifi_with(|air| {
+        air.sae = true;
+        air.sae_eager = true;
+    });
+    assert!(run(&mut wifi, &model, |wifi, _| {
+        wifi.radio().station().phase() == Peering::Associated
+    }));
+    let air = model.0.borrow();
+    assert_eq!(sae_sent(&air), [(1, 0), (2, 0)]);
+    let sent = authentications(&air);
+    let authenticated = air.position(|c| *c == Call::Authenticated).unwrap();
+    assert!(sent[0] < authenticated && authenticated < sent[1]);
+    assert_eq!(air.count(|c| *c == Call::Authenticated), 1);
+}
+
+#[test]
+fn a_deauthentication_during_sae_ends_the_exchange() {
+    // `ieee80211_rx_mgmt_deauth` while authenticating destroys the exchange
+    // at once, where the station would otherwise wait out its tries.
+    let (mut wifi, model) = wifi_with(|air| {
+        air.sae = true;
+        air.sae_deauth = true;
+    });
+    let mut committed = None;
+    let mut left = None;
+    assert!(run(&mut wifi, &model, |_, air| {
+        let now = CLOCK.now_us();
+        if committed.is_none() && !air.management(0xb0).is_empty() {
+            committed = Some(now);
+        }
+        if air.count(|c| *c == Call::Disassociate) == 1 {
+            left = Some(now);
+        }
+        left.is_some()
+    }));
+    assert!(left.unwrap() - committed.unwrap() < 100_000);
+    let air = model.0.borrow();
+    assert_eq!(sae_sent(&air), [(1, 0)]);
+    assert_eq!(air.count(|c| *c == Call::Authenticated), 0);
+    drop(air);
+    let Err(LinkError::Adapter(failure)) = wifi.receive() else {
+        panic!("no failure")
+    };
+    assert!(
+        failure.contains("authentication or association failed"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn an_sae_exchange_for_an_mld_link_is_unsupported() {
+    // The chip has one address, the one its address CAM holds.
+    let (_, model) = wifi();
+    let database = regdb(&[(*b"US", &US[..])]);
+    let country = database.select(*b"US").unwrap();
+    let mut radio = Rtl8852c::new(model.clone(), Mac(LOCAL), country, CLOCK).unwrap();
+    let peer = Peer {
+        bssid: Mac(AP),
+        channel: channel(1),
+        basic_rates: 1,
+        supported_rates: 0x11,
+        beacon_interval: 100,
+        dtim_period: 2,
+        slot_time: 20,
+    };
+    let affiliation = Affiliation {
+        mld: Mld {
+            local: Mac(LOCAL),
+            ap: Mac(AP),
+        },
+        link_id: 0,
+        local: Mac([0x02, 0x11, 0x22, 0x33, 0x44, 0x66]),
+    };
+    let got = radio.begin_external_authentication(0, peer, Some(affiliation), 10_000_000);
+    assert!(
+        matches!(got, Err(Error::Unsupported("MLO on an RTL8852C"))),
+        "{got:?}"
+    );
+    assert!(model.0.borrow().calls.is_empty());
+}
+
+#[test]
+fn a_wrong_sae_confirm_deauthenticates_and_leaves() {
+    // mac80211 takes the AP's confirm (status 0) as the exchange's end, its
+    // station AUTH; wpa_supplicant's check of it fails, and
+    // `ieee80211_mgd_deauth` aborts the authentication with a
+    // deauthentication to the AP before the chip leaves.
+    let (mut wifi, model) = wifi_with(|air| {
+        air.sae = true;
+        air.sae_wrong_confirm = true;
+    });
+    assert!(run(&mut wifi, &model, |_, air| {
+        air.count(|c| *c == Call::Disassociate) == 1
+    }));
+    let air = model.0.borrow();
+    assert_eq!(sae_sent(&air), [(1, 0), (2, 0)]);
+    let authenticated = air.position(|c| *c == Call::Authenticated).unwrap();
+    let deauth = air
+        .position(|c| matches!(c, Call::Management(b, _) if b[0] == 0xc0))
+        .unwrap();
+    let left = air.position(|c| *c == Call::Disassociate).unwrap();
+    assert!(authenticated < deauth && deauth < left);
+    let Call::Management(frame, _) = &air.calls[deauth] else {
+        unreachable!()
+    };
+    // Unprotected, from the station to the AP, reason 3 (leaving).
+    assert_eq!(frame[1] & 0x40, 0);
+    assert_eq!((&frame[4..10], &frame[10..16]), (&AP[..], &LOCAL[..]));
+    assert_eq!(frame[24..], [3, 0]);
+    assert_eq!(air.management(0x00).len(), 0);
+    drop(air);
+    let Err(LinkError::Adapter(failure)) = wifi.receive() else {
+        panic!("no failure")
+    };
+    assert!(failure.contains("SAE confirm failed"), "{failure}");
+}
+
+#[test]
+fn a_deauthentication_from_another_ap_leaves_the_exchange_running() {
+    // `ieee80211_rx_mgmt_deauth` ends an authentication only for its AP's
+    // BSSID, and `ieee80211_rx_mgmt_auth` ignores another BSSID's frame.
+    let (mut wifi, model) = wifi_with(|air| air.sae = true);
+    assert!(run(&mut wifi, &model, |_, air| !air
+        .management(0xb0)
+        .is_empty()));
+    let other = [0x02, 0xaa, 0, 0, 0, 9, 0x02, 0xaa, 0, 0, 0, 9];
+    let mut deauth = management(0xc0, &[1, 0]);
+    deauth[10..22].copy_from_slice(&other);
+    let mut commit = sae_frame(&sae_ap().commit());
+    commit[10..22].copy_from_slice(&other);
+    // And the AP's to another station.
+    let mut elsewhere = management(0xc0, &[1, 0]);
+    elsewhere[4..10].copy_from_slice(&other[..6]);
+    model.0.borrow_mut().hear(deauth);
+    model.0.borrow_mut().hear(commit);
+    model.0.borrow_mut().hear(elsewhere);
+    assert!(run(&mut wifi, &model, |wifi, _| {
+        wifi.radio().station().phase() == Peering::Associated
+    }));
+    let air = model.0.borrow();
+    assert_eq!(air.count(|c| *c == Call::Disassociate), 0);
+    assert_eq!(sae_sent(&air), [(1, 0), (2, 0)]);
+    drop(air);
+    // Dropped as mac80211 drops them, nothing reported.
+    assert_eq!(wifi.receive(), Ok(None));
+}
+
+#[test]
+fn the_progress_line_names_the_last_joins_authentication() {
+    // An SAE attempt that failed, then the network's AP offering WPA2 only:
+    // the counts add up, under the open system's name.
+    let (mut wifi, model) = wifi_with(|air| {
+        air.sae = true;
+        air.deaf_to_auth = true;
+    });
+    assert!(run(&mut wifi, &model, |_, air| {
+        air.count(|c| *c == Call::Disassociate) == 1
+    }));
+    assert!(progress(&mut wifi).contains(", sae 3/0, "));
+    {
+        let mut air = model.0.borrow_mut();
+        air.sae = false;
+        air.deaf_to_auth = false;
+    }
+    assert!(run(&mut wifi, &model, |wifi, _| {
+        wifi.radio().station().phase() == Peering::Associated
+    }));
+    let line = progress(&mut wifi);
+    assert!(
+        line.contains(", auth 4/1 status 0, assoc 1/1 status 0"),
+        "{line}"
+    );
 }

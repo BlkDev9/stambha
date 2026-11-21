@@ -17,6 +17,18 @@
 //!   chip's management queue at the BSS's lowest basic rate, each ticketed
 //!   one's TX status from its release report. The AP's acceptance of the
 //!   authentication moves its station to AUTH ([`chip::Chip::authenticated`]).
+//! - A WPA3-Personal network is joined by SAE as `ieee80211_mgd_auth` runs
+//!   wpa_supplicant's exchange (spec S1.16): the channel and BSSID as a
+//!   join's, then the keeper's commits and confirms, which the station
+//!   builds, on the management queue, each one's TX status timing its next
+//!   try (`ieee80211_sta_work`), and the AP's handed back to the keeper.
+//!   The AP's station goes to AUTH once the exchange ends authenticated,
+//!   with the AP's confirm of the station's or the station's confirm to an
+//!   AP that confirmed first (`ieee80211_mark_sta_auth`); the association
+//!   follows under the PMF SAE requires. A denied or timed-out exchange
+//!   ends, the keeper told; a deauthentication from its AP ends it at once
+//!   (`ieee80211_rx_mgmt_deauth`), and the keeper's own end of it leaves
+//!   with a deauthentication (`ieee80211_mgd_deauth`).
 //! - The association programs the chip with the negotiated peer as
 //!   `BSS_CHANGED_ASSOC` does (spec S10), on the channel the join switched
 //!   to.
@@ -28,8 +40,14 @@
 //!   it as `ieee80211_key_replace` does, the old one deleted first, and an
 //!   identical one is not installed again (`ieee80211_key_identical`). The
 //!   port opens on both, and under PMF on the IGTK too, which stays on the
-//!   host (`BipKey`); a rekey while it is open authorizes it again on the
-//!   keys then held, as mac80211's station stays authorized across one.
+//!   host (`BipKey`, spec S1.2); a rekey while it is open authorizes it
+//!   again on the keys then held, as mac80211's station stays authorized
+//!   across one. rtw89 puts the IGTK in the CAM as BIP_CCMP128
+//!   (`cam.c:516-517`), but reads neither BIP bit of the RX descriptor
+//!   (`AX_RXD_BIP_KEYID`, `AX_RXD_BIP_ENC`, `txrx.h:427-428`), and mac80211
+//!   checks a group robust frame's MIC itself unless the hardware marked it
+//!   decrypted (`ieee80211_crypto_aes_cmac_decrypt`): here every one's is
+//!   checked on the host.
 //! - Data under the PTK leaves as `Protection::HostIv` plans it: the
 //!   station reserves its PN and writes its CCMP header, which
 //!   [`super::txd::strip_ccmp`] checks against the reservation and removes;
@@ -76,7 +94,8 @@
 //!
 //! This module does not grant: any cipher but CCMP-128 (TKIP, GCMP,
 //! CCMP-256, WEP), hardware-encrypted management frames
-//! (`hw_mgmt_tx_encrypt`), SAE, beacon loss, A-MSDU or aggregated TX, power
+//! (`hw_mgmt_tx_encrypt`), the IGTK in the CAM, SAE on 6 GHz or on an MLD
+//! link, beacon loss, A-MSDU or aggregated TX, power
 //! save, templates, the watchdog, SA Query requests of its own, or following
 //! the AP's beacons and channel switches. Of RX Block Ack it does not
 //! grant: an agreement's inactivity timeout
@@ -131,7 +150,7 @@ use crate::{
         },
     },
 };
-use alloc::{collections::VecDeque, format, string::String, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, format, string::String, sync::Arc, vec::Vec};
 use core::fmt;
 use stela_driver_base::entropy::Entropy;
 use zeroize::Zeroizing;
@@ -153,8 +172,8 @@ const CCMP_128_ONLY: &str = "a key other than CCMP-128 on an RTL8852C";
 /// a sealed frame's CCMP header goes.
 const CCMP_HEADER: usize = 8;
 const MANAGEMENT_HEADER: usize = 24;
-/// What SAE gets in M3a (M3 Task 17).
-const SAE_BEFORE_M3B: &str = "SAE before M3b";
+/// What an MLD link gets: the chip has one address, its address CAM's.
+const NO_MLO: &str = "MLO on an RTL8852C";
 /// 8852C's `max_rx_agg_num` (`rtw8852c.c:3157`), which rtw89 makes
 /// `max_rx_aggregation_subframes` (`core.c:7483`): an agreement's largest
 /// window.
@@ -291,10 +310,12 @@ struct Eapol {
 }
 
 /// The progress line's counts (spec S14.6), each `None` until reached.
+/// `auth` counts the SAE frames when the last join was by SAE (`sae`).
 #[derive(Clone, Debug, Default)]
 struct Progress {
     scans: u32,
     auth: Option<Exchange>,
+    sae: bool,
     assoc: Option<Exchange>,
     aid: Option<u16>,
     eapol: Option<Eapol>,
@@ -583,7 +604,18 @@ impl<C: Chip> Rtl8852c<C> {
                     self.depart(ticket);
                 }
             }
-            Action::Remove { ticket, .. } => self.depart(ticket),
+            Action::Remove { ticket, failure } => {
+                // An SAE exchange the AP denied or that timed out, which
+                // mac80211 destroys and cfg80211 reports to wpa_supplicant
+                // (rtw88's `depart`).
+                if let Some(failure) = failure
+                    && self.station.external_authentication().is_some()
+                {
+                    self.events
+                        .push_back(keeper::Event::SaeEnded(format!("{failure:?}")));
+                }
+                self.depart(ticket);
+            }
         }
     }
 
@@ -672,8 +704,13 @@ impl<C: Chip> Rtl8852c<C> {
 
     /// rtw88's `send_management` (`station.rs:889`): the outbox, oldest
     /// first, while the chip has room; a ticketed frame's token is kept
-    /// for its report, the token it replaces among the earlier ones. A
-    /// protected frame was sealed as it was queued.
+    /// for its report, the token it replaces among the earlier ones, and
+    /// so is an SAE frame's, the outbox's only authentication without a
+    /// ticket: mac80211 sends the exchange's frames with
+    /// `IEEE80211_TX_CTL_REQ_TX_STATUS`, rtw89 reporting TX status
+    /// (`REPORTS_TX_ACK_STATUS`, `core.c:7495`), and the status times the
+    /// exchange's next try (`ieee80211_mgd_conn_tx_status`). A protected
+    /// frame was sealed as it was queued.
     fn send_management(&mut self) -> Result<(), Error> {
         let basic_rates = self.basic_rates();
         while let Some((_, bytes)) = self.outbox.front() {
@@ -690,10 +727,12 @@ impl<C: Chip> Rtl8852c<C> {
                 Kind::Association => bump(&mut self.progress.assoc.get_or_insert_default().sent),
                 Kind::Other => {}
             }
+            if (ticket.is_some() || kind == Kind::Authentication)
+                && let Some(earlier) = self.reporting.replace((token, kind))
+            {
+                self.keep_earlier(earlier);
+            }
             if let Some(ticket) = ticket {
-                if let Some(earlier) = self.reporting.replace((token, kind)) {
-                    self.keep_earlier(earlier);
-                }
                 self.station.submitted(ticket).map_err(Error::Station)?;
             }
         }
@@ -885,10 +924,13 @@ impl<C: Chip> Rtl8852c<C> {
         }
     }
 
-    /// A frame's release report: the ticketed management frame's goes to
+    /// A frame's release report: the awaited management frame's goes to
     /// the station as its TX status (rtw88's `Report::Transmitted`,
-    /// `station.rs:1275-1288`, spec S1.10), and is counted; one the station
-    /// no longer awaits, and an EAPOL frame's, is counted only.
+    /// `station.rs:1275-1288`, spec S1.10), an SAE frame's to its exchange
+    /// (`ieee80211_sta_work`: unacknowledged, it goes again at once;
+    /// acknowledged, the AP gets IEEE80211_AUTH_TIMEOUT_SAE), and is
+    /// counted; one the station no longer awaits, and an EAPOL frame's, is
+    /// counted only.
     fn transmitted(&mut self, token: Token, acknowledged: bool, now: u64) -> Result<(), Error> {
         if let Some((_, kind)) = self.reporting.filter(|&(awaited, _)| awaited == token) {
             self.reporting = None;
@@ -1335,7 +1377,7 @@ impl<C: Chip> Rtl8852c<C> {
             return self.protected_management(frame, now);
         }
         if self.station.phase() == Peering::ExternalAuthenticating {
-            return Ok(());
+            return self.exchange_frame(frame, now);
         }
         let Some(epoch) = self.station.association_epoch() else {
             return Ok(());
@@ -1382,6 +1424,54 @@ impl<C: Chip> Rtl8852c<C> {
             Self::chip(self.chip.authenticated())?;
         }
         Ok(())
+    }
+
+    /// `ieee80211_rx_mgmt_auth` and `ieee80211_rx_mgmt_deauth` while the
+    /// keeper's SAE exchange runs (rtw88's `management_frame`,
+    /// `station.rs:1526`), each taking only its AP's frames (the BSSID
+    /// its `auth_data` names): an authentication frame goes to the
+    /// exchange, and one it takes to the keeper, which answers it. The AP's
+    /// confirm of the station's ends the exchange authenticated, and the
+    /// AP's station goes to AUTH on the chip (`ieee80211_mark_sta_auth`).
+    /// A deauthentication ends it at once, as mac80211 destroys its
+    /// authentication data; anything else is dropped.
+    fn exchange_frame(&mut self, frame: Mpdu, now: u64) -> Result<(), Error> {
+        let session = self
+            .station
+            .external_authentication()
+            .cloned()
+            .ok_or(Error::Refused("exchange"))?;
+        let header = *frame.header();
+        let peer = session.peer();
+        let from_peer =
+            header.transmitter == Some(peer) && frame.bytes().get(16..22) == Some(&peer.0[..]);
+        match header.control & 0xfc {
+            0xb0 if from_peer => {
+                let received = self
+                    .station
+                    .receive_external_authentication(&session, frame, now)
+                    .map_err(Error::Station)?;
+                // A frame after the exchange's end is not taken, so it
+                // ends once.
+                if let Some(received) = received {
+                    self.events
+                        .push_back(keeper::Event::Sae(Box::new(received)));
+                    if self.station.external_authenticated() {
+                        Self::chip(self.chip.authenticated())?;
+                    }
+                }
+                Ok(())
+            }
+            0xc0 if from_peer
+                && (header.receiver == self.address || header.receiver.is_multicast()) =>
+            {
+                if let Ok(Action::Remove { ticket, .. }) = self.station.disconnect() {
+                    self.depart(ticket);
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     /// rtw88's `protected_management` (`station.rs:1598`) without channel
@@ -1515,6 +1605,20 @@ impl<C: Chip> Rtl8852c<C> {
                 }
             }
         }
+        // `ieee80211_auth`: the exchange's last frame again once its wait
+        // passed (rtw88's `operate`).
+        if !self.left && self.station.phase() == Peering::ExternalAuthenticating {
+            let mut policy = Admitted(&self.channels);
+            match self.station.external_retransmission(now, &mut policy) {
+                Ok(Some(bytes)) => self.queue_management(None, bytes),
+                Ok(None) => {}
+                Err(error) => {
+                    if first.is_ok() {
+                        first = Err(Error::Station(error));
+                    }
+                }
+            }
+        }
         let sent = self.send_management();
         if first.is_ok() {
             first = sent;
@@ -1548,11 +1652,18 @@ impl<C: Chip> Rtl8852c<C> {
                     },
                 )
         };
+        let auth = if p.sae {
+            let counts = p
+                .auth
+                .map_or_else(|| String::from("-"), |e| format!("{}/{}", e.sent, e.acked));
+            format!("sae {counts}")
+        } else {
+            format!("auth {}", exchange(p.auth))
+        };
         let mut line = format!(
-            "scans {} ({} networks, target {target}), auth {}",
+            "scans {} ({} networks, target {target}), {auth}",
             p.scans,
             self.observed.len(),
-            exchange(p.auth),
         );
         match p.assoc {
             Some(_) => line.push_str(&format!(
@@ -1612,17 +1723,32 @@ impl<C: Chip> Rtl8852c<C> {
         Ok(())
     }
 
-    fn join_with(&mut self, handle: usize, join: Join, peer: Peer) -> Result<(), Error> {
-        let observed = self.observed(handle)?;
-        let bss = observed.bss().clone();
-        // `ieee80211_prep_connection`: the channel, then the BSSID.
+    /// `ieee80211_prep_connection`, for a join and an SAE exchange alike:
+    /// the channel, then the BSSID; the BSS's profile kept, and the AP's
+    /// station new (`sta_info_alloc`).
+    fn approach(&mut self, bss: &Bss, peer: Peer) -> Result<(), Error> {
         Self::chip(self.chip.tune(bss.channel))?;
         Self::chip(self.chip.set_bssid(bss.bssid))?;
         self.peer = Some(peer);
-        // The AP's station, new (`sta_info_alloc`).
         self.ap = Some(bss.bssid);
         self.last_sequence = FRESH_SEQUENCES;
+        Ok(())
+    }
+
+    /// No station began after [`Self::approach`]: the BSSID goes again, so
+    /// a scan may run.
+    fn withdraw(&mut self) {
+        self.peer = None;
+        self.ap = None;
+        let _ = self.chip.disassociate();
+    }
+
+    fn join_with(&mut self, handle: usize, join: Join, peer: Peer) -> Result<(), Error> {
+        let observed = self.observed(handle)?;
+        let bss = observed.bss().clone();
+        self.approach(&bss, peer)?;
         self.management_cipher = join.request.pmf().map(|pmf| pmf.management());
+        self.progress.sae = false;
         self.progress.auth.get_or_insert_default();
         let now = self.clock.now_us();
         let mut policy = Admitted(&self.channels);
@@ -1638,13 +1764,94 @@ impl<C: Chip> Rtl8852c<C> {
                 Ok(())
             }
             Err(error) => {
-                // No station began: the BSSID goes again, so a scan may run.
-                self.peer = None;
-                self.ap = None;
-                let _ = self.chip.disassociate();
+                self.withdraw();
                 Err(Error::Station(error))
             }
         }
+    }
+
+    /// rtw88's `begin_external_authentication` (`station.rs:2041`), the
+    /// half of `ieee80211_mgd_auth` before its first frame: the channel and
+    /// BSSID as a join's ([`Self::approach`]), then the keeper's SAE
+    /// exchange begun on the station. An MLD link's is refused first.
+    fn begin_external_with(
+        &mut self,
+        handle: usize,
+        peer: Peer,
+        multi_link: Option<Affiliation>,
+        budget_us: u64,
+    ) -> Result<Arc<external::Session>, Error> {
+        if multi_link.is_some() {
+            return Err(Error::Unsupported(NO_MLO));
+        }
+        let bss = self.observed(handle)?.bss().clone();
+        self.approach(&bss, peer)?;
+        self.progress.sae = true;
+        self.progress.auth.get_or_insert_default();
+        let now = self.clock.now_us();
+        let mut policy = Admitted(&self.channels);
+        let begun = self.station.begin_external_authentication(
+            external::Peer {
+                bssid: bss.bssid,
+                channel: bss.channel,
+                ssid: bss.ssid.clone().unwrap_or_default(),
+                multi_link: None,
+            },
+            now,
+            budget_us,
+            &mut policy,
+        );
+        begun.map_err(|error| {
+            self.withdraw();
+            Error::Station(error)
+        })
+    }
+
+    /// rtw88's `transmit_external_authentication` (`station.rs:2079`): the
+    /// keeper's SAE frame, built by the station, to the outbox. A confirm
+    /// to an AP that confirmed first ends the exchange authenticated, and
+    /// the AP's station goes to AUTH on the chip before it leaves, as
+    /// `ieee80211_mgd_auth` marks it before `ieee80211_auth` sends it.
+    fn transmit_external_with(
+        &mut self,
+        session: &external::Session,
+        frame: external::Frame<'_>,
+    ) -> Result<(), Error> {
+        let now = self.clock.now_us();
+        let mut policy = Admitted(&self.channels);
+        let bytes = self
+            .station
+            .external_authentication_transmit(session, frame, now, &mut policy)
+            .map_err(Error::Station)?;
+        // The station builds no frame after the exchange's end, so this is
+        // the frame that ended it.
+        if self.station.external_authenticated() {
+            Self::chip(self.chip.authenticated())?;
+        }
+        self.queue_management(None, bytes);
+        Ok(())
+    }
+
+    /// rtw88's `associate_external` (`station.rs:2094`): the association
+    /// once the exchange authenticated, on the channel and BSSID its start
+    /// set, under the join's management cipher, as [`Self::join_with`]
+    /// takes it.
+    fn associate_external_with(
+        &mut self,
+        session: &external::Session,
+        handle: usize,
+        join: Join,
+    ) -> Result<(), Error> {
+        let observed = self.observed(handle)?;
+        let now = self.clock.now_us();
+        self.management_cipher = join.request.pmf().map(|pmf| pmf.management());
+        let mut policy = Admitted(&self.channels);
+        let action = self
+            .station
+            .associate_external_pmf(session, join, observed, now, &mut policy)
+            .map_err(Error::Station)?;
+        self.act(action);
+        Ok(())
     }
 
     /// rtw88's `configure` (`station.rs:2113`) on rtw89 (spec S14.5): the
@@ -1681,7 +1888,10 @@ impl<C: Chip> Rtl8852c<C> {
     /// the frame, then a flush without drop so it leaves (`mlme.c:4594-4604`
     /// at the donor's mac80211); `ieee80211_mgd_deauth` flushes neither
     /// during an authentication or association. A flush's failure is passed
-    /// over, as Linux's is.
+    /// over, as Linux's is. An SAE exchange, before any join the station
+    /// could address the frame from, is left with a deauthentication
+    /// between the exchange's addresses, as `ieee80211_mgd_deauth` aborts
+    /// an authentication "by local choice".
     fn deauthenticate_with(&mut self, reason: u16) -> Result<(), Error> {
         if self.left || self.station.phase() == Peering::Idle {
             return Ok(());
@@ -1691,7 +1901,12 @@ impl<C: Chip> Rtl8852c<C> {
             self.held.clear();
             let _ = self.chip.flush(true);
         }
-        if let Ok((local, ap)) = self.station.addresses() {
+        let addresses = self.station.addresses().ok().or_else(|| {
+            self.station
+                .external_authentication()
+                .map(|session| (session.local(), session.peer()))
+        });
+        if let Some((local, ap)) = addresses {
             let protected = self.station.protected_port_authorized();
             let bytes = management(local, ap, 0xc0, protected, &reason.to_le_bytes());
             self.queue_management(None, bytes);
@@ -2064,14 +2279,16 @@ impl<C: Chip> Radio for Rtl8852c<C> {
         self.note(joined)
     }
 
+    /// SAE's start (spec S1.16): the channel and BSSID, then the exchange.
     fn begin_external_authentication(
         &mut self,
-        _: usize,
-        _: Peer,
-        _: Option<Affiliation>,
-        _: u64,
+        handle: usize,
+        peer: Peer,
+        multi_link: Option<Affiliation>,
+        budget_us: u64,
     ) -> Result<Arc<external::Session>, Error> {
-        self.note(Err(Error::Unsupported(SAE_BEFORE_M3B)))
+        let begun = self.begin_external_with(handle, peer, multi_link, budget_us);
+        self.note(begun)
     }
 
     fn begin_six_ghz_external_authentication(
@@ -2087,19 +2304,21 @@ impl<C: Chip> Radio for Rtl8852c<C> {
 
     fn transmit_external_authentication(
         &mut self,
-        _: &external::Session,
-        _: external::Frame<'_>,
+        session: &external::Session,
+        frame: external::Frame<'_>,
     ) -> Result<(), Error> {
-        self.note(Err(Error::Unsupported(SAE_BEFORE_M3B)))
+        let sent = self.transmit_external_with(session, frame);
+        self.note(sent)
     }
 
     fn associate_external(
         &mut self,
-        _: &external::Session,
-        _: usize,
-        _: Join,
+        session: &external::Session,
+        handle: usize,
+        join: Join,
     ) -> Result<(), Error> {
-        self.note(Err(Error::Unsupported(SAE_BEFORE_M3B)))
+        let associated = self.associate_external_with(session, handle, join);
+        self.note(associated)
     }
 
     fn configure(&mut self) -> Result<(), Error> {
@@ -2127,7 +2346,7 @@ impl<C: Chip> Radio for Rtl8852c<C> {
     }
 
     fn install_link_key(&mut self, _: u8, _: u8, _: &[u8], _: ReplaySeed) -> Result<(), Error> {
-        self.note(Err(Error::Unsupported("MLO on an RTL8852C")))
+        self.note(Err(Error::Unsupported(NO_MLO)))
     }
 
     /// The IGTK stays on the host, where mac80211 runs BIP (spec S1.2).
