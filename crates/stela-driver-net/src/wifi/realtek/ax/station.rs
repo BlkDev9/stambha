@@ -20,27 +20,55 @@
 //! - The association programs the chip with the negotiated peer as
 //!   `BSS_CHANGED_ASSOC` does (spec S10), on the channel the join switched
 //!   to.
-//! - EAPOL runs over the data queues, without a key; data frames wait in
-//!   `held` while the chip has no room, management frames in the outbox.
+//! - EAPOL runs over the data queues; data frames wait in `held` while the
+//!   chip has no room, management frames in the outbox.
+//! - The handshake's keys go to the chip's security CAM (`rtw89_ops_set_key`,
+//!   spec S12), CCMP-128 only (spec S1.2): the PTK with a host packet
+//!   number, the GTK receive-only; a key of an index already held replaces
+//!   it as `ieee80211_key_replace` does, the old one deleted first, and an
+//!   identical one is not installed again (`ieee80211_key_identical`). The
+//!   port opens on both, and under PMF on the IGTK too, which stays on the
+//!   host (`BipKey`); a rekey while it is open authorizes it again on the
+//!   keys then held, as mac80211's station stays authorized across one.
+//! - Data under the PTK leaves as `Protection::HostIv` plans it: the
+//!   station reserves its PN and writes its CCMP header, which
+//!   [`super::txd::strip_ccmp`] checks against the reservation and removes;
+//!   the chip puts the PN in the TX descriptor and the hardware encrypts
+//!   (`hw_sec_hdr`, spec S5.4). A reservation is spent whether the frame
+//!   leaves, waits or is dropped, so PNs only increase. Robust management
+//!   frames are sealed on the host under the PTK (`realtek::ccmp`), as
+//!   rtw88 seals them, and leave without a hardware key.
+//! - Received data the hardware decrypted (its CCMP header and MIC kept,
+//!   spec S7.3) is taken under the key its key ID names, through the
+//!   station's replay and port checks, fragments reassembled and A-MSDUs
+//!   split as rtw88 takes them; protected management frames are opened on
+//!   the host when the hardware left them sealed.
 //! - A departure leaves through the chip (spec S11), which releases its
-//!   channel.
+//!   channel. From an association, mac80211's `ieee80211_set_disassoc`
+//!   flushes first ([`chip::Chip::flush`] with drop, then without it after
+//!   a deauthentication of the station's own); each key is deleted after a
+//!   flush without drop, as `rtw89_ops_set_key`'s DISABLE_KEY flushes, the
+//!   PTK first, then the group keys, before the chip disassociates.
 //!
 //! The radio polls (spec S1.4): it never signals, and the keeper services
 //! it from `carrier()` and `receive()`. Its diagnostic is the progress line
 //! of spec S14.6, which names no address, then the chip's own counts.
 //!
-//! This module does not grant (M3a): keys (`install_key` refuses with
-//! "keys before M3b", so the port never opens), encrypted or protected
-//! frames, the IGTK, SAE, RX Block Ack and reordering, fragments and
-//! A-MSDUs received, beacon loss, A-MSDU or aggregated TX, power save,
-//! templates, the watchdog, or following the AP's beacons and channel
-//! switches. Nor the chip half of mac80211's TX flush before a
-//! deauthentication (`rtw89_ops_flush`'s ring wait and PKT_DROP H2Cs).
+//! This module does not grant: any cipher but CCMP-128 (TKIP, GCMP,
+//! CCMP-256, WEP), hardware-encrypted management frames
+//! (`hw_mgmt_tx_encrypt`), SAE, RX Block Ack and reordering, beacon loss,
+//! A-MSDU or aggregated TX, power save, templates, the watchdog, SA Query
+//! requests of its own, or following the AP's beacons and channel
+//! switches. The GTK is deleted before the chip disassociates, where Linux
+//! deletes a station's group key (a vif key in station mode, cfg.c's
+//! `ieee80211_add_key` without an address) only after cfg80211's
+//! disconnect (`__cfg80211_disconnected`'s `rdev_del_key` loop,
+//! `net/wireless/sme.c:1375-1391`); either way the chip ends keyless.
 pub mod chip;
 
-use self::chip::{Association, Chip, Data, Incoming, Management, Received, Token};
+use self::chip::{Association, Chip, Data, HardwareKey, Incoming, Management, Received, Token};
 use super::assoc::HtPeer;
-use super::live::KEYS_BEFORE_M3B;
+use super::txd;
 use crate::{
     Clock, Link, LinkError, Mac,
     wifi::{
@@ -48,17 +76,22 @@ use crate::{
         connection::keeper::{self, Advertisement, Keeper, Peer, Radio, Stage},
         frame::Mpdu,
         network::Network,
+        realtek::ccmp,
         regulatory::{channel::DISABLED, database::Country},
         scan::{self, Outcome, Retirement, Scanner, result::Bss},
         security::{
-            self, Cipher, Integrity, KeyIdentity, KeySlot, PacketNumber, ReplaySeed,
-            SecurityStatus, management as protection,
+            self, Cipher, InstallOutcome, Integrity, KeyIdentity, KeyScope, KeySlot, PacketNumber,
+            ReplaySeed, SecurityStatus,
+            aggregate::{OrderedGroup, Shape},
+            management::{self as protection, BipKey, ManagementCipher},
+            tx::TransmitSeed,
         },
         station::{
             Action, AssociationContext, Completion, Failure, Join, NativeBssObservation,
             Phase as Peering, RegulatoryPolicy, Station, Ticket,
             data::{self, Ingress, Protection, Qos, SequenceOwner, TxClass},
             external,
+            fragments::Fragments,
             multi_link::Affiliation,
             phy::{Capabilities, McsMaps, Role},
             wire::six_ghz::Selection,
@@ -68,6 +101,7 @@ use crate::{
 use alloc::{collections::VecDeque, format, string::String, sync::Arc, vec::Vec};
 use core::fmt;
 use stela_driver_base::entropy::Entropy;
+use zeroize::Zeroizing;
 
 /// How long the radio may take from its start to carrier (M3 spec S1.5):
 /// one scan's budget, `SAE_BUDGET_US` and `HANDSHAKE_TIMEOUT_US`, 28.98 s,
@@ -77,8 +111,15 @@ pub const WIFI_CARRIER_WAIT_US: u64 = 30_000_000;
 const BSS_EXPIRY_US: u64 = 30_000_000;
 /// The data frames that wait for room, the oldest dropped past it.
 const MAX_HELD: usize = 256;
-/// The EAPOL frames whose release reports the progress line awaits.
+/// The EAPOL frames, and the ticketed management frames the station no
+/// longer awaits, whose release reports the progress line still counts.
 const MAX_EAPOL_REPORTS: usize = 64;
+/// What a key the chip cannot take gets (spec S1.2).
+const CCMP_128_ONLY: &str = "a key other than CCMP-128 on an RTL8852C";
+/// `IEEE80211_CCMP_HDR_LEN`, and a management frame's header, before which
+/// a sealed frame's CCMP header goes.
+const CCMP_HEADER: usize = 8;
+const MANAGEMENT_HEADER: usize = 24;
 /// What SAE gets in M3a (M3 Task 17).
 const SAE_BEFORE_M3B: &str = "SAE before M3b";
 /// `ieee80211_add_wmm_info_ie`, without U-APSD.
@@ -125,8 +166,24 @@ impl fmt::Display for Error {
     }
 }
 
-/// The keeper's handle on the IGTK the host would hold (M3b).
+/// The keeper's handle on the IGTK the host holds.
 pub struct ManagementKey;
+
+/// One key the chip's security CAM holds: its slot, kind, key ID, entry
+/// and material (for the host's sealing and opening under the PTK).
+struct Key {
+    slot: KeySlot,
+    pairwise: bool,
+    index: u8,
+    cam: u8,
+    material: Zeroizing<Vec<u8>>,
+}
+
+/// Whether `a` and `b` are the same key material, compared in time that
+/// does not depend on where they differ.
+fn same_material(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (a, b)| d | (a ^ b)) == 0
+}
 
 /// A BSS and when it was last heard, a `cfg80211_internal_bss`.
 struct Heard {
@@ -134,13 +191,15 @@ struct Heard {
     at: u64,
 }
 
-/// A data frame waiting for room: its MPDU, the queue's TID, whether it is
-/// EAPOL, and the peer's rates.
+/// A data frame waiting for room: its MPDU (without its CCMP header when
+/// it goes under a key), the queue's TID, whether it is EAPOL, the peer's
+/// rates, and the key it goes under: CAM entry, key ID and its reserved PN.
 struct Held {
     bytes: Vec<u8>,
     tid: u8,
     eapol: bool,
     supported: u16,
+    key: Option<(u8, u8, u64)>,
 }
 
 /// What a management frame is to the progress line.
@@ -345,8 +404,20 @@ pub struct Rtl8852c<C: Chip> {
     peer: Option<Peer>,
     /// The ticketed management frame whose report the station awaits.
     reporting: Option<(Token, Kind)>,
+    /// Ticketed management frames the chip took before the one the station
+    /// awaits, until their reports: counted, not the station's.
+    earlier: VecDeque<(Token, Kind)>,
     /// The EAPOL frames the chip took, until their reports.
     eapol_reports: VecDeque<Token>,
+    /// The keys the chip's security CAM holds.
+    keys: Vec<Key>,
+    /// The next `KeySlot` number: each key gets its own.
+    next_slot: u16,
+    /// The join's management cipher, and the IGTK the host checks group
+    /// frames under.
+    management_cipher: Option<ManagementCipher>,
+    integrity: Option<BipKey>,
+    fragments: Fragments,
     port_open: bool,
     departing: Option<Ticket>,
     left: bool,
@@ -379,7 +450,13 @@ impl<C: Chip> Rtl8852c<C> {
             context: None,
             peer: None,
             reporting: None,
+            earlier: VecDeque::new(),
             eapol_reports: VecDeque::new(),
+            keys: Vec::new(),
+            next_slot: 0,
+            management_cipher: None,
+            integrity: None,
+            fragments: Fragments::default(),
             port_open: false,
             departing: None,
             left: false,
@@ -426,9 +503,7 @@ impl<C: Chip> Rtl8852c<C> {
 
     fn act(&mut self, action: Action) {
         match action {
-            Action::Transmit { ticket, bytes, .. } => {
-                self.outbox.push_back((Some(ticket), bytes));
-            }
+            Action::Transmit { ticket, bytes, .. } => self.queue_management(Some(ticket), bytes),
             Action::Configure {
                 ticket,
                 context: Some(context),
@@ -445,8 +520,32 @@ impl<C: Chip> Rtl8852c<C> {
         }
     }
 
-    /// The station left: nothing it queued leaves after it.
+    /// `bytes` to the outbox, a protected frame sealed first: mac80211
+    /// encrypts a frame as it enters its TX path. One that cannot be sealed
+    /// (no PTK) is dropped, reported once.
+    fn queue_management(&mut self, ticket: Option<Ticket>, bytes: Vec<u8>) {
+        if bytes.get(1).is_some_and(|fc| fc & 0x40 != 0) {
+            match self.seal(&bytes) {
+                Ok(sealed) => self.outbox.push_back((ticket, sealed)),
+                Err(_) => self.unsupported("a protected management frame without its key"),
+            }
+        } else {
+            self.outbox.push_back((ticket, bytes));
+        }
+    }
+
+    /// The station left of the AP's doing or its own: an association's
+    /// `ieee80211_set_disassoc` without a frame of its own flushes with
+    /// drop first, its failure passed over as Linux's is.
     fn depart(&mut self, ticket: Ticket) {
+        if self.context.is_some() {
+            let _ = self.chip.flush(true);
+        }
+        self.leave(ticket);
+    }
+
+    /// The station left: nothing it queued leaves after it.
+    fn leave(&mut self, ticket: Ticket) {
         self.departing = Some(ticket);
         self.left = true;
         self.port_open = false;
@@ -455,17 +554,32 @@ impl<C: Chip> Rtl8852c<C> {
         self.held.clear();
     }
 
-    /// The station's state gone after its retirement.
+    /// The station's state gone after its retirement, the keys with it. A
+    /// report still awaited is counted when it comes.
     fn clear(&mut self) {
         self.context = None;
         self.peer = None;
         self.admitted = None;
         self.departing = None;
         self.left = false;
-        self.reporting = None;
+        if let Some(report) = self.reporting.take() {
+            self.keep_earlier(report);
+        }
         self.port_open = false;
         self.outbox.clear();
         self.held.clear();
+        self.keys.clear();
+        self.management_cipher = None;
+        self.integrity = None;
+        self.fragments.clear();
+    }
+
+    /// A report the station no longer awaits, kept for the progress line.
+    fn keep_earlier(&mut self, report: (Token, Kind)) {
+        if self.earlier.len() >= MAX_EAPOL_REPORTS {
+            self.earlier.pop_front();
+        }
+        self.earlier.push_back(report);
     }
 
     fn observed(&self, handle: usize) -> Result<Arc<NativeBssObservation>, Error> {
@@ -484,16 +598,11 @@ impl<C: Chip> Rtl8852c<C> {
 
     /// rtw88's `send_management` (`station.rs:889`): the outbox, oldest
     /// first, while the chip has room; a ticketed frame's token is kept
-    /// for its report.
+    /// for its report, the token it replaces among the earlier ones. A
+    /// protected frame was sealed as it was queued.
     fn send_management(&mut self) -> Result<(), Error> {
         let basic_rates = self.basic_rates();
         while let Some((_, bytes)) = self.outbox.front() {
-            // A protected frame needs the PTK the host would seal it under.
-            if bytes[1] & 0x40 != 0 {
-                self.outbox.pop_front();
-                self.unsupported("a protected management frame before M3b");
-                continue;
-            }
             let frame = Management { bytes, basic_rates };
             let Some(token) = Self::chip(self.chip.transmit_management(&frame))? else {
                 return Ok(());
@@ -508,7 +617,9 @@ impl<C: Chip> Rtl8852c<C> {
                 Kind::Other => {}
             }
             if let Some(ticket) = ticket {
-                self.reporting = Some((token, kind));
+                if let Some(earlier) = self.reporting.replace((token, kind)) {
+                    self.keep_earlier(earlier);
+                }
                 self.station.submitted(ticket).map_err(Error::Station)?;
             }
         }
@@ -524,7 +635,7 @@ impl<C: Chip> Rtl8852c<C> {
                 tid: held.tid,
                 eapol: held.eapol,
                 supported_rates: held.supported,
-                key: None,
+                key: held.key,
             };
             let Some(token) = Self::chip(self.chip.transmit_data(&frame))? else {
                 return Ok(());
@@ -542,10 +653,44 @@ impl<C: Chip> Rtl8852c<C> {
         Ok(())
     }
 
-    /// rtw88's `send` (`station.rs:1121`, spec S13.1) without A-MSDU, TX
-    /// Block Ack or keys: the MSDU as the station prepares it, held, then
-    /// sent while the chip has room, as mac80211 hands a frame to the
-    /// driver at once.
+    /// rtw88's `seal` (`station.rs:918`), `IEEE80211_KEY_FLAG_SW_MGMT_TX`'s
+    /// host half: `bytes`, a robust management frame, sealed under the PTK
+    /// at the next PN of its slot, which data shares, as one key's
+    /// `tx_pn` counts both in Linux.
+    fn seal(&mut self, bytes: &[u8]) -> Result<Vec<u8>, Error> {
+        let key = self
+            .keys
+            .iter_mut()
+            .find(|key| key.pairwise)
+            .ok_or(Error::Refused("no pairwise key"))?;
+        let identity = key.slot.installed().ok_or(Error::Refused("no key"))?;
+        if bytes.len() < MANAGEMENT_HEADER {
+            return Err(Error::Refused("a management frame shorter than its header"));
+        }
+        let nonce = key
+            .slot
+            .reserve_host_tx_nonce(identity)
+            .map_err(Error::Key)?;
+        let pn = nonce.packet_number();
+        let header: [u8; CCMP_HEADER] = nonce.into_header();
+        let material: &[u8; 16] = key.material[..]
+            .try_into()
+            .map_err(|_| Error::Unsupported(CCMP_128_ONLY))?;
+        Ok(ccmp::seal(
+            material,
+            &bytes[..MANAGEMENT_HEADER],
+            &header,
+            pn,
+            &bytes[MANAGEMENT_HEADER..],
+        ))
+    }
+
+    /// rtw88's `send` (`station.rs:1121`, spec S13.1) without A-MSDU or TX
+    /// Block Ack: the MSDU as the station prepares it under the keys held,
+    /// a `HostIv` frame's CCMP header checked against its reservation and
+    /// removed (spec S5.4), held, then sent while the chip has room, as
+    /// mac80211 hands a frame to the driver at once. A frame the strip
+    /// refuses is dropped, its PN spent.
     fn send(&mut self, ethernet: &[u8], class: TxClass) -> Result<(), Error> {
         let epoch = self
             .station
@@ -554,7 +699,7 @@ impl<C: Chip> Rtl8852c<C> {
         let context = self.context.clone().ok_or(Error::Refused("no context"))?;
         let tid = data::data_tid(&context, None, None, ethernet);
         let mut policy = Admitted(&self.channels);
-        let mut keys: Vec<&mut KeySlot> = Vec::new();
+        let mut keys: Vec<&mut KeySlot> = self.keys.iter_mut().map(|key| &mut key.slot).collect();
         let plan = match tid {
             Some(tid) => self.station.prepare_qos_msdu_refs(
                 epoch,
@@ -577,12 +722,22 @@ impl<C: Chip> Rtl8852c<C> {
             ),
         }
         .map_err(Error::Data)?;
-        let (_, _, mpdu, protection, _, _) = plan.into_parts();
-        match protection {
-            Protection::None => {}
-            Protection::HostIv { .. } => return Err(Error::Unsupported(KEYS_BEFORE_M3B)),
+        let (_, _, mut mpdu, protection, _, _) = plan.into_parts();
+        let key = match protection {
+            Protection::None => None,
+            Protection::HostIv { key, pn } => {
+                let cam = self
+                    .keys
+                    .iter()
+                    .find(|held| held.slot.installed() == Some(key))
+                    .map(|held| held.cam)
+                    .ok_or(Error::Refused("a key the chip does not hold"))?;
+                txd::strip_ccmp(&mut mpdu, pn.value(), key.index())
+                    .map_err(|error| Error::Chip(format!("{error}")))?;
+                Some((cam, key.index(), pn.value()))
+            }
             Protection::Firmware { .. } => return Err(Error::Refused("a firmware key")),
-        }
+        };
         if self.held.len() >= MAX_HELD {
             self.held.pop_front();
         }
@@ -591,6 +746,7 @@ impl<C: Chip> Rtl8852c<C> {
             tid: tid.unwrap_or(0),
             eapol: class != TxClass::Data,
             supported: context.negotiated().legacy.supported,
+            key,
         });
         self.send_data()
     }
@@ -631,24 +787,22 @@ impl<C: Chip> Rtl8852c<C> {
 
     /// A frame's release report: the ticketed management frame's goes to
     /// the station as its TX status (rtw88's `Report::Transmitted`,
-    /// `station.rs:1275-1288`, spec S1.10); an EAPOL frame's is counted.
+    /// `station.rs:1275-1288`, spec S1.10), and is counted; one the station
+    /// no longer awaits, and an EAPOL frame's, is counted only.
     fn transmitted(&mut self, token: Token, acknowledged: bool, now: u64) -> Result<(), Error> {
         if let Some((_, kind)) = self.reporting.filter(|&(awaited, _)| awaited == token) {
             self.reporting = None;
-            if acknowledged {
-                let exchange = match kind {
-                    Kind::Authentication => self.progress.auth.as_mut(),
-                    Kind::Association => self.progress.assoc.as_mut(),
-                    Kind::Other => None,
-                };
-                if let Some(exchange) = exchange {
-                    bump(&mut exchange.acked);
-                }
-            }
+            self.count_ack(kind, acknowledged);
             return self
                 .station
                 .management_status(acknowledged, now)
                 .map_err(Error::Station);
+        }
+        if let Some(at) = self.earlier.iter().position(|&(sent, _)| sent == token) {
+            if let Some((_, kind)) = self.earlier.remove(at) {
+                self.count_ack(kind, acknowledged);
+            }
+            return Ok(());
         }
         if let Some(at) = self.eapol_reports.iter().position(|&sent| sent == token) {
             self.eapol_reports.remove(at);
@@ -657,6 +811,18 @@ impl<C: Chip> Rtl8852c<C> {
             }
         }
         Ok(())
+    }
+
+    /// An acknowledged authentication or association, counted.
+    fn count_ack(&mut self, kind: Kind, acknowledged: bool) {
+        let exchange = match kind {
+            Kind::Authentication => self.progress.auth.as_mut(),
+            Kind::Association => self.progress.assoc.as_mut(),
+            Kind::Other => None,
+        };
+        if acknowledged && let Some(exchange) = exchange {
+            bump(&mut exchange.acked);
+        }
     }
 
     /// The scan ended (spec S8.2): its ticket completed, the chip restored
@@ -711,12 +877,15 @@ impl<C: Chip> Rtl8852c<C> {
         Some(mpdu)
     }
 
-    /// rtw88's `frame` (`station.rs:1344`) without keys: a scan's beacons
-    /// and probe responses to the scanner, management frames to
-    /// [`Self::management_frame`], unprotected whole MSDUs to the station.
-    /// A protected frame has no key to be taken under in M3a, and
-    /// fragments and A-MSDUs are M3b's (spec S13.3).
-    fn frame(&mut self, frame: Mpdu, now: u64) -> Result<(), Error> {
+    /// rtw88's `frame` (`station.rs:1344`) without TKIP or Block Ack
+    /// reordering (spec S13.3): a scan's beacons and probe responses to the
+    /// scanner, management frames to [`Self::management_frame`], and data
+    /// with a body to the station, a protected frame under the key its key
+    /// ID names (pairwise for unicast, a group key for a group address),
+    /// dropped without one, failing its ICV, or left encrypted by the
+    /// hardware (mac80211 would decrypt it in software; no Stela station
+    /// does). Fragments are reassembled.
+    fn frame(&mut self, mut frame: Mpdu, now: u64) -> Result<(), Error> {
         let header = *frame.header();
         if let Some(ticket) = self.scanning
             && matches!(header.control & 0xfc, 0x80 | 0x50)
@@ -730,32 +899,93 @@ impl<C: Chip> Rtl8852c<C> {
         if header.control & 12 == 0 {
             return self.management_frame(frame, now);
         }
-        if header.control & 12 != 8
-            || !header.data_present()
-            || header.protected()
-            || header.fragmented()
-            || header.amsdu
-        {
+        if header.control & 12 != 8 || !header.data_present() {
             return Ok(());
         }
-        self.deliver(&frame);
+        if header.protected() {
+            let multicast = header.receiver.is_multicast();
+            let index = frame.bytes().get(header.length + 3).map(|byte| byte >> 6);
+            let Some(key) = self
+                .keys
+                .iter()
+                .find(|key| key.pairwise != multicast && Some(key.index) == index)
+                .and_then(|key| key.slot.installed())
+            else {
+                return Ok(());
+            };
+            if frame.security.icv_error || !frame.security.decrypted {
+                return Ok(());
+            }
+            frame.security.key = Some(key);
+        }
+        if header.fragmented() {
+            self.reassemble(&frame, now);
+            return Ok(());
+        }
+        self.deliver(frame);
         Ok(())
     }
 
-    /// rtw88's `deliver` (`station.rs:1451`) of one MSDU: mac80211 drops
-    /// what its port check refuses. EAPOL goes to the keeper.
-    fn deliver(&mut self, frame: &Mpdu) {
-        let Some(epoch) = self.station.association_epoch() else {
-            return;
-        };
-        let mut keys: Vec<&mut KeySlot> = Vec::new();
-        match self.station.receive_msdu_refs(epoch, frame, &mut keys) {
-            Ok(Ingress::Data(ethernet)) => self.received.push_back(ethernet),
-            Ok(Ingress::ControlPort { ethernet, .. }) => {
-                bump(&mut self.progress.eapol.get_or_insert_default().received);
-                self.events.push_back(keeper::Event::Eapol(ethernet));
+    /// rtw88's `reassemble` (`station.rs:1415`): `frame`, one fragment;
+    /// the station has the MSDU with the last of them.
+    fn reassemble(&mut self, frame: &Mpdu, now: u64) {
+        let key = frame.security.key;
+        let slot = self
+            .keys
+            .iter_mut()
+            .map(|key| &mut key.slot)
+            .find(|slot| key.is_some() && slot.installed() == key);
+        if let Some(whole) = self.fragments.add(frame, slot, now) {
+            self.deliver(whole);
+        }
+    }
+
+    /// rtw88's `deliver` (`station.rs:1451`): `frame`, an MSDU or an
+    /// A-MSDU, to the station; mac80211 drops what its replay and port
+    /// checks refuse. EAPOL goes to the keeper.
+    fn deliver(&mut self, frame: Mpdu) {
+        let ingress = if frame.header().amsdu {
+            let Some(context) = self.context.clone() else {
+                return;
+            };
+            let key = frame.security.key;
+            // SAFETY: an A-MSDU is one record here, delivered as received
+            // (no reorder buffer holds it), and `clear` drops what an
+            // older association left.
+            let group =
+                unsafe { OrderedGroup::new(context, alloc::vec![frame], Shape::WholeMpdu, ()) };
+            let slot = self
+                .keys
+                .iter_mut()
+                .map(|key| &mut key.slot)
+                .find(|slot| key.is_some() && slot.installed() == key);
+            let Ok(received) = self.station.receive_ordered_group(&group, slot) else {
+                return;
+            };
+            let keys: Vec<&KeySlot> = self.keys.iter().map(|key| &key.slot).collect();
+            match self.station.receive_group_refs(&received, &keys) {
+                Ok(ingress) => ingress,
+                Err(_) => return,
             }
-            Err(_) => {}
+        } else {
+            let Some(epoch) = self.station.association_epoch() else {
+                return;
+            };
+            let mut keys: Vec<&mut KeySlot> =
+                self.keys.iter_mut().map(|key| &mut key.slot).collect();
+            match self.station.receive_msdu_refs(epoch, &frame, &mut keys) {
+                Ok(ingress) => alloc::vec![ingress],
+                Err(_) => return,
+            }
+        };
+        for ingress in ingress {
+            match ingress {
+                Ingress::Data(ethernet) => self.received.push_back(ethernet),
+                Ingress::ControlPort { ethernet, .. } => {
+                    bump(&mut self.progress.eapol.get_or_insert_default().received);
+                    self.events.push_back(keeper::Event::Eapol(ethernet));
+                }
+            }
         }
     }
 
@@ -777,29 +1007,50 @@ impl<C: Chip> Rtl8852c<C> {
         }
     }
 
-    /// rtw88's `management_frame` (`station.rs:1514`) of M3a: what the
-    /// station's authentication and association take, and the AP's
-    /// departures. Beacons and probe responses outside a scan, action
-    /// frames (Block Ack is M3 Task 16's; channel switches are not
-    /// followed), protected frames, and, under PMF, robust frames to
-    /// everyone (BIP is M3b's) are dropped, as is everything before a join.
+    /// rtw88's `management_frame` (`station.rs:1514`): what the station's
+    /// authentication and association take, and the AP's departures; a
+    /// protected frame to [`Self::protected_management`]. Under PMF a
+    /// robust frame to everyone must carry its IGTK's MIC (BIP on the host)
+    /// and a departure to the station alone must come protected once keys
+    /// are installed (`ieee80211_drop_unencrypted_mgmt`). Beacons and
+    /// probe responses outside a scan and unprotected action frames (Block
+    /// Ack is M3 Task 16's; channel switches are not followed) are dropped,
+    /// as is everything before a join.
     fn management_frame(&mut self, frame: Mpdu, now: u64) -> Result<(), Error> {
         let header = *frame.header();
         let subtype = header.control & 0xfc;
-        if matches!(subtype, 0x80 | 0x50 | 0xd0) || header.protected() {
+        if matches!(subtype, 0x80 | 0x50) {
             return Ok(());
         }
-        if self.station.phase() == Peering::ExternalAuthenticating {
+        if header.protected() {
+            return self.protected_management(frame);
+        }
+        if subtype == 0xd0 || self.station.phase() == Peering::ExternalAuthenticating {
             return Ok(());
         }
         let Some(epoch) = self.station.association_epoch() else {
             return Ok(());
         };
-        // `ieee80211_drop_unencrypted_mgmt` of an MFP station.
-        if self.station.requires_protected_management()
-            && header.receiver.is_multicast()
-            && protection::robust(&frame)
-        {
+        let pmf = self.station.requires_protected_management();
+        if pmf && header.receiver.is_multicast() && protection::robust(&frame) {
+            let Some(integrity) = &mut self.integrity else {
+                return Ok(());
+            };
+            let Ok(authenticated) = integrity.authenticate(&frame) else {
+                return Ok(());
+            };
+            if matches!(subtype, 0xa0 | 0xc0) {
+                let body = authenticated.body();
+                let action = self
+                    .station
+                    .receive_protected_departure(epoch, &frame, body)
+                    .map_err(Error::Station)?;
+                self.events.push_back(keeper::Event::ConnectionLost);
+                self.act(action);
+            }
+            return Ok(());
+        }
+        if pmf && matches!(subtype, 0xa0 | 0xc0) && !self.keys.is_empty() {
             return Ok(());
         }
         let before = self.station.phase();
@@ -812,6 +1063,73 @@ impl<C: Chip> Rtl8852c<C> {
         self.act(action);
         if authenticated {
             Self::chip(self.chip.authenticated())?;
+        }
+        Ok(())
+    }
+
+    /// rtw88's `protected_management` (`station.rs:1598`) without Block
+    /// Ack (M3 Task 16) or channel switches: a frame under the PTK, opened
+    /// on the host when the hardware left it sealed, taken once under its
+    /// packet number (`ieee80211_crypto_ccmp_decrypt` keeps management's
+    /// apart from data's); a departure ends the association, and an SA
+    /// Query request is answered, sealed in turn.
+    fn protected_management(&mut self, mut frame: Mpdu) -> Result<(), Error> {
+        let local = self.address;
+        let Some(epoch) = self.station.association_epoch() else {
+            return Ok(());
+        };
+        let header = *frame.header();
+        let Some(key) = self.keys.iter_mut().find(|key| key.pairwise) else {
+            return Ok(());
+        };
+        if frame.security.icv_error {
+            return Ok(());
+        }
+        if !frame.security.decrypted {
+            let number = frame
+                .bytes()
+                .get(header.length..)
+                .and_then(|iv| PacketNumber::from_header(iv).ok());
+            let material: Option<&[u8; 16]> = key.material[..].try_into().ok();
+            let (Some((number, _)), Some(material)) = (number, material) else {
+                return Ok(());
+            };
+            let Some(opened) = ccmp::open(material, frame.bytes(), number) else {
+                return Ok(());
+            };
+            let security = SecurityStatus {
+                decrypted: true,
+                integrity: Integrity::Verified,
+                ..SecurityStatus::default()
+            };
+            let Ok(clear) = Mpdu::new(opened, frame.radio.clone(), security) else {
+                return Ok(());
+            };
+            frame = clear;
+        }
+        frame.security.key = key.slot.installed();
+        let Ok(authenticated) = key.slot.authorize_unicast_management(&frame, local) else {
+            return Ok(());
+        };
+        let body = authenticated.body();
+        match header.control & 0xfc {
+            0xa0 | 0xc0 => {
+                let action = self
+                    .station
+                    .receive_protected_departure(epoch, &frame, body)
+                    .map_err(Error::Station)?;
+                self.events.push_back(keeper::Event::ConnectionLost);
+                self.act(action);
+            }
+            0xd0 if body.len() >= 4 && body[..2] == [8, 0] => {
+                let response = [8, 1, body[2], body[3]];
+                let Some(ap) = header.transmitter else {
+                    return Ok(());
+                };
+                let bytes = management(local, ap, 0xd0, true, &response);
+                self.queue_management(None, bytes);
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -971,6 +1289,7 @@ impl<C: Chip> Rtl8852c<C> {
         Self::chip(self.chip.tune(bss.channel))?;
         Self::chip(self.chip.set_bssid(bss.bssid))?;
         self.peer = Some(peer);
+        self.management_cipher = join.request.pmf().map(|pmf| pmf.management());
         self.progress.auth.get_or_insert_default();
         let now = self.clock.now_us();
         let mut policy = Admitted(&self.channels);
@@ -1014,37 +1333,217 @@ impl<C: Chip> Rtl8852c<C> {
 
     /// rtw88's `deauthenticate` (`station.rs:2296`): the deauthentication
     /// after what the outbox holds, then the station's departure, even when
-    /// the chip refused the frame. Held data never leaves after it:
-    /// mac80211 flushes with drop first (`ieee80211_set_disassoc`), and
-    /// the departure drops what the chip has not taken.
+    /// the chip refused the frame. Held data never leaves after it. From an
+    /// association, as `ieee80211_set_disassoc` sends it: a flush with drop
+    /// first (mac80211 purges its queues, the chip drops what it holds),
+    /// the frame, then a flush without drop so it leaves (`mlme.c:4594-4604`
+    /// at the donor's mac80211); `ieee80211_mgd_deauth` flushes neither
+    /// during an authentication or association. A flush's failure is passed
+    /// over, as Linux's is.
     fn deauthenticate_with(&mut self, reason: u16) -> Result<(), Error> {
         if self.left || self.station.phase() == Peering::Idle {
             return Ok(());
         }
+        let associated = self.context.is_some();
+        if associated {
+            self.held.clear();
+            let _ = self.chip.flush(true);
+        }
         if let Ok((local, ap)) = self.station.addresses() {
             let protected = self.station.protected_port_authorized();
             let bytes = management(local, ap, 0xc0, protected, &reason.to_le_bytes());
-            self.outbox.push_back((None, bytes));
+            self.queue_management(None, bytes);
         }
         let sent = self.send_management();
-        let action = self.station.disconnect().map_err(Error::Station)?;
-        self.act(action);
+        if associated {
+            let _ = self.chip.flush(false);
+        }
+        match self.station.disconnect().map_err(Error::Station)? {
+            Action::Remove { ticket, .. } => self.leave(ticket),
+            action => self.act(action),
+        }
         sent
     }
 
-    /// rtw88's `retire_peer` (`station.rs:2311`), the chip first: its
-    /// disassociation (spec S11) releases the channel, then the removal is
-    /// accepted. A failed disassociation powered the chip off, which holds
-    /// no association either.
+    /// rtw88's `retire_peer` (`station.rs:2311`) on rtw89 (spec S14.5):
+    /// `sta_info_flush`'s key deletes first, the PTK, then the group keys by
+    /// key ID, each as `rtw89_ops_set_key`'s DISABLE_KEY runs it, a flush
+    /// without drop, then the CAM delete (`mac80211.c:1010-1015`); then the
+    /// chip's disassociation (spec S11), which releases the channel; then
+    /// the removal is accepted. Every step runs whatever an earlier one
+    /// returned, as mac80211 goes on past a driver's failures, and the
+    /// first error is returned. A failed disassociation powered the chip
+    /// off, which holds no association either.
     fn retire(&mut self) -> Result<(), Error> {
+        let mut keys = core::mem::take(&mut self.keys);
+        keys.sort_by_key(|key| (!key.pairwise, key.index));
+        let mut first = Ok(());
+        for key in &keys {
+            let _ = self.chip.flush(false);
+            let removed = Self::chip(self.chip.remove_key(key.cam));
+            if first.is_ok() {
+                first = removed;
+            }
+        }
+        drop(keys);
         let left = Self::chip(self.chip.disassociate());
+        if first.is_ok() {
+            first = left;
+        }
         if let Some(ticket) = self.departing.take() {
             self.station
                 .complete_removal(ticket, Completion::Accepted)
                 .map_err(Error::Station)?;
         }
         self.clear();
-        left
+        first
+    }
+
+    /// `rtw89_ops_set_key`'s SET_KEY (spec S12, S14.5) of a CCMP-128 key:
+    /// the pairwise key with `TransmitSeed::host(0)`, a group key
+    /// receive-only. As `ieee80211_key_link`: an identical key of the same
+    /// kind and index is not installed again (-EALREADY, which mac80211
+    /// takes as success); another replaces it (`ieee80211_key_replace`),
+    /// the old one deleted first (a flush without drop, then the CAM
+    /// delete, its failure passed over), then the new one installed. The
+    /// key counts as installed only once the chip's `add_key` returned its
+    /// CAM entry, the firmware having acknowledged it; otherwise its slot
+    /// is never completed and goes. An open port is authorized again on the
+    /// keys then held.
+    fn install(
+        &mut self,
+        pairwise: bool,
+        index: u8,
+        material: &[u8],
+        receive: ReplaySeed,
+    ) -> Result<KeyIdentity, Error> {
+        self.progress.keys.get_or_insert(0);
+        let temporal: &[u8; 16] = material
+            .try_into()
+            .map_err(|_| Error::Unsupported(CCMP_128_ONLY))?;
+        let peer = self
+            .station
+            .pairwise_peer()
+            .ok_or(Error::Refused("no peer"))?;
+        if let Some(at) = self
+            .keys
+            .iter()
+            .position(|key| key.pairwise == pairwise && key.index == index)
+        {
+            if same_material(&self.keys[at].material, material)
+                && let Some(identity) = self.keys[at].slot.installed()
+            {
+                return Ok(identity);
+            }
+            let old = self.keys.remove(at);
+            // What still waits under the old key goes with it: its CAM
+            // entry may hold the new key by the time the chip has room.
+            self.held
+                .retain(|held| held.key.is_none_or(|(cam, _, _)| cam != old.cam));
+            let _ = self.chip.flush(false);
+            let _ = self.chip.remove_key(old.cam);
+        }
+        let scope = if pairwise {
+            KeyScope::Pairwise(peer)
+        } else {
+            KeyScope::Group(peer)
+        };
+        let transmit = if pairwise {
+            TransmitSeed::host(PacketNumber::new(0).ok_or(Error::Refused("packet number"))?)
+        } else {
+            TransmitSeed::RECEIVE_ONLY
+        };
+        // SAFETY: the counter gives each key of the radio its own slot,
+        // which no other `KeySlot` controls.
+        let mut slot = unsafe { KeySlot::new(self.next_slot) }.map_err(Error::Key)?;
+        self.next_slot = self.next_slot.wrapping_add(1);
+        let ticket = slot
+            .begin_install(index, Cipher::Ccmp128, material, receive, scope, transmit)
+            .map_err(Error::Key)?;
+        let identity = ticket.identity();
+        let cam = Self::chip(self.chip.add_key(&HardwareKey {
+            pairwise,
+            index,
+            material: temporal,
+        }))?;
+        slot.complete_install(ticket, InstallOutcome::Accepted)
+            .map_err(Error::Key)?;
+        self.keys.push(Key {
+            slot,
+            pairwise,
+            index,
+            cam,
+            material: Zeroizing::new(material.to_vec()),
+        });
+        if let Some(keys) = &mut self.progress.keys {
+            bump(keys);
+        }
+        // mac80211 keeps the AP's station authorized across a rekey; the
+        // station layer authorizes one PTK and GTK, which a replaced or
+        // newer key leaves behind, so the port is authorized again on the
+        // keys now held. The keeper installs a key only from an
+        // authenticated handshake.
+        if self.port_open {
+            let epoch = self
+                .station
+                .association_epoch()
+                .ok_or(Error::Refused("no association"))?;
+            self.authorize(epoch)?;
+        }
+        Ok(identity)
+    }
+
+    /// The host's IGTK (spec S1.2), rtw88's `install_management_key`
+    /// (`station.rs:2236`): BIP under the join's management cipher, beside
+    /// the GTK, which must be installed first (`Pending` until then).
+    fn install_integrity(
+        &mut self,
+        index: u8,
+        material: &[u8],
+        receive: PacketNumber,
+    ) -> Result<Arc<ManagementKey>, Error> {
+        let cipher = self
+            .management_cipher
+            .ok_or(Error::Refused("no management cipher"))?;
+        let gtk = self
+            .keys
+            .iter()
+            .rev()
+            .find(|key| !key.pairwise)
+            .and_then(|key| key.slot.installed())
+            .ok_or(Error::Pending)?;
+        self.integrity = Some(
+            BipKey::new(gtk, cipher, index, material, receive)
+                .map_err(|_| Error::Refused("the IGTK"))?,
+        );
+        Ok(Arc::new(ManagementKey))
+    }
+
+    /// rtw88's `authorize_port` (`station.rs:2271`): the PTK and the last
+    /// GTK, under PMF with the association's protection.
+    fn authorize(&mut self, epoch: u64) -> Result<(), Error> {
+        let context = self.context.clone().ok_or(Error::Refused("no context"))?;
+        let ptk = self
+            .keys
+            .iter()
+            .find(|key| key.pairwise)
+            .ok_or(Error::Refused("no pairwise key"))?;
+        let gtk = self
+            .keys
+            .iter()
+            .rev()
+            .find(|key| !key.pairwise)
+            .ok_or(Error::Refused("no group key"))?;
+        let links = [(&ptk.slot, &gtk.slot)];
+        if self.station.requires_protected_management() {
+            self.station
+                .authorize_protected_port(&context, epoch, &links)
+        } else {
+            self.station.authorize_port(epoch, &links)
+        }
+        .map_err(Error::Station)?;
+        self.port_open = true;
+        Ok(())
     }
 }
 
@@ -1259,53 +1758,51 @@ impl<C: Chip> Radio for Rtl8852c<C> {
         self.note(sent)
     }
 
-    /// `rtw89_ops_set_key` takes CCMP-128 alone here (spec S1.2); in M3a
-    /// none reaches the chip (spec S14.5).
+    /// `rtw89_ops_set_key` of CCMP-128 alone (spec S1.2), into the chip's
+    /// security CAM (its `install`).
     fn install_key(
         &mut self,
-        _pairwise: bool,
-        _index: u8,
+        pairwise: bool,
+        index: u8,
         material: &[u8],
-        _receive: ReplaySeed,
+        receive: ReplaySeed,
     ) -> Result<KeyIdentity, Error> {
-        self.progress.keys.get_or_insert(0);
-        let refused = if material.len() != Cipher::Ccmp128.key_length() {
-            Error::Unsupported("a key other than CCMP-128 on an RTL8852C")
-        } else {
-            Error::Unsupported(KEYS_BEFORE_M3B)
-        };
-        self.note(Err(refused))
+        let installed = self.install(pairwise, index, material, receive);
+        self.note(installed)
     }
 
     fn install_link_key(&mut self, _: u8, _: u8, _: &[u8], _: ReplaySeed) -> Result<(), Error> {
         self.note(Err(Error::Unsupported("MLO on an RTL8852C")))
     }
 
-    /// The IGTK would stay on the host (spec S1.2); M3a has no PTK to
-    /// hold it beside.
+    /// The IGTK stays on the host, where mac80211 runs BIP (spec S1.2).
     unsafe fn install_management_key(
         &mut self,
         _: u64,
-        _: u8,
-        _: &[u8],
-        _: PacketNumber,
+        index: u8,
+        material: &[u8],
+        receive: PacketNumber,
     ) -> Result<Arc<ManagementKey>, Error> {
-        self.note(Err(Error::Unsupported(KEYS_BEFORE_M3B)))
+        let installed = self.install_integrity(index, material, receive);
+        self.note(installed)
     }
 
+    /// A rekeyed IGTK replaces the host's.
     unsafe fn rotate_management_key(
         &mut self,
         _: &Arc<ManagementKey>,
-        _: u8,
-        _: &[u8],
-        _: PacketNumber,
+        index: u8,
+        material: &[u8],
+        receive: PacketNumber,
     ) -> Result<Arc<ManagementKey>, Error> {
-        self.note(Err(Error::Unsupported(KEYS_BEFORE_M3B)))
+        let installed = self.install_integrity(index, material, receive);
+        self.note(installed)
     }
 
-    /// The port opens on an installed PTK and GTK, which M3a never has.
-    fn authorize_port(&mut self, _: u64) -> Result<(), Error> {
-        self.note(Err(Error::Refused("no pairwise key")))
+    /// The port opens on an installed PTK and GTK.
+    fn authorize_port(&mut self, epoch: u64) -> Result<(), Error> {
+        let authorized = self.authorize(epoch);
+        self.note(authorized)
     }
 
     fn deauthenticate(&mut self, reason: u16) -> Result<(), Error> {

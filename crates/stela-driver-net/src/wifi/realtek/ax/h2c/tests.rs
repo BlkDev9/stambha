@@ -776,3 +776,27 @@ fn security_cam_class_and_func_constants_are_linuxs() {
     assert_eq!((H2C_CL_MAC_FR_EXCHG, H2C_FUNC_MAC_DCTLINFO_UD_V1), (5, 9));
     assert_eq!((SEC_CAM_LEN, SEC_KEY_TYPE_CCMP128), (20, 6));
 }
+
+#[test]
+fn pkt_drop_is_byte_exact() {
+    // rtw89_fw_h2c_pkt_drop (fw.c:10621-10676) for rtw89_mac_pkt_drop_sta's
+    // station (mac.c:7255-7278): MAC / FW_OFLD / PKT_DROP (0x1b), rack 0,
+    // dack 0, H2C_PKT_DROP_LEN 24: w0 = sel [7:0] | macid [15:8] | band 0
+    // [23:16] | port [31:24]; w1 = mbssid 0 [7:0] | tf_trs 0 [15:8] (no HE
+    // association, core.c:5718-5722); w2..w5 = macid_band_sel 0
+    // (fw.h:2110-2158).
+    for (sel, seq) in [(0u8, 17u8), (1, 18), (2, 19), (3, 20)] {
+        let (got, p) = H2c::at(seq).pkt_drop(sel, 0, 0);
+        assert_eq!(got, seq);
+        let (len, b) = body(&p);
+        assert_eq!(len, 32);
+        // REC_ACK only by the every-fourth-sequence rule.
+        let rack = if seq % 4 == 0 { 0x40 } else { 0 };
+        assert_eq!(&b[..8], &[0x25, 0x1B, 0x00, seq, 0x20, rack, 0x00, 0x00]);
+        let mut payload = [0u8; 24];
+        payload[0] = sel;
+        assert_eq!(&b[8..], &payload[..]);
+    }
+    let (_, p) = H2c::at(1).pkt_drop(3, 0x7F, 2);
+    assert_eq!(word(&body(&p).1[8..], 0), 0x0200_7F03);
+}

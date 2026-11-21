@@ -100,12 +100,18 @@
 //! from [`keys`]): [`Live::add_key`] installs one in the security CAM and
 //! points the address CAM at it, waiting for the firmware's receipt and
 //! acknowledgement, and [`Live::remove_key`] deletes one; [`Live::leave`]
-//! deletes what is left first. A refused key leaves the chip on.
+//! deletes what is left first. A refused key leaves the chip on. A data
+//! frame goes under a key as its TX descriptor names the key's CAM entry,
+//! key ID and host PN ([`Live::queue_data`]), only an entry
+//! [`Live::add_key`] installed ([`Chip::transmit_data`]). [`Live::flush`]
+//! is `rtw89_ops_flush`: the TX rings' wait, then with drop the PKT_DROP
+//! H2Cs for the AP's station, without it the wait for the MAC's TX queues.
 //!
-//! This module sends no frame under a key yet (M3 Task 15:
-//! [`Chip::transmit_data`] refuses a keyed frame), and grants no TX status
-//! beyond RPQ's: a report says the MAC is done with a frame, acknowledged or
-//! not, nothing more. It runs no IQK, DPK, TSSI, watchdog, interrupts, probe
+//! This module grants no TX status beyond RPQ's: a report says the MAC is
+//! done with a frame, acknowledged or not, nothing more; a flush grants no
+//! empty queue either, as Linux's waits only log their timeouts. It
+//! encrypts no management frame (a robust one is sealed on the host, spec
+//! S1.2). It runs no IQK, DPK, TSSI, watchdog, interrupts, probe
 //! request or idle power save, and processes no beacon filter report (M3
 //! Task 18). It has no `Drop`: a live chip that is dropped keeps running,
 //! its rings and pools quarantined, as rtw88's `Hardware` keeps running for
@@ -121,7 +127,7 @@ use super::core_tail;
 use super::dm::Dig;
 use super::efuse::RxGain;
 use super::h2c::{H2c, ScanChannel};
-use super::io::{AxError, AxIo};
+use super::io::{AxError, AxIo, poll32};
 use super::keys::{self, KeyCam};
 use super::pci::{Rings, TX_DONE, TxChannel, TxPools, WD_HEAD_BYTES, releases};
 use super::receive::{Event, MAX_PENDING, Mode, Received, Tag};
@@ -130,7 +136,7 @@ use super::scan::{self, EdccaBak, ScanEnd, ScanError, hw_band, wifi_band};
 use super::station::chip::{
     self, Association, Chip, Data, HardwareKey, Incoming, Management, Token,
 };
-use super::txd::{self, RateCaps};
+use super::txd::{self, RateCaps, TxSec};
 use super::txpwr_tables::TxPowerTables;
 use super::vif;
 use crate::Mac;
@@ -168,9 +174,25 @@ pub const CONNECTED: AxError =
 /// ([`Live::held_dropped`]).
 const MAX_HELD: usize = MAX_PENDING;
 
-/// What every keyed frame gets until encrypted data is sent (M3 Task 15),
-/// and what the station's key calls got in M3a (spec S14.5).
+/// What the station's key calls got in M3a (spec S14.5), which the host
+/// check's M3a verdict still reads; nothing returns it since M3 Task 15.
 pub const KEYS_BEFORE_M3B: &str = "keys before M3b";
+
+/// What [`Chip::transmit_data`] gets for a frame naming a security CAM
+/// entry that holds no key [`Live::add_key`] installed.
+pub const KEY_NOT_IN_CAM: &str = "a key not in the security CAM";
+
+/// `R_AX_DLE_EMPTY0` (`reg.h:631`), and the queues `dle_is_txq_empty`
+/// wants empty in it (`mac.c:2393-2405`, bits `reg.h:632-651`).
+const R_AX_DLE_EMPTY0: u32 = 0x8430;
+const DLE_TXQ_EMPTY: u32 = 0x07FF_079F;
+/// `rtw89_mac_flush_txq`'s `read_poll_timeout`: every 10 ms for up to
+/// 200 ms (`mac.c:6360-6361`).
+const FLUSH_TXQ_STEP_US: u64 = 10_000;
+const FLUSH_TXQ_WAIT_US: u64 = 200_000;
+/// `rtw89_mac_pkt_drop_sta`'s selections (`mac.c:7259-7264`),
+/// `RTW89_PKT_DROP_SEL_MACID_BE_ONCE` to `_VO_ONCE` (`core.h:6485-6488`).
+const PKT_DROP_SELS: [u8; 4] = [0, 1, 2, 3];
 
 /// The data and management channels, in the order the reclaim reads them.
 const TX_CHANNELS: [TxChannel; 5] = [
@@ -1186,6 +1208,65 @@ impl<I: AxIo> Live<I> {
         done.and_then(|done| done)
     }
 
+    /// `rtw89_ops_flush` (`mac80211.c:1122-1136`), as mac80211's
+    /// `ieee80211_flush_queues` and `rtw89_ops_set_key`'s DISABLE_KEY
+    /// (`mac80211.c:1010-1013`) call it: no LPS to leave, then
+    /// `rtw89_hci_flush_queues`, the TX rings' wait of [`Rings::flush_tx`];
+    /// then with `drop`, as the 8852C's firmware lacks `NO_PACKET_DROP`
+    /// (`fw.c:870`), `__rtw89_drop_packets` (`mac80211.c:1109-1120`): for
+    /// the AP's station, which exists while a BSSID is set (mac80211 adds it
+    /// before authentication and iterates it as uploaded), the four
+    /// PKT_DROP H2Cs of `rtw89_mac_pkt_drop_sta` (`mac.c:7255-7278`), BE, BK,
+    /// VI then VO once for macid 0, each sent without a wait and its failure
+    /// passed over as Linux ignores it; without `drop`,
+    /// `rtw89_mac_flush_txq` (`mac.c:6352-6363`): `R_AX_DLE_EMPTY0` sampled
+    /// every 10 ms for up to 200 ms until `dle_is_txq_empty`'s queues are
+    /// all empty (`mac.c:2388-2412`), a timeout passed over as Linux only
+    /// logs it. Frames drained meanwhile are held for the next
+    /// [`Live::drain`]. Refused before any I/O on a chip off
+    /// ([`POWERED_OFF`]) and while a scan has not been ended
+    /// ([`SCAN_NOT_ENDED`]); a failed register read is returned, the chip
+    /// left on, as is the first PKT_DROP that could not be sent.
+    ///
+    /// # Safety
+    /// [`start`]'s contract, still holding for this chip.
+    pub unsafe fn flush(&mut self, drop: bool) -> Result<(), AxError> {
+        self.idle()?;
+        self.rings.flush_tx(&mut self.io)?;
+        if !drop {
+            return match poll32(
+                &mut self.io,
+                R_AX_DLE_EMPTY0,
+                DLE_TXQ_EMPTY,
+                DLE_TXQ_EMPTY,
+                FLUSH_TXQ_STEP_US,
+                FLUSH_TXQ_WAIT_US,
+            ) {
+                Ok(()) | Err(AxError::Timeout { .. }) => Ok(()),
+                Err(error) => Err(error),
+            };
+        }
+        if self.bssid.is_none() {
+            return Ok(());
+        }
+        let mut held = core::mem::take(&mut self.held);
+        let sent = self.session(|io, session| {
+            let mut first = Ok(());
+            for sel in PKT_DROP_SELS {
+                let packet = session.h2c.pkt_drop(sel, vif::MAC_ID, vif::PORT);
+                // SAFETY: the caller's contract is `start`'s, which `send`'s
+                // is, for the live chip's own window and rings.
+                let result = unsafe { session.send(io, packet, &mut |e| held.keep(e)) };
+                if first.is_ok() {
+                    first = result.map(|_| ());
+                }
+            }
+            first
+        });
+        self.held = held;
+        sent.and_then(|sent| sent)
+    }
+
     /// The channel context released after the station left (mac80211's
     /// `ieee80211_link_release_channel` at the end of
     /// `ieee80211_set_disassoc` and `ieee80211_destroy_auth_data`):
@@ -1236,11 +1317,14 @@ impl<I: AxIo> Live<I> {
         unsafe { self.submit(ch, &head, bytes) }
     }
 
-    /// Queue a data frame without a key, as [`Live::queue_management`]
-    /// queues a management frame: the WD head of [`txd::data`] for the
-    /// queue of `tid`, `eapol`, the tuned band, the peer's `supported`
-    /// rates and, once associated, the STBC and LDPC its RA H2C took
-    /// (`rtwsta_link->ra`, `core.c:1144-1145`; neither before).
+    /// Queue a data frame, as [`Live::queue_management`] queues a
+    /// management frame: the WD head of [`txd::data`] for the queue of
+    /// `tid`, `eapol`, the tuned band, the peer's `supported` rates, once
+    /// associated the STBC and LDPC its RA H2C took (`rtwsta_link->ra`,
+    /// `core.c:1145-1146`; neither before), and `sec`, the hardware key a
+    /// Protected frame goes under (`rtw89_core_tx_update_sec_key`), whose
+    /// CCMP header [`txd::strip_ccmp`] removed. The key's CAM entry is the
+    /// caller's to have installed ([`Chip::transmit_data`] checks it).
     ///
     /// # Safety
     /// [`start`]'s contract, still holding for this chip.
@@ -1250,6 +1334,7 @@ impl<I: AxIo> Live<I> {
         tid: u8,
         eapol: bool,
         supported: u16,
+        sec: Option<TxSec>,
     ) -> Result<Option<Token>, AxError> {
         if self.off {
             return Err(POWERED_OFF);
@@ -1270,7 +1355,7 @@ impl<I: AxIo> Live<I> {
                 ldpc: false,
             },
         };
-        let (ch, head) = txd::data(bytes, tid, eapol, self.chan.band, supported, caps, None)?;
+        let (ch, head) = txd::data(bytes, tid, eapol, self.chan.band, supported, caps, sec)?;
         // SAFETY: the caller's contract is `submit`'s, word for word.
         unsafe { self.submit(ch, &head, bytes) }
     }
@@ -1547,16 +1632,29 @@ impl<I: AxIo> Chip for Live<I> {
         unsafe { self.queue_management(frame.bytes, frame.basic_rates) }.map_err(|e| e.to_string())
     }
 
-    /// [`Live::queue_data`]; a frame with a key is refused until M3b.
+    /// [`Live::queue_data`], a frame's key as its CAM entry, key ID and PN
+    /// ([`TxSec`]). A frame naming an entry that holds no key
+    /// [`Live::add_key`] installed and nothing deleted since is refused
+    /// with [`KEY_NOT_IN_CAM`] before any access: the hardware would
+    /// encrypt it under whatever that entry held, or under nothing.
     fn transmit_data(&mut self, frame: &Data<'_>) -> Result<Option<Token>, String> {
         if self.off {
             return Err(POWERED_OFF.to_string());
         }
-        if frame.key.is_some() {
-            return Err(KEYS_BEFORE_M3B.into());
-        }
+        let sec = match frame.key {
+            Some((cam, _, _)) if !self.key_installed(cam) => return Err(KEY_NOT_IN_CAM.into()),
+            Some((cam, keyid, pn)) => Some(TxSec { keyid, cam, pn }),
+            None => None,
+        };
+        let Data {
+            bytes,
+            tid,
+            eapol,
+            supported_rates,
+            ..
+        } = *frame;
         // SAFETY: `start`'s contract holds for the live chip's every use.
-        unsafe { self.queue_data(frame.bytes, frame.tid, frame.eapol, frame.supported_rates) }
+        unsafe { self.queue_data(bytes, tid, eapol, supported_rates, sec) }
             .map_err(|e| e.to_string())
     }
 
@@ -1617,6 +1715,12 @@ impl<I: AxIo> Chip for Live<I> {
     fn remove_key(&mut self, cam: u8) -> Result<(), String> {
         // SAFETY: `start`'s contract holds for the live chip's every use.
         unsafe { Live::remove_key(self, cam) }.map_err(|e| e.to_string())
+    }
+
+    /// [`Live::flush`].
+    fn flush(&mut self, drop: bool) -> Result<(), String> {
+        // SAFETY: `start`'s contract holds for the live chip's every use.
+        unsafe { Live::flush(self, drop) }.map_err(|e| e.to_string())
     }
 
     /// Accepted without the BA CAM until M3b, with no access.

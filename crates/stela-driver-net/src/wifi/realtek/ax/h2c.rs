@@ -21,7 +21,8 @@
 //! `rtw89_fw_h2c_set_bcn_fltr_cfg` (`fw.c:5397-5470`) and
 //! `rtw89_fw_h2c_set_edca` (`fw.c:5241-5276`). For the keys (M3 spec S12):
 //! `rtw89_cam_send_sec_key_cmd`'s SEC_UPD (`cam.c:11-99`) and
-//! `rtw89_fw_h2c_dctl_sec_cam_v1` (`fw.c:2346-2382`).
+//! `rtw89_fw_h2c_dctl_sec_cam_v1` (`fw.c:2346-2382`). For a flush with drop:
+//! `rtw89_fw_h2c_pkt_drop` (`fw.c:10621-10676`).
 //!
 //! Each of those is fixed to the one station interface of milestone 2c's
 //! spec: wifi role STATION, self role CLIENT, MAC 0, PHY 0, address CAM 0
@@ -84,6 +85,8 @@ pub(super) const H2C_FUNC_USR_EDCA: u8 = 0xF;
 pub(super) const H2C_FUNC_ADD_SCANOFLD_CH: u8 = 0x16;
 pub(super) const H2C_FUNC_SCANOFLD: u8 = 0x17;
 pub(super) const H2C_FUNC_CFG_BCNFLTR: u8 = 0x1E;
+/// `H2C_FUNC_PKT_DROP` (`fw.h:4776`), a FW_OFLD func too.
+pub(super) const H2C_FUNC_PKT_DROP: u8 = 0x1B;
 /// `H2C_CL_BA_CAM` / `H2C_FUNC_MAC_BA_CAM` (`fw.h:4808-4809`).
 pub(super) const H2C_CL_BA_CAM: u8 = 0xC;
 pub(super) const H2C_FUNC_MAC_BA_CAM: u8 = 0;
@@ -269,6 +272,28 @@ impl H2c {
             H2C_FUNC_OFLD_CFG,
             true,
             &OFLD_CFG,
+        )
+    }
+
+    /// `rtw89_fw_h2c_pkt_drop` (`fw.c:10621-10676`) as
+    /// `rtw89_mac_pkt_drop_sta` (`mac.c:7255-7278`) sends it for a station
+    /// of the vif on `port`: MAC / FW_OFLD / PKT_DROP, rack 0, dack 0,
+    /// `H2C_PKT_DROP_LEN` 24 bytes (`fw.c:10620`). w0 = `sel` [7:0] |
+    /// `macid` [15:8] | band (`mac_idx` 0) [23:16] | `port` [31:24]; w1 =
+    /// mbssid 0 [7:0] | tf_trs [15:8], the vif's `trigger`, 0 without an HE
+    /// association (`core.c:5718-5722`); w2-w5 = `macid_band_sel` 0
+    /// (`fw.h:2110-2158`).
+    pub fn pkt_drop(&mut self, sel: u8, macid: u8, port: u8) -> (u8, Vec<u8>) {
+        let w0 = field(u32::from(sel), 7, 0)
+            | field(u32::from(macid), 15, 8)
+            | field(0, 23, 16)
+            | field(u32::from(port), 31, 24);
+        self.packet(
+            H2C_CAT_MAC,
+            H2C_CL_MAC_FW_OFLD,
+            H2C_FUNC_PKT_DROP,
+            false,
+            &le_words(&[w0, 0, 0, 0, 0, 0]),
         )
     }
 

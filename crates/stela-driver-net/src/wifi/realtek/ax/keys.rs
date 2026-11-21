@@ -36,7 +36,8 @@
 //! second SEC_UPD), a BIP key (the IGTK stays on the host, spec S1.2), an
 //! AP's or a TDLS peer's own address CAM, MLO, WoWLAN's IV words, the
 //! DISABLE_KEY flushes of `rtw89_ops_set_key` (`rtw89_hci_flush_queues` and
-//! `rtw89_mac_flush_txq`, `mac80211.c:1010-1013`, M3 Task 15), its BTC
+//! `rtw89_mac_flush_txq`, `mac80211.c:1010-1015`, which the station runs
+//! through `Live::flush` before each delete), its BTC
 //! EAPOL_END notify and RX statistics reset, and any key on the air: a
 //! frame goes under a key only as its TX descriptor names the entry.
 use super::assoc::{AddrCam, CamKeys};
