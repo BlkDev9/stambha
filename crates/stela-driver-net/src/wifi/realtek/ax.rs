@@ -53,8 +53,12 @@
 //! both of its windows ([`Rf18`]). The bring-up grants no channel but the
 //! scan's boot channel, no IQK, DPK, TSSI or tracking, no association, no
 //! transmission request and no interrupts; the chip is powered off at the
-//! end.
+//! end. [`attach`] is the other way out of [`live::start`]: it keeps the
+//! live chip as the [`station::Rtl8852c`] radio, connected through the
+//! shared connection keeper to the configured network, under that network's
+//! channel rules.
 pub mod assoc;
+pub mod attach;
 pub mod bb;
 pub mod bringup;
 pub mod c2h;
@@ -94,6 +98,7 @@ pub mod txpwr;
 pub mod txpwr_tables;
 pub mod vif;
 
+pub use attach::{AttachError, attach};
 pub use bringup::{
     BringUpError, Earlier, FirmwareFile, Host, Rf18, Rf18Line, Running, bring_up, quiesce,
 };
@@ -110,3 +115,4 @@ pub use phy::{PhyReport, RfkReport};
 pub use pci::{Ch12, Rings, encode_txbd};
 pub use power::{power_on, xtal_si_read, xtal_si_write};
 pub use scan::{Listed, Network, ScanEnd, ScanReport};
+pub use station::{Rtl8852c, WIFI_CARRIER_WAIT_US, Wifi};
