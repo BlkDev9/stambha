@@ -547,3 +547,33 @@ fn profiled_register_operations_count_by_form_and_path() {
     machine.enter_amx_cell();
     assert_eq!(machine.cpu.amx.native.cell.routine, compiler);
 }
+
+/// With native AMX off (`--amx-native off`) blocks find the model's paths
+/// in their cell and the service runs every register operation on the
+/// model, whatever tier the host has; on again, the host's paths.
+#[test]
+fn native_amx_off_leaves_every_register_operation_to_the_model() {
+    let host = TargetCpu::detect();
+    let native = Native::select(host);
+    let mut machine = machine(&[]);
+    machine.target = host;
+    machine.cpu.state.x[1] = 1 << 63;
+    machine.system_instruction(msr(AMX_CTL_EL1, 1)).unwrap();
+    machine.amx(SET).unwrap();
+    machine.enter_amx_cell();
+    assert_eq!(machine.cpu.amx.native.cell.native, native);
+    machine.set_amx_native(false);
+    machine.enter_amx_cell();
+    assert_eq!(machine.cpu.amx.native.cell.native, Native::MODEL);
+    // A matrix fma32 with every lane on, which each host tier covers: the
+    // service counts the operations the model completes.
+    machine.cpu.state.x[3] = 0;
+    machine.amx(FMA32 | 3).unwrap();
+    assert_eq!(machine.statistics.amx_operations, [0, 1]);
+    machine.set_amx_native(true);
+    machine.amx(FMA32 | 3).unwrap();
+    let model = u64::from(native == Native::MODEL);
+    assert_eq!(machine.statistics.amx_operations, [0, 1 + model]);
+    machine.enter_amx_cell();
+    assert_eq!(machine.cpu.amx.native.cell.native, native);
+}

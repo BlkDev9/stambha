@@ -173,7 +173,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     pub(super) fn enter_amx_cell(&mut self) {
         let registers = self.amx_registers();
         let generation = self.cpu.amx.generation();
-        let native = Native::select(self.target);
+        let native = self.amx_paths();
         let routine = if self.step_timing.is_some() {
             forms::routine as *const () as usize as u64
         } else {
@@ -184,6 +184,23 @@ impl<H: Host, D: Devices> Machine<H, D> {
         cell.routine = routine;
         cell.generation = generation;
         cell.native = native;
+    }
+
+    /// Let host kernels complete AMX register operations, as by default, or
+    /// leave every one to the reference model (`--amx-native off`): blocks
+    /// from their next native entry, the service at once. The code blocks
+    /// hold is the same either way.
+    pub fn set_amx_native(&mut self, on: bool) {
+        self.amx_native = on;
+    }
+
+    /// The host paths register operations take: the target's, or none.
+    fn amx_paths(&self) -> Native {
+        if self.amx_native {
+            Native::select(self.target)
+        } else {
+            Native::MODEL
+        }
     }
 
     /// Add what native code completed to the statistics as it returns.
@@ -364,10 +381,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
             AmxOperand::Register(_) | AmxOperand::None => 0,
         };
         // Arithmetic a host path covers completes without the model, which
-        // stays its definition and the fallback (`amx::native`).
+        // stays its definition and the fallback (`amx::native`), unless
+        // native AMX is off.
+        let paths = self.amx_paths();
         if !operation.accesses_memory()
             && let Some(registers) = self.cpu.amx.registers.as_deref_mut()
-            && Native::select(self.target).execute(generation, registers, operation, operand)
+            && paths.execute(generation, registers, operation, operand)
         {
             self.count_amx_form(generation, operation, operand, 0);
             return self.next();
