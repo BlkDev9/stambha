@@ -1,106 +1,75 @@
-<h1 align="center">
-  <img src="assets/stela-icon.png" alt="" width="96"><br>
-  Stela
-</h1>
+<h1 align="center">Stambha</h1>
 
-A translation-based Apple Silicon layer for x86-64 PCs. It is a UEFI boot
-program with an arm64-to-x86-64 translator, a Metal driver for NVIDIA GPUs and
-a model of Apple silicon hardware. Stela currently presents itself as an M2 Mac mini.
+<p align="center"><i>स्तम्भ (stambha): "pillar", as in the pillars of Ashoka, India's ancient inscribed stone pillars.</i></p>
+
+Run Apple-silicon macOS on ordinary x86-64 PCs, desktops and laptops alike. Stambha boots from
+a USB stick, translates macOS's arm64 code to x86-64 as it runs, and models the Apple hardware
+macOS expects.
+
+The goal: macOS that works like it belongs on your machine. That means **speed**, the hardware
+you actually have (**Wi-Fi, Bluetooth, sound**), and on laptops the things a laptop needs
+(battery, touchpad gestures, the lid, brightness and keyboard keys).
 
 > [!WARNING]
-Stela is still in development. It is slow and still may not boot on supported hardware. Fixes are on the way, please submit a GitHub Issue with your boot logs if you encounter an error!
+> Experimental. It may not boot on your hardware, and it is slower than a real Mac.
+> Back up anything you care about before installing.
 
-## Translator
+## Status
 
-An ahead-of-time and just-in-time compiler translates arm64e code to x86-64.
-It covers more than 3,000 AArch64 instruction encodings, maps guest registers
-to host registers and caches translated code.
-
-## NVIDIA driver
-
-The Metal driver compiles AIR, Metal's shader IR, directly to NIR, Mesa's IR,
-and supports the Metal3 and Apple7 GPU families.
+| | |
+|---|---|
+| **Wi-Fi**: Realtek RTL8852CE (Wi-Fi 6E, found in many recent laptops): scan, connect, DHCP, HTTPS | Working on real hardware with WPA2 (tested before macOS starts); WPA3 implemented but not yet hardware-tested; the in-macOS test is in progress |
+| **Install safety**: installs only into empty (unallocated) space, reads back every partition-table write, refuses unexpected layouts, and offers a "Check only" dry run that writes nothing | Done |
+| **Install progress**: a progress line every minute (stage, percent, speed), so a long install never looks frozen | Done |
+| Faster installs, Bluetooth (Realtek), sound, battery and charging in macOS, a Magic-Trackpad-style touchpad, power button / lid / brightness / keyboard backlight, a guest profiler and speed-ups | In development on branches; each lands in `main` after review and a hardware test |
+| More Realtek Wi-Fi chips (RTL8852BE, RTL8851BE, RTL8852AE, RTL8922AE) and full Wi-Fi speed (aggregation, 80/160 MHz) | In development |
+| AMD Radeon and Intel graphics | In development |
 
 ## Hardware requirements
 
 | Part | Requirement |
 |---|---|
-| CPU | Intel or AMD x86-64-v2 (Intel Nehalem, AMD Bulldozer or newer). AVX2 and AVX-512 are used when present. |
-| Memory | 8 GB or more. |
+| CPU | Intel or AMD x86-64-v2 or newer. AVX2 and AVX-512 are used when present. |
+| Memory | 8 GB or more (16 GB recommended). |
 | Firmware | 64-bit UEFI with Secure Boot off. |
-| GPU | NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series. |
-| Disk | NVMe, or SATA in AHCI mode. 60 GB or more for macOS: a GPT partition or a whole disk to erase. |
-| USB stick | 8 GB for the Online installer, 32 GB for the Offline installer. |
-| Ethernet | Intel I225, I226, I210, I211, I350, 82574L, 82575, 82576, 82579, 82580, I217, I218, I219.<br>Realtek RTL8111, RTL8168, RTL8169, RTL8411, RTL8125, RTL8126, Killer E2600, E3000.<br>Broadcom BCM5720, BCM5761, BCM5762.<br>Aquantia AQC100, AQC107, AQC108, AQC109, AQC111, AQC112, AQC113, AQC114, AQC115C, AQC116C.<br>Qualcomm Atheros AR8131, AR8132, AR8151, AR8152, AR8161, AR8162, AR8171, AR8172, Killer E2200, E2400, E2500.<br>USB: Realtek RTL8152, RTL8153, RTL8156, ASIX AX88179, AX88178A, AX88772, CDC ECM and NCM. |
-| Wi-Fi | None currently supported. |
-| Bluetooth | None currently supported. |
-| Audio | None currently supported. |
-| USB | xHCI (USB 3) and EHCI controllers, hubs, USB disks. |
-| Input | USB keyboards and mice. PS/2 keyboards, mice and Synaptics or Elantech touchpads. |
+| GPU | NVIDIA GeForce GTX 16 or RTX 20/30/40/50 series. On laptops with a MUX switch, use dGPU-only mode. |
+| Disk | NVMe, or SATA in AHCI mode, with 60 GB or more of **unallocated** space (shrink a partition first and leave the space unallocated). |
+| Wi-Fi | Realtek RTL8852CE (more coming). |
+| Ethernet | Intel, Realtek, Broadcom, Aquantia, Qualcomm Atheros, and common USB adapters. |
 
-## Install
+## Getting it
 
-1. Download `stela` from the
-   [releases page](https://github.com/tylertms/Stela/releases).
-2. Run `sudo ./stela` (Linux, macOS) or double-click `stela.exe`
-   (Windows).
-3. Choose the USB stick and the installer, then confirm. This erases the USB
-   stick.
-4. Boot the PC from the USB stick.
-
-## Update
-
-Download the new `stela`, plug the USB stick in and run:
+Releases are coming soon. Until then, build from source:
 
 ```sh
-sudo ./stela update
-```
-
-On Windows, open Terminal with Run as administrator and run:
-
-```
-.\stela.exe update
-```
-
-## Logs
-
-If Stela does not work, plug the USB stick into any computer with `stela` and
-save the boot log. Include `log.txt` in your GitHub Issue. Save it before you
-start Stela again many times: the log keeps the start of each of the last
-eight boots, but only the latest part of a long run.
-
-```sh
-sudo ./stela log --output log.txt
-```
-
-On Windows, open Terminal with Run as administrator and run:
-
-```
-.\stela.exe log --output log.txt
-```
-
-## Build
-
-You need [Rust](https://rustup.rs), git, Python 3.10 or newer, and LLVM 21,
-22 or 23 with Clang, LLD and libclang. On macOS, Xcode's Apple clang 21 or
-newer also works.
-
-```sh
-git clone https://github.com/tylertms/Stela
-cd Stela
+git clone https://github.com/garvitsurana271/stambha
+cd stambha
 cargo xtask dist
 ```
 
-This writes `target/release/stela`. The first build fetches and compiles
-Linux, Mesa and LLVM sources and takes a long time.
+You need [Rust](https://rustup.rs), git, Python 3.10 or newer, and LLVM 21-23 with Clang, LLD and
+libclang. The first build fetches and compiles Linux, Mesa and LLVM sources and takes a long time.
+It writes `target/release/stela`: the command keeps its original name until the rename to
+`stambha` lands.
+
+## Maintainer
+
+**Garvit Surana** ([@garvitsurana271](https://github.com/garvitsurana271)).
+
+## Credits
+
+- Stambha is originally based on [Stela](https://github.com/tylertms/Stela) by Tyler Smith
+  (tylertms): the translator, the Metal driver and the Apple silicon hardware model come from his
+  work. His branches are kept here as `tyler/*`.
+- The Wi-Fi driver is a Rust port of Linux's `rtw89` by Realtek and the Linux wireless developers.
+  Its Linux sources are listed in [NOTICE](NOTICE).
+- Mesa, Linux and LLVM: see [NOTICE](NOTICE).
 
 ## Legal
 
-Stela contains no Apple software. You are responsible for following Apple's
-software license agreement and terms of use.
+Stambha contains no Apple software. You are responsible for following Apple's software license
+agreement and terms of use.
 
-Stela's code is GPL-2.0-or-later. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
-
-## Community
-
-[Discord Server](https://discord.gg/aSkwrJEMYc)
+Stambha's code is GPL-2.0-or-later. Files whose SPDX line says otherwise keep their own terms. The
+boot program contains Linux code and is distributed as a whole under GPL-2.0-only; NOTICE gives
+the terms for each program. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
