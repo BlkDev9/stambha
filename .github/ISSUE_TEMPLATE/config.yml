@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Get help on Discord
+    url: https://discord.gg/M66z9fPJy5
+    about: Install or boot trouble? The #help forum is the fastest way to an answer.
+  - name: Security issue
+    url: https://github.com/garvitsurana271/stambha/security/advisories/new
+    about: Report a security problem privately, not in a public issue.

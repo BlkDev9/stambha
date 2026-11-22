@@ -1,45 +1,80 @@
+<p align="center">
+  <img src="assets/stambha-icon.svg" width="140" alt="Stambha">
+</p>
+
 <h1 align="center">Stambha</h1>
 
-<p align="center"><i>स्तम्भ (stambha): "pillar", as in the pillars of Ashoka, India's ancient inscribed stone pillars.</i></p>
+<p align="center">
+  <b>Run Apple-silicon macOS on your PC.</b><br>
+  Desktops and laptops. NVIDIA graphics. Installs over Ethernet or Wi-Fi.
+</p>
 
-Run Apple-silicon macOS on ordinary x86-64 PCs, desktops and laptops alike. Stambha boots from
-a USB stick, translates macOS's arm64 code to x86-64 as it runs, and models the Apple hardware
-macOS expects.
+<p align="center">
+  <a href="https://discord.gg/M66z9fPJy5"><img src="https://img.shields.io/discord/1574111611348590602?label=Discord&logo=discord&logoColor=white&color=5865F2" alt="Discord"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--2.0--or--later-2B3A8C" alt="License: GPL-2.0-or-later"></a>
+  <a href="https://github.com/garvitsurana271/stambha/stargazers"><img src="https://img.shields.io/github/stars/garvitsurana271/stambha?color=F07A28" alt="Stars"></a>
+</p>
 
-The goal: macOS that works like it belongs on your machine. That means **speed**, the hardware
-you actually have (**Wi-Fi, Bluetooth, sound**), and on laptops the things a laptop needs
-(battery, touchpad gestures, the lid, brightness and keyboard keys).
+<p align="center"><i>स्तम्भ (stambha): "pillar", as in the Ashoka pillars.</i></p>
+
+---
+
+Stambha boots from a USB stick and runs the **Apple-silicon (arm64) version of macOS** on an ordinary x86-64 PC. It
+translates macOS's Arm code to x86 as it runs, drives your NVIDIA GPU through its own Metal driver, and recreates the
+Apple hardware macOS expects. No Mac, no Hackintosh kexts, no virtual machine.
 
 > [!WARNING]
 > Experimental. It may not boot on your hardware, and it is slower than a real Mac.
 > Back up anything you care about before installing.
 
-## Status
+## ✨ What works
 
 | | |
 |---|---|
-| **Wi-Fi**: Realtek RTL8852CE (Wi-Fi 6E, found in many recent laptops): scan, connect, DHCP, HTTPS | Working on real hardware with WPA2 (tested before macOS starts); WPA3 implemented but not yet hardware-tested; the in-macOS test is in progress |
-| **Install safety**: installs only into empty (unallocated) space, reads back every partition-table write, refuses unexpected layouts, and offers a "Check only" dry run that writes nothing | Done |
-| **Install progress**: a progress line every minute (stage, percent, speed), so a long install never looks frozen | Done |
-| Faster installs, Bluetooth (Realtek), sound, battery and charging in macOS, a Magic-Trackpad-style touchpad, power button / lid / brightness / keyboard backlight, a guest profiler and speed-ups | In development on branches; each lands in `main` after review and a hardware test |
-| More Realtek Wi-Fi chips (RTL8852BE, RTL8851BE, RTL8852AE, RTL8922AE) and full Wi-Fi speed (aggregation, 80/160 MHz) | In development |
-| AMD Radeon and Intel graphics | In development |
+| 🖥️ **macOS on your PC** | Apple-silicon macOS boots, with NVIDIA GPU acceleration (GTX 16, RTX 20/30/40/50) |
+| 📶 **Install over Wi-Fi** | No Ethernet cable needed with a Realtek RTL8852CE (Wi-Fi 6E, in many recent laptops) |
+| 🛡️ **A safe installer** | Only ever uses empty space on your disk; see [below](#-safe-for-the-system-you-already-have) |
+| 📈 **Install progress** | A progress line every minute (stage, percent, speed), so a long install never looks frozen |
 
-## Hardware requirements
+## 🔧 Coming in the first release
+
+- ⚡ **Speed:** Apple's matrix unit (AMX) running natively on your CPU, faster translator paths, faster installs
+- 📶 **Wi-Fi inside macOS**, and a Wi-Fi picker right in the boot menu with saved networks
+- 💻 **Laptops:** battery level and charging, a Magic-Trackpad-style touchpad, brightness and keyboard-backlight keys,
+  power button and lid, audio fixes
+- 🟦 **Bluetooth** (Realtek)
+- 🧩 **Fixes for known issues** and the best community contributions
+
+Next after that: AMD and Intel graphics, more Wi-Fi chips and full Wi-Fi speed, and laptops presented as a MacBook.
+
+## 🛡️ Safe for the system you already have
+
+Installing macOS next to Windows or Linux should never risk them. Stambha's installer:
+
+- uses **only unallocated space**: it never resizes, moves or deletes a partition;
+- checks the partition table it is about to write against **both** GPT copies, and refuses an unexpected layout;
+- **reads back every write** before making the next one;
+- offers **Check only**: a full dry run of the install plan that writes nothing at all.
+
+## 📋 Requirements
 
 | Part | Requirement |
 |---|---|
-| CPU | Intel or AMD x86-64-v2 or newer. AVX2 and AVX-512 are used when present. |
-| Memory | 8 GB or more (16 GB recommended). |
-| Firmware | 64-bit UEFI with Secure Boot off. |
-| GPU | NVIDIA GeForce GTX 16 or RTX 20/30/40/50 series. On laptops with a MUX switch, use dGPU-only mode. |
-| Disk | NVMe, or SATA in AHCI mode, with 60 GB or more of **unallocated** space (shrink a partition first and leave the space unallocated). |
-| Wi-Fi | Realtek RTL8852CE (more coming). |
-| Ethernet | Intel, Realtek, Broadcom, Aquantia, Qualcomm Atheros, and common USB adapters. |
+| CPU | Intel or AMD x86-64-v2 or newer (Intel Nehalem, AMD Bulldozer). AVX2 and AVX-512 are used when present. |
+| Memory | 8 GB or more (16 GB recommended) |
+| Firmware | 64-bit UEFI with Secure Boot off |
+| GPU | NVIDIA GeForce GTX 16 or RTX 20/30/40/50 series. Laptops with a MUX switch: use dGPU-only mode. |
+| Disk | NVMe, or SATA in AHCI mode, with **60 GB or more of unallocated space** (shrink a partition, leave the space empty) |
+| Network | Ethernet (Intel, Realtek, Broadcom, Aquantia, Qualcomm Atheros, common USB adapters) or Realtek RTL8852CE Wi-Fi |
+| USB stick | 8 GB or more |
 
-## Getting it
+## 🚀 Getting it
 
-Releases are coming soon. Until then, build from source:
+The first release is on its way. **[Join the Discord](https://discord.gg/M66z9fPJy5)** to get it the day it lands, to
+test early builds, and to get help.
+
+<details>
+<summary>Build from source</summary>
 
 ```sh
 git clone https://github.com/garvitsurana271/stambha
@@ -47,29 +82,39 @@ cd stambha
 cargo xtask dist
 ```
 
-You need [Rust](https://rustup.rs), git, Python 3.10 or newer, and LLVM 21-23 with Clang, LLD and
-libclang. The first build fetches and compiles Linux, Mesa and LLVM sources and takes a long time.
-It writes `target/release/stela`: the command keeps its original name until the rename to
-`stambha` lands.
+You need [Rust](https://rustup.rs), git, Python 3.10 or newer, and LLVM 21-23 with Clang, LLD and libclang. The first
+build fetches and compiles Linux, Mesa and LLVM sources and takes a long time. It writes `target/release/stela`: the
+command keeps its original name until the rename to `stambha` lands.
+</details>
+
+## ❓ Questions
+
+Answers to the common ones (AMD/Intel graphics, hybrid-graphics laptops, Wi-Fi chips, virtual machines, how long an
+install takes) are in the **#faq** channel on [Discord](https://discord.gg/M66z9fPJy5). Bugs and hardware reports:
+[open an issue](https://github.com/garvitsurana271/stambha/issues/new/choose).
+
+## 🤝 Contributing
+
+Pull requests are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md). Testing on your hardware and posting a hardware
+report helps just as much.
 
 ## Maintainer
 
-**Garvit Surana** ([@garvitsurana271](https://github.com/garvitsurana271)).
+**Garvit Surana** ([@garvitsurana271](https://github.com/garvitsurana271))
 
 ## Credits
 
-- Stambha is originally based on [Stela](https://github.com/tylertms/Stela) by Tyler Smith
-  (tylertms): the translator, the Metal driver and the Apple silicon hardware model come from his
-  work. His branches are kept here as `tyler/*`.
+- Stambha is built on [Stela](https://github.com/tylertms/Stela) by Tyler Smith (tylertms): the translator, the Metal
+  driver and the Apple-silicon hardware model come from his work. Thank you, Tyler.
 - The Wi-Fi driver is a Rust port of Linux's `rtw89` by Realtek and the Linux wireless developers.
-  Its Linux sources are listed in [NOTICE](NOTICE).
 - Mesa, Linux and LLVM: see [NOTICE](NOTICE).
+- Everyone who contributes code, tests and reports.
 
 ## Legal
 
-Stambha contains no Apple software. You are responsible for following Apple's software license
-agreement and terms of use.
+Stambha contains no Apple software. You are responsible for following Apple's software license agreement and terms of
+use.
 
-Stambha's code is GPL-2.0-or-later. Files whose SPDX line says otherwise keep their own terms. The
-boot program contains Linux code and is distributed as a whole under GPL-2.0-only; NOTICE gives
-the terms for each program. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Stambha's code is GPL-2.0-or-later. Files whose SPDX line says otherwise keep their own terms. The boot program contains
+Linux code and is distributed as a whole under GPL-2.0-only; NOTICE gives the terms for each program. See
+[LICENSE](LICENSE) and [NOTICE](NOTICE).

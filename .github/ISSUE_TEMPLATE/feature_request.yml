@@ -1,0 +1,20 @@
+name: Feature request
+description: An idea for Stambha.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What would you like?
+      description: Describe it from your side, as a user.
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why?
+      description: What it would let you do, and what you do today instead.
+  - type: input
+    id: hardware
+    attributes:
+      label: Your hardware (if it is hardware support)

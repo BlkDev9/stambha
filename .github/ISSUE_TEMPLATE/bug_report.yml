@@ -1,0 +1,72 @@
+name: Bug report
+description: Something doesn't boot, install or work the way it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Quick questions are faster on [Discord](https://discord.gg/M66z9fPJy5) (#help).
+        **Before attaching a log or photo, hide serial numbers, MAC addresses, Wi-Fi names, IP addresses and anything personal.**
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Desktop or laptop?
+      options: [Desktop, Laptop]
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Machine
+      description: Laptop model, or motherboard for a desktop.
+      placeholder: ASUS TUF A16 FA608PP / MSI B650 Tomahawk
+  - type: input
+    id: cpu
+    attributes:
+      label: CPU and RAM
+      placeholder: Ryzen 9 8940HX, 16 GB
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU
+      description: Laptops, also say whether dGPU-only / MUX mode is on.
+      placeholder: RTX 5070 Laptop, dGPU-only mode on
+    validations:
+      required: true
+  - type: input
+    id: disk
+    attributes:
+      label: Disk macOS is on
+      placeholder: NVMe (KIOXIA ...), SATA in AHCI mode, ...
+  - type: input
+    id: network
+    attributes:
+      label: Network
+      placeholder: Realtek RTL8852CE Wi-Fi / Intel I225 Ethernet / ...
+  - type: input
+    id: version
+    attributes:
+      label: Stambha version
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you saw. A photo of the screen helps a lot.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Boot log
+      description: Attach the boot log file (each release explains how to save it). Drag the file into this box.
+  - type: checkboxes
+    id: masked
+    attributes:
+      label: Privacy
+      options:
+        - label: I removed serial numbers, MAC addresses, Wi-Fi names and IP addresses from what I attached.
+          required: true
