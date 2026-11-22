@@ -10,6 +10,7 @@
 </p>
 
 <p align="center">
+  <a href="https://garvitsurana271.github.io/stambha/"><img src="https://img.shields.io/badge/website-stambha-F07A28" alt="Website"></a>
   <a href="https://discord.gg/M66z9fPJy5"><img src="https://img.shields.io/discord/1574111611348590602?label=Discord&logo=discord&logoColor=white&color=5865F2" alt="Discord"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--2.0--or--later-2B3A8C" alt="License: GPL-2.0-or-later"></a>
   <a href="https://github.com/garvitsurana271/stambha/stargazers"><img src="https://img.shields.io/github/stars/garvitsurana271/stambha?color=F07A28" alt="Stars"></a>
@@ -79,7 +80,7 @@ Installing macOS next to Windows or Linux should never risk them. Stambha's inst
 ## 🚀 Getting it
 
 The first release is on its way. **[Join the Discord](https://discord.gg/M66z9fPJy5)** to get it the day it lands, to
-test early builds, and to get help.
+test early builds, and to get help. The [website](https://garvitsurana271.github.io/stambha/) has the short version.
 
 <details>
 <summary>Build from source</summary>
