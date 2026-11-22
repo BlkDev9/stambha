@@ -14,6 +14,14 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--2.0--or--later-2B3A8C" alt="License: GPL-2.0-or-later"></a>
   <a href="https://github.com/garvitsurana271/stambha/stargazers"><img src="https://img.shields.io/github/stars/garvitsurana271/stambha?color=F07A28" alt="Stars"></a>
 </p>
+<p align="center">
+  <img src="https://img.shields.io/badge/runs-macOS%2027-111111?logo=apple&logoColor=white" alt="Runs macOS 27">
+  <img src="https://img.shields.io/badge/on-x86--64%20UEFI%20PCs-2B3A8C" alt="On x86-64 UEFI PCs">
+  <img src="https://img.shields.io/badge/GPU-NVIDIA%20GTX%2016%20%7C%20RTX%2020%E2%80%9350-76B900?logo=nvidia&logoColor=white" alt="NVIDIA GTX 16, RTX 20-50">
+  <img src="https://img.shields.io/badge/written%20in-Rust-B7410E?logo=rust&logoColor=white" alt="Written in Rust">
+  <a href="https://github.com/garvitsurana271/stambha/commits/main"><img src="https://img.shields.io/github/last-commit/garvitsurana271/stambha?color=FFD27A" alt="Last commit"></a>
+  <a href="https://github.com/garvitsurana271/stambha/issues"><img src="https://img.shields.io/github/issues/garvitsurana271/stambha?color=5FE3C8" alt="Open issues"></a>
+</p>
 
 <p align="center"><i>स्तम्भ (stambha): "pillar", as in the Ashoka pillars.</i></p>
 
