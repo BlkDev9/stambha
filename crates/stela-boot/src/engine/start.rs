@@ -291,6 +291,11 @@ fn start(handoff: u64) -> Started {
             "HOST AMD-Vi table memory unavailable: {error:?}\n"
         ));
     }
+    // SAFETY: as the AMD-Vi tables': the loader's private reservation, held
+    // in the shared physmap and outside guest RAM, before any driver starts.
+    if let Err(error) = unsafe { crate::native_memory::initialize_low_dma(handoff.low_dma) } {
+        output::arguments(format_args!("HOST LOW DMA memory unavailable: {error:?}\n"));
+    }
     // SAFETY: loader-reserved immutable pages, kept in every shared-window
     // physmap; metadata and Arc are created in this active engine allocator.
     let host_firmware = unsafe { crate::host_firmware::after_ebs(&handoff.host_firmware) }
