@@ -20,6 +20,7 @@ pub use reports::{
     Suspension, TRACE_HITS, TraceHit, WATCH_HITS, WatchHit, WholeTlbiSites,
 };
 mod amx;
+pub use amx::{AmxCell, AmxCounts, AmxForms, FORMS};
 mod apple_maintenance;
 mod budget;
 mod caller;

@@ -16,6 +16,7 @@ use stela_contracts::refuse;
 mod start;
 pub(crate) use start::entry;
 mod aml;
+mod amx_profile;
 mod bluetooth;
 mod boot_image;
 pub(crate) mod bundle;
