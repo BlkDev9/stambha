@@ -16,6 +16,7 @@ use stela_contracts::refuse;
 mod start;
 pub(crate) use start::entry;
 mod aml;
+mod amx_profile;
 mod bluetooth;
 mod boot_image;
 pub(crate) mod bundle;
@@ -1200,6 +1201,12 @@ fn run_machine<H: Host>(
         ));
     }
     machine.set_step_timing(options.profile);
+    machine.set_amx_native(options.amx_native());
+    if !options.amx_native() {
+        output::arguments(format_args!(
+            "AMX NATIVE off: the reference model completes every AMX register operation\n"
+        ));
+    }
     if options.profile {
         host::pmu::start(machine.processor());
     }

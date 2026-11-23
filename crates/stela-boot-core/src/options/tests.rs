@@ -181,7 +181,7 @@ fn every_option_survives_a_round_trip() {
         "--system --storage {DISK} --nor {DISK} --bundle b --install p.json \
          --install-source 11111111-2222-3333-4444-555555555555 --verify-on-read \
          --usb-storage A --usb-storage B --input --idle-skip --sep-observe --native-cores 3 \
-         --native-artifacts --serialized --profile --monitor-trace --display-trace \
+         --native-artifacts --serialized --profile --amx-native off --monitor-trace --display-trace \
          --network-check http://h/p --audio-check transport-duplex --audio-own-hpet --dram-base 0x10000000000 \
          --load 0x10000004000 --entry 0x10000008000 --x0 7 --budget 99 --break 0x10 \
          --trace 0x20 --watch 0x30,0x40 --dump x21-0x8,0x10 --dump 0x50,0x60"
@@ -191,6 +191,7 @@ fn every_option_survives_a_round_trip() {
     assert!(options.audio_own_hpet);
     assert!(options.display_trace);
     assert!(!System::default().display_trace);
+    assert!(!options.amx_native());
     assert!(!options.parallel);
     assert_eq!(options.dumps[0], (Base::Register(21, -8), 0x10));
     let restore = round_trip(&format!(
@@ -409,6 +410,27 @@ fn numbers_take_decimal_and_separated_hex() {
         vec![Base::parse("x3+0x10").unwrap()],
         [Base::Register(3, 16)]
     );
+}
+
+#[test]
+fn amx_native_is_on_unless_turned_off() {
+    let default = round_trip("--system");
+    assert!(default.amx_native());
+    assert!(!default.to_string().contains(AMX_NATIVE));
+    let off = round_trip(&format!("--system {AMX_NATIVE} off"));
+    assert!(!off.amx_native());
+    assert!(off.to_string().contains("--amx-native off"));
+    assert!(round_trip(&format!("--system {AMX_NATIVE} on")).amx_native());
+    for (text, error) in [
+        ("--system --amx-native", Error::AmxNative),
+        ("--system --amx-native no", Error::AmxNative),
+        (
+            "--system --amx-native off --amx-native on",
+            Error::DuplicateAmxNative,
+        ),
+    ] {
+        assert_eq!(System::parse(text), Err(error), "{text}");
+    }
 }
 
 mod constraints;

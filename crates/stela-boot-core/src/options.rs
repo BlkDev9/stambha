@@ -39,6 +39,9 @@ pub const GUEST_PES: &str = "--guest-pes";
 /// take the mode its EDID prefers.
 pub const DISPLAY_SIZE: &str = "--display-size";
 pub const MAINTENANCE_WRITE: &str = "--maintenance-write";
+/// Host kernels for AMX register operations (`--amx-native on|off`): on by
+/// default; off leaves every one to the reference model.
+pub const AMX_NATIVE: &str = "--amx-native";
 /// Boots the installed system to its single-user shell.
 pub const SINGLE_USER: &str = "--single-user";
 /// Keeps the newest presented frame at one logged address.
@@ -297,6 +300,9 @@ pub struct System {
     /// Time the engine's phases and report them with each heartbeat
     /// (`--profile`).
     pub profile: bool,
+    /// [`AMX_NATIVE`]'s value, unset where the line has none
+    /// ([`Self::amx_native`]).
+    pub amx_native: Option<bool>,
     /// The machine's ECID for a bundle built from the Preboot volume
     /// (`--ecid HEX`, nonzero).
     pub ecid: Option<u64>,
@@ -403,6 +409,7 @@ impl Default for System {
             native_rounds: false,
             parallel: true,
             profile: false,
+            amx_native: None,
             ecid: None,
             network_check: None,
             audio_check: None,
@@ -566,6 +573,12 @@ impl System {
     /// (`-restore`), which starts no WindowServer and no Metal client.
     pub fn starts_metal_clients(&self) -> bool {
         self.preboot.is_some() && !self.upgrade
+    }
+
+    /// Host kernels complete AMX register operations, unless
+    /// `--amx-native off` leaves every one to the reference model.
+    pub fn amx_native(&self) -> bool {
+        self.amx_native != Some(false)
     }
 
     /// Whether this boot hides the guest's AGX model (`sgx` and its `gfx-asc`
@@ -859,6 +872,10 @@ impl fmt::Display for System {
             self.native_rounds || self.native_shared_check || self.native_bootstrap_check;
         line.flag("--serialized", !self.parallel && !implied_serial)?;
         line.flag("--profile", self.profile)?;
+        line.value(
+            AMX_NATIVE,
+            self.amx_native.map(|on| if on { "on" } else { "off" }),
+        )?;
         line.flag("--monitor-trace", self.monitor_trace)?;
         line.flag("--display-trace", self.display_trace)?;
         line.value("--network-check", self.network_check.as_deref())?;

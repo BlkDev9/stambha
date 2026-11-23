@@ -439,7 +439,7 @@ fn native_moves_find_the_file_only_where_moves_run() {
     let file = machine.cpu.amx.registers.as_deref().unwrap() as *const _ as u64;
     assert_eq!(machine.amx_registers(), file);
     machine.enter_amx_cell();
-    let cell = machine.cpu.amx.native;
+    let cell = machine.cpu.amx.native.cell;
     assert_eq!(cell.registers, file);
     assert_eq!(cell.generation, Some(stela_compiler::amx::Generation::M2));
     assert_eq!(
@@ -461,13 +461,13 @@ fn native_moves_find_the_file_only_where_moves_run() {
     machine.amx(FMA32 | 3).unwrap();
     assert_eq!(machine.statistics.amx_moves, [0, 1]);
     assert_eq!(machine.statistics.amx_operations, [0, 1]);
-    machine.cpu.amx.native.moves = 3;
-    machine.cpu.amx.native.calls = 5;
-    machine.cpu.amx.native.kernels[12] = [4, 1];
+    machine.cpu.amx.native.cell.moves = 3;
+    machine.cpu.amx.native.cell.calls = 5;
+    machine.cpu.amx.native.cell.kernels[12] = [4, 1];
     machine.leave_amx_cell();
     machine.fold_amx_kernels();
     assert_eq!(machine.statistics.amx_kernels[12], [4, 1]);
-    assert_eq!(machine.cpu.amx.native.kernels[12], [0, 0]);
+    assert_eq!(machine.cpu.amx.native.cell.kernels[12], [0, 0]);
     assert_eq!(machine.statistics.amx_moves, [3, 1]);
     assert_eq!(machine.statistics.amx_operations, [5, 1]);
     machine.amx(CLR).unwrap();
@@ -478,4 +478,102 @@ fn native_moves_find_the_file_only_where_moves_run() {
         "no qualified generation, no lowered moves"
     );
     assert_eq!(other.amx_registers(), 0);
+}
+
+/// Under step timing (`--profile`) blocks call the routine that counts each
+/// register operation it completes by form and path, beside the compiler's
+/// own count by number, and the service counts the forms it completes;
+/// folding moves the forms to the statistics, and `amx_counts` reports them
+/// with what the cell holds yet. Without step timing blocks call the
+/// compiler's routine itself and nothing is counted by form.
+#[test]
+fn profiled_register_operations_count_by_form_and_path() {
+    use super::forms::{self, AmxForms};
+    use stela_compiler::amx::{AmxOperation, Generation};
+    const MATFP: u32 = 0x0020_12a0;
+    let host = TargetCpu::detect();
+    let mut machine = machine(&[]);
+    machine.target = host;
+    machine.cpu.state.x[1] = 1 << 63;
+    machine.system_instruction(msr(AMX_CTL_EL1, 1)).unwrap();
+    machine.amx(SET).unwrap();
+    let compiler = stela_compiler::x86_64::amx_routine::routine as *const () as usize as u64;
+    let counting = forms::routine as *const () as usize as u64;
+    machine.enter_amx_cell();
+    assert_eq!(machine.cpu.amx.native.cell.routine, compiler);
+    machine.set_step_timing(true);
+    machine.enter_amx_cell();
+    assert_eq!(machine.cpu.amx.native.cell.routine, counting);
+    let fused = forms::key(AmxOperation::Fma32, 0, Generation::M2).unwrap();
+    let matfp = forms::key(AmxOperation::MatrixFloat, 4 << 42, Generation::M2).unwrap();
+    // A matrix fma32 runs natively wherever the host has a tier; matfp on
+    // the model.
+    let fused_path = usize::from(Native::select(host) == Native::MODEL);
+    let cell = &raw mut machine.cpu.amx.native.cell;
+    for (number, operand) in [(12, 0), (12, 0), (21, 4 << 42)] {
+        // SAFETY: the cell names the PE's live register file, which nothing
+        // else touches during the call.
+        assert_eq!(unsafe { forms::routine(cell, number, operand) }, 1);
+    }
+    let amx = machine.cpu.amx.native;
+    let mut expected = [[0; 2]; 2];
+    expected[0][fused_path] = 2;
+    expected[1][1] = 1;
+    assert_eq!([amx.forms.counts[fused], amx.forms.counts[matfp]], expected);
+    assert_eq!(amx.cell.kernels[12][fused_path], 2, "the compiler's count");
+    assert_eq!(
+        amx.forms.sampled[fused][fused_path][1], 1,
+        "a form's first call is timed"
+    );
+    let counts = machine.amx_counts();
+    assert_eq!(counts.operations, [3, 0]);
+    assert_eq!(counts.forms, amx.forms);
+    machine.fold_amx_kernels();
+    assert_eq!(machine.cpu.amx.native.forms, AmxForms::ZERO);
+    assert_eq!(machine.statistics.amx_forms.counts[matfp], [0, 1]);
+    assert_eq!(machine.amx_counts(), counts, "folding moves counts");
+    // The service counts the register operations it completes.
+    machine.cpu.state.x[3] = 4 << 42;
+    machine.amx(MATFP | 3).unwrap();
+    assert_eq!(machine.statistics.amx_forms.counts[matfp], [0, 2]);
+    assert_eq!(machine.amx_counts().operations, [3, 1]);
+    machine.set_step_timing(false);
+    machine.amx(MATFP | 3).unwrap();
+    assert_eq!(
+        machine.statistics.amx_forms.counts[matfp],
+        [0, 2],
+        "only under step timing"
+    );
+    machine.enter_amx_cell();
+    assert_eq!(machine.cpu.amx.native.cell.routine, compiler);
+}
+
+/// With native AMX off (`--amx-native off`) blocks find the model's paths
+/// in their cell and the service runs every register operation on the
+/// model, whatever tier the host has; on again, the host's paths.
+#[test]
+fn native_amx_off_leaves_every_register_operation_to_the_model() {
+    let host = TargetCpu::detect();
+    let native = Native::select(host);
+    let mut machine = machine(&[]);
+    machine.target = host;
+    machine.cpu.state.x[1] = 1 << 63;
+    machine.system_instruction(msr(AMX_CTL_EL1, 1)).unwrap();
+    machine.amx(SET).unwrap();
+    machine.enter_amx_cell();
+    assert_eq!(machine.cpu.amx.native.cell.native, native);
+    machine.set_amx_native(false);
+    machine.enter_amx_cell();
+    assert_eq!(machine.cpu.amx.native.cell.native, Native::MODEL);
+    // A matrix fma32 with every lane on, which each host tier covers: the
+    // service counts the operations the model completes.
+    machine.cpu.state.x[3] = 0;
+    machine.amx(FMA32 | 3).unwrap();
+    assert_eq!(machine.statistics.amx_operations, [0, 1]);
+    machine.set_amx_native(true);
+    machine.amx(FMA32 | 3).unwrap();
+    let model = u64::from(native == Native::MODEL);
+    assert_eq!(machine.statistics.amx_operations, [0, 1 + model]);
+    machine.enter_amx_cell();
+    assert_eq!(machine.cpu.amx.native.cell.native, native);
 }
