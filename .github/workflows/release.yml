@@ -8,7 +8,9 @@ name: release
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
