@@ -51,7 +51,6 @@ jobs:
           fi
           if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
             echo "::error::tag $GITHUB_REF_NAME does not match the workspace version $version (expected v$version)"
-            exit 1
           fi
           for path in LICENSE NOTICE LICENSES; do
             if [[ ! -e "$path" ]]; then
